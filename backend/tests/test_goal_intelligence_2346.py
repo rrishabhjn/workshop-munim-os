@@ -2245,8 +2245,11 @@ async def test_expense_categorization_salary_routing_and_zoho_coa_selection():
     assert "Category: *Salaries & Wages*" in confirm_txt
 
     # 4. Zoho push selects exact Chart of Accounts account_id (never blindly index 0)
+    assert goal_primitives.normalize_or_infer_expense_category("cogs", "") == "raw_materials"
     fake_coa = [
         {"account_id": "coa-it", "account_name": "IT and Internet Expenses", "account_type": "expense", "is_active": True},
+        {"account_id": "coa-raw-exp", "account_name": "Raw Materials And Consumables", "account_type": "expense", "is_active": True},
+        {"account_id": "coa-mat-cogs", "account_name": "Materials", "account_type": "cost_of_goods_sold", "is_active": True},
         {"account_id": "coa-sal", "account_name": "Salaries and Employee Wages", "account_type": "expense", "is_active": True},
         {"account_id": "coa-trn", "account_name": "Transportation Expense", "account_type": "expense", "is_active": True},
         {"account_id": "coa-oth", "account_name": "Other Expenses", "account_type": "expense", "is_active": True},
@@ -2301,11 +2304,21 @@ async def test_expense_categorization_salary_routing_and_zoho_coa_selection():
             notes="random",
             expense_category="other_expense",
         )
+        res_mat = await zoho.push_management_entry_to_zoho(
+            sb,
+            entry_kind="expense",
+            amount_inr=420,
+            payment_account_id="acc-axis",
+            reference_number="MUNIM-MAT-1",
+            notes="fevicol and screws",
+            expense_category="raw_materials",
+        )
 
-    assert posted_account_ids == ["coa-sal", "coa-trn", "coa-oth"]
+    assert posted_account_ids == ["coa-sal", "coa-trn", "coa-oth", "coa-mat-cogs"]
     assert res_sal["expense_account_name"] == "Salaries and Employee Wages"
     assert res_trn["expense_account_name"] == "Transportation Expense"
     assert res_oth["expense_account_name"] == "Other Expenses"
+    assert res_mat["expense_account_name"] == "Materials"
 
 
 

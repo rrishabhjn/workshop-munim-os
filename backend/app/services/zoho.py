@@ -1105,21 +1105,29 @@ def _pick_zoho_expense_account(
         ]
     ]
 
-    for tname in target_names:
-        exact = next(
-            (a for a in active_exp if (a.get("account_name") or "").strip().lower() == tname),
-            None,
-        )
-        if exact:
-            return exact
+    cogs_only = [a for a in active_exp if a.get("account_type") == "cost_of_goods_sold"]
+    search_pools = (
+        (cogs_only, active_exp)
+        if cat_code in ("raw_materials", "contractor_labor") and cogs_only
+        else (active_exp,)
+    )
 
-    for tname in target_names:
-        sub = next(
-            (a for a in active_exp if tname in (a.get("account_name") or "").strip().lower()),
-            None,
-        )
-        if sub:
-            return sub
+    for pool in search_pools:
+        for tname in target_names:
+            exact = next(
+                (a for a in pool if (a.get("account_name") or "").strip().lower() == tname),
+                None,
+            )
+            if exact:
+                return exact
+
+        for tname in target_names:
+            sub = next(
+                (a for a in pool if tname in (a.get("account_name") or "").strip().lower()),
+                None,
+            )
+            if sub:
+                return sub
 
     for fallback_name in ("other expenses", "uncategorized"):
         fb = next(

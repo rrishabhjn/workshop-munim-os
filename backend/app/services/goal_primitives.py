@@ -510,8 +510,8 @@ EXPENSE_CATEGORIES: dict[str, dict[str, Any]] = {
         "pattern": r"\b(tempo|auto|truck|pickup|transport|transportation|bhada|bhaada|freight|cartage|petrol|diesel|fuel|toll|riksa|rickshaw)\b",
     },
     "raw_materials": {
-        "label": "Raw Materials & Hardware",
-        "zoho_names": ["raw materials and consumables", "materials", "merchandise", "cost of goods sold"],
+        "label": "Raw Materials & Hardware (COGS)",
+        "zoho_names": ["materials", "cost of goods sold", "raw materials and consumables", "merchandise"],
         "pattern": r"\b(ply|plywood|hdhmr|mdf|board|laminate|sunmica|mica|veneer|acrylic|hardware|hinge|hinges|channel|screw|screws|fevicol|adhesive|glue|edgeband|pvc\s+tape|foam|fabric|glass|mirror|handle|handles|lock|locks)\b",
     },
     "food_tea_mess": {
@@ -563,6 +563,9 @@ _EXPENSE_CATEGORY_ALIASES: dict[str, str] = {
     "materials": "raw_materials",
     "raw_material": "raw_materials",
     "raw_materials_and_consumables": "raw_materials",
+    "raw_materials_hardware_cogs": "raw_materials",
+    "cogs": "raw_materials",
+    "cost_of_goods_sold": "raw_materials",
     "hardware": "raw_materials",
     "food": "food_tea_mess",
     "tea": "food_tea_mess",
