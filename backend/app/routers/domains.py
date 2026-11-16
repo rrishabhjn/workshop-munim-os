@@ -23,12 +23,12 @@ router = APIRouter(prefix="/api", tags=["domains"])
 logger = logging.getLogger(__name__)
 
 
-def _resolve_actor_person(sb: Any, user: CurrentUser) -> tuple[str | None, str]:
-    """Map authenticated CurrentUser (email or telegram_user_id) to canonical people.id."""
+def _resolve_actor_access(sb: Any, user: CurrentUser) -> tuple[str | None, str, bool]:
+    """Map authenticated CurrentUser to (people.id, full_name, can_login_munim)."""
     if user.auth_type == "telegram" and user.identifier.isdigit():
         rows = (
             sb.table("people")
-            .select("id,full_name")
+            .select("id,full_name,can_login_munim")
             .eq("telegram_user_id", int(user.identifier))
             .limit(1)
             .execute()
@@ -36,11 +36,11 @@ def _resolve_actor_person(sb: Any, user: CurrentUser) -> tuple[str | None, str]:
             or []
         )
         if rows:
-            return str(rows[0]["id"]), str(rows[0]["full_name"])
+            return str(rows[0]["id"]), str(rows[0]["full_name"]), rows[0].get("can_login_munim") is not False
     else:
         rows = (
             sb.table("people")
-            .select("id,full_name")
+            .select("id,full_name,can_login_munim")
             .ilike("email", user.identifier)
             .limit(1)
             .execute()
@@ -48,8 +48,25 @@ def _resolve_actor_person(sb: Any, user: CurrentUser) -> tuple[str | None, str]:
             or []
         )
         if rows:
-            return str(rows[0]["id"]), str(rows[0]["full_name"])
-    return None, user.display_name
+            return str(rows[0]["id"]), str(rows[0]["full_name"]), rows[0].get("can_login_munim") is not False
+    return None, user.display_name, True
+
+
+def _resolve_actor_person(sb: Any, user: CurrentUser) -> tuple[str | None, str]:
+    """Map authenticated CurrentUser (email or telegram_user_id) to canonical people.id."""
+    actor_id, actor_name, _ = _resolve_actor_access(sb, user)
+    return actor_id, actor_name
+
+
+def _require_munim_access(sb: Any, user: CurrentUser) -> tuple[str | None, str]:
+    """Reject operators whose people.can_login_munim flag is explicitly False."""
+    actor_id, actor_name, can_munim = _resolve_actor_access(sb, user)
+    if not can_munim:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Munim finance portal access is disabled for your account.",
+        )
+    return actor_id, actor_name
 
 
 # ---------------------------------------------------------------------------
@@ -287,8 +304,11 @@ async def get_production_overview(
         }
         for o in orders
     ]
-    whos_doing_what = sb.table("v_whos_doing_what").select("*").execute().data or []
+    whos_doing_what = step_executors.enrich_whos_doing_what_rows(
+        sb, sb.table("v_whos_doing_what").select("*").execute().data or []
+    )
     needs_info = sb.table("v_needs_info_queue").select("*").execute().data or []
+    actor_id, actor_name, can_munim = _resolve_actor_access(sb, user)
 
     return {
         "me": {
@@ -296,6 +316,7 @@ async def get_production_overview(
             "display_name": actor_name,
             "identifier": user.identifier,
             "auth_type": user.auth_type,
+            "can_login_munim": can_munim,
         },
         "lookups": {
             "pipeline_stages": pipeline_stages,
@@ -616,7 +637,7 @@ async def get_munim_overview(
     user: CurrentUser = Depends(get_current_user),
 ) -> dict[str, Any]:
     sb = get_supabase_admin()
-    actor_id, actor_name = _resolve_actor_person(sb, user)
+    actor_id, actor_name = _require_munim_access(sb, user)
     accounts = sb.table("payment_accounts").select("*").eq("is_active", True).order("sort_order").execute().data or []
     pnl = sb.table("v_project_pnl").select("*").eq("project_type", "customer").order("promised_delivery_date").limit(80).execute().data or []
     customers = sb.table("customers").select("*").eq("is_active", True).order("full_name").limit(200).execute().data or []
@@ -625,7 +646,7 @@ async def get_munim_overview(
     needs_info = sb.table("v_needs_info_queue").select("*").execute().data or []
 
     return {
-        "me": {"person_id": actor_id, "display_name": actor_name},
+        "me": {"person_id": actor_id, "display_name": actor_name, "can_login_munim": True},
         "payment_accounts": accounts,
         "project_pnl": pnl,
         "customers": customers,
@@ -640,9 +661,11 @@ async def get_munim_overview(
 async def trigger_zoho_pulse_sync(
     user: CurrentUser = Depends(get_current_user),
 ) -> dict[str, Any]:
-    _ = user
     sb = get_supabase_admin()
-    return await zoho.sync_owner_pulse_snapshot(sb)
+    _require_munim_access(sb, user)
+    pulse = await zoho.sync_owner_pulse_snapshot(sb)
+    project_caches = await zoho.sync_project_financial_caches(sb)
+    return {**pulse, "project_caches": project_caches}
 
 
 @router.post("/munim/people")
@@ -691,8 +714,8 @@ async def add_vendor_to_directory(
     body: VendorCreateRequest,
     user: CurrentUser = Depends(get_current_user),
 ) -> dict[str, Any]:
-    _ = user
     sb = get_supabase_admin()
+    _require_munim_access(sb, user)
     payload = body.model_dump(exclude_none=True)
     if payload.get("gstin"):
         payload["gstin"] = str(payload["gstin"]).strip().upper()
@@ -706,8 +729,8 @@ async def patch_vendor_in_directory(
     body: VendorPatchRequest,
     user: CurrentUser = Depends(get_current_user),
 ) -> dict[str, Any]:
-    _ = user
     sb = get_supabase_admin()
+    _require_munim_access(sb, user)
     res = await step_executors.update_vendor_record(
         sb,
         vendor_id=vendor_id,
@@ -731,8 +754,8 @@ async def add_customer_to_directory(
     body: CustomerCreateRequest,
     user: CurrentUser = Depends(get_current_user),
 ) -> dict[str, Any]:
-    _ = user
     sb = get_supabase_admin()
+    _require_munim_access(sb, user)
     res = step_executors.create_standalone_customer(
         sb,
         full_name=body.full_name,
@@ -752,8 +775,8 @@ async def patch_customer_in_directory(
     body: CustomerPatchRequest,
     user: CurrentUser = Depends(get_current_user),
 ) -> dict[str, Any]:
-    _ = user
     sb = get_supabase_admin()
+    _require_munim_access(sb, user)
     res = await step_executors.update_customer_record(
         sb,
         customer_id=customer_id,
@@ -801,7 +824,16 @@ async def execute_web_agent_turn(
     user: CurrentUser = Depends(get_current_user),
 ) -> dict[str, Any]:
     sb = get_supabase_admin()
-    actor_id, actor_name = _resolve_actor_person(sb, user)
+    actor_id, actor_name, can_munim = _resolve_actor_access(sb, user)
+    scope = "munim" if domain_scope == "munim" else "production"
+    if scope == "munim" and not can_munim:
+        return {
+            "kind": "error",
+            "is_error": True,
+            "reply_text": "🔒 Munim finance assistant access is disabled for your account. Please switch to Production.",
+            "goals": [],
+        }
+
     try:
         ui_ctx = json.loads(ui_context_json) if ui_context_json else {}
     except json.JSONDecodeError:
@@ -819,7 +851,6 @@ async def execute_web_agent_turn(
         att_mime = attachment.content_type or "image/jpeg"
         media_files.append((att_bytes, att_mime))
 
-    scope = "munim" if domain_scope == "munim" else "production"
     try:
         return await agent_core.run_agent_turn(
             sb,

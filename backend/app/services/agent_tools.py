@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from app.services import zoho
+from app.services import step_executors, zoho
 
 
 INTERACTION_TOOLS_SCHEMA: list[dict[str, Any]] = [
@@ -330,7 +330,9 @@ def _tool_query_workshop_pulse(
         return {"needs_info_queue": rows}
 
     # Default: whos_doing_what
-    wdw = sb.table("v_whos_doing_what").select("*").limit(60).execute().data or []
+    wdw = step_executors.enrich_whos_doing_what_rows(
+        sb, sb.table("v_whos_doing_what").select("*").limit(60).execute().data or []
+    )
     people_map = {
         p["id"]: p["full_name"]
         for p in (sb.table("people").select("id,full_name").execute().data or [])

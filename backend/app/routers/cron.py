@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, status
 
 from app.config import Settings, get_settings
 from app.db import get_supabase_admin
-from app.services import sheets_backup, telegram_api, zoho
+from app.services import sheets_backup, step_executors, telegram_api, zoho
 from app.services.goal_primitives import format_inr
 
 router = APIRouter(prefix="/cron", tags=["cron"])
@@ -43,7 +43,9 @@ async def morning_brief(
         .data
         or []
     )
-    wdw = sb.table("v_whos_doing_what").select("*").execute().data or []
+    wdw = step_executors.enrich_whos_doing_what_rows(
+        sb, sb.table("v_whos_doing_what").select("*").execute().data or []
+    )
     stale_items = [w for w in wdw if int(w.get("days_in_stage") or 0) >= 3]
     ansh_pending = [w for w in wdw if w.get("work_kind") == "material_track"]
     packed_gate = [w for w in wdw if w.get("stage_code") == "packed_ready"]
@@ -131,12 +133,18 @@ async def nightly_sync(
     x_cron_secret: str | None = Header(default=None),
     settings: Settings = Depends(get_settings),
 ) -> dict[str, Any]:
-    """02:00 IST Zoho Owner Pulse balance sync + read-only Google Sheet backup."""
+    """02:00 IST Zoho Owner Pulse balance sync + project P&L cache sync + read-only Google Sheet backup."""
     _verify_cron_secret(x_cron_secret, settings.cron_auth_secret)
     sb = get_supabase_admin()
     pulse_res = await zoho.sync_owner_pulse_snapshot(sb)
+    prj_sync_res = await zoho.sync_project_financial_caches(sb)
     sheet_res = sheets_backup.export_readonly_sheet_snapshot(sb)
     cutoff = (date.today() - timedelta(days=30)).isoformat()
     sb.table("telegram_webhook_dedup").delete().lt("received_at", f"{cutoff}T00:00:00Z").execute()
-    sb.table("telegram_inbox_buffer").delete().eq("status", "processed").lt("created_at", f"{cutoff}T00:00:00Z").execute()
-    return {"ok": True, "zoho_pulse": pulse_res, "sheets": sheet_res}
+    sb.table("telegram_inbox_buffer").delete().in_("status", ["processed", "ignored", "failed"]).lt("created_at", f"{cutoff}T00:00:00Z").execute()
+    return {
+        "ok": True,
+        "zoho_pulse": pulse_res,
+        "project_caches": prj_sync_res,
+        "sheets": sheet_res,
+    }

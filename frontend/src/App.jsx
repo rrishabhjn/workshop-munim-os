@@ -41,12 +41,20 @@ export default function App() {
   async function loadAllData() {
     try {
       setError("");
-      const [pOverview, mOverview] = await Promise.all([
-        apiFetch("/api/production/overview"),
-        apiFetch("/api/munim/overview"),
-      ]);
+      const pOverview = await apiFetch("/api/production/overview");
       setProdData(pOverview);
-      setMunimData(mOverview);
+      const canMunim = pOverview?.me?.can_login_munim !== false;
+      if (canMunim) {
+        apiFetch("/api/munim/overview")
+          .then(setMunimData)
+          .catch(() => setMunimData(null));
+      } else {
+        setMunimData(null);
+        setDomain("production");
+        if (window.location.pathname === "/munim") {
+          window.history.replaceState({}, "", "/production");
+        }
+      }
     } catch (err) {
       setProdData(null);
       setError(err.message || "Authentication required");
@@ -56,12 +64,17 @@ export default function App() {
   }
 
   async function refreshActiveDomain(targetDomain = domain) {
-    if (targetDomain === "production") {
+    const canMunim = prodData?.me?.can_login_munim !== false;
+    if (targetDomain === "production" || !canMunim) {
       const pOverview = await apiFetch("/api/production/overview");
       setProdData(pOverview);
-      apiFetch("/api/munim/overview")
-        .then(setMunimData)
-        .catch(() => {});
+      if (pOverview?.me?.can_login_munim !== false) {
+        apiFetch("/api/munim/overview")
+          .then(setMunimData)
+          .catch(() => {});
+      } else {
+        setMunimData(null);
+      }
     } else {
       const mOverview = await apiFetch("/api/munim/overview");
       setMunimData(mOverview);
@@ -118,6 +131,9 @@ export default function App() {
   }, []);
 
   function switchDomain(nextDomain) {
+    if (nextDomain === "munim" && prodData?.me?.can_login_munim === false) {
+      nextDomain = "production";
+    }
     setDomain(nextDomain);
     const targetPath = nextDomain === "munim" ? "/munim" : "/production";
     if (window.location.pathname !== targetPath) {
@@ -240,16 +256,18 @@ export default function App() {
             >
               🏭 Production
             </button>
-            <button
-              onClick={() => switchDomain("munim")}
-              className={`min-h-[38px] px-3 rounded-lg text-xs font-bold transition ${
-                domain === "munim"
-                  ? "bg-amber-900 text-white shadow-sm"
-                  : "text-stone-600 hover:text-stone-900"
-              }`}
-            >
-              📒 Munim
-            </button>
+            {prodData?.me?.can_login_munim !== false && (
+              <button
+                onClick={() => switchDomain("munim")}
+                className={`min-h-[38px] px-3 rounded-lg text-xs font-bold transition ${
+                  domain === "munim"
+                    ? "bg-amber-900 text-white shadow-sm"
+                    : "text-stone-600 hover:text-stone-900"
+                }`}
+              >
+                📒 Munim
+              </button>
+            )}
           </div>
 
           <div className="flex items-center gap-1.5">
@@ -318,7 +336,7 @@ export default function App() {
 
       {/* Main Content */}
       <main className="max-w-6xl mx-auto px-3 pt-4">
-        {domain === "production" ? (
+        {domain === "production" || prodData?.me?.can_login_munim === false ? (
           prodTab === "whos_doing_what" ? (
             <WhosDoingWhat
               me={prodData.me}

@@ -692,6 +692,7 @@ def create_customer_and_lead(
     quoted_total: float = 0.0,
     promised_delivery_date: str | None = None,
     existing_customer_id: str | None = None,
+    force_new_customer: bool = False,
     actor_person_id: str | None = None,
 ) -> dict[str, Any]:
     """Create a canonical Customer (or link repeat Customer) + Supabase Lead Project.
@@ -701,6 +702,46 @@ def create_customer_and_lead(
     cname = full_name.strip()
     area = area_landmark.strip()
 
+    def _norm_phone10(raw_p: Any) -> str:
+        digits = re.sub(r"\D+", "", str(raw_p or ""))
+        return digits[-10:] if len(digits) >= 10 else digits
+
+    if not cust_id and not force_new_customer and cname:
+        candidates = (
+            sb.table("customers")
+            .select("id,full_name,area_landmark,phone,is_active")
+            .ilike("full_name", cname)
+            .limit(10)
+            .execute()
+            .data
+            or []
+        )
+        exact = [
+            c
+            for c in candidates
+            if c.get("is_active") is not False
+            and str(c.get("full_name") or "").strip().lower() == cname.lower()
+        ]
+        in_phone = _norm_phone10(phone)
+        if in_phone:
+            exact = [
+                c
+                for c in exact
+                if not _norm_phone10(c.get("phone")) or _norm_phone10(c.get("phone")) == in_phone
+            ]
+        if len(exact) > 1 and area:
+            area_low = area.lower()
+            area_matches = [
+                c for c in exact if str(c.get("area_landmark") or "").strip().lower() == area_low
+            ]
+            if area_matches:
+                exact = area_matches
+        if len(exact) == 1:
+            cust_id = str(exact[0]["id"])
+            cname = str(exact[0].get("full_name") or cname)
+            area = area or str(exact[0].get("area_landmark") or "")
+            phone = phone or exact[0].get("phone")
+
     if not cust_id:
         ins_c = (
             sb.table("customers")
@@ -709,6 +750,7 @@ def create_customer_and_lead(
                     "full_name": cname,
                     "area_landmark": area,
                     "phone": phone,
+                    "is_active": True,
                 }
             )
             .execute()
@@ -1923,3 +1965,55 @@ def delete_item_material_row(
         "undo_event_ids": undo_ids,
         "receipt": f"Removed *{cur['material_name']}*",
     }
+
+
+def enrich_whos_doing_what_rows(
+    sb: Any, rows: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Backfill queue ownership for packed_ready items even before SQL migration 007 runs.
+
+    Routes unassigned `packed_ready` items to the active `is_default_qc` owner (Shreyansh),
+    falling back to `project_items.production_mistri_id` if no default QC owner exists.
+    """
+    if not rows:
+        return []
+
+    unassigned_packed_item_ids = [
+        str(r["item_id"])
+        for r in rows
+        if r.get("work_kind") == "item_execution"
+        and r.get("stage_code") == "packed_ready"
+        and not (r.get("assigned_person_ids") or [])
+        and r.get("item_id")
+    ]
+    if not unassigned_packed_item_ids:
+        return rows
+
+    default_qc_id = get_default_person_id(sb, "is_default_qc")
+    mistri_by_item: dict[str, str] = {}
+    if not default_qc_id:
+        pi_rows = (
+            sb.table("project_items")
+            .select("id,production_mistri_id")
+            .in_("id", unassigned_packed_item_ids)
+            .execute()
+            .data
+            or []
+        )
+        for pi in pi_rows:
+            if pi.get("production_mistri_id"):
+                mistri_by_item[str(pi["id"])] = str(pi["production_mistri_id"])
+
+    enriched: list[dict[str, Any]] = []
+    for row in rows:
+        if (
+            row.get("work_kind") == "item_execution"
+            and row.get("stage_code") == "packed_ready"
+            and not (row.get("assigned_person_ids") or [])
+        ):
+            owner_id = default_qc_id or mistri_by_item.get(str(row.get("item_id") or ""))
+            if owner_id:
+                enriched.append({**row, "assigned_person_ids": [owner_id]})
+                continue
+        enriched.append(row)
+    return enriched

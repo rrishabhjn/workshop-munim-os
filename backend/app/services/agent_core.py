@@ -41,6 +41,7 @@ from app.services.goal_primitives import (
     format_inr,
     format_voice_receipt_header,
     is_high_sensitivity_master_mutation,
+    make_zoho_reference_number,
     select_hydrogen_thinking_level,
 )
 
@@ -621,6 +622,7 @@ async def run_agent_turn(
     text: str | None = None,
     audio_bytes: bytes | None = None,
     audio_mime_type: str = "audio/ogg",
+    extra_audio_files: list[tuple[bytes, str]] | None = None,
     media_files: list[tuple[bytes, str]] | None = None,  # [(bytes, mime_type)]
     ui_context: dict[str, Any] | None = None,
     telegram_chat_id: int | None = None,
@@ -683,13 +685,20 @@ async def run_agent_turn(
             )
 
     # 2. Build Interactions API Multimodal Input
-    input_blocks: list[dict[str, Any]] = []
+    all_audio_files: list[tuple[bytes, str]] = []
     if audio_bytes:
+        all_audio_files.append((audio_bytes, audio_mime_type))
+    for ex_bytes, ex_mime in extra_audio_files or []:
+        if ex_bytes:
+            all_audio_files.append((ex_bytes, ex_mime or audio_mime_type))
+
+    input_blocks: list[dict[str, Any]] = []
+    for a_bytes, a_mime in all_audio_files:
         input_blocks.append(
             {
                 "type": "audio",
-                "data": base64.b64encode(audio_bytes).decode("ascii"),
-                "mime_type": audio_mime_type,
+                "data": base64.b64encode(a_bytes).decode("ascii"),
+                "mime_type": a_mime,
             }
         )
     for m_bytes, m_mime in media_files or []:
@@ -787,7 +796,7 @@ async def run_agent_turn(
         except Exception as exc:
             logger.warning("Empty goal_items retry failed safely: %s", exc)
 
-    heard = envelope.heard_transcript if audio_bytes else None
+    heard = envelope.heard_transcript if all_audio_files else None
 
     if envelope.intent_category in ("direct_answer", "draft_whatsapp_message") and not envelope.goal_items:
         raw_reply_txt = envelope.direct_reply_text or "Done."
@@ -2188,6 +2197,9 @@ async def _run_single_step(
             line_items=line_items,
             notes=str(slots.get("notes") or ""),
             vendor_id=c_res.get("contact_id"),
+            reference_number=make_zoho_reference_number(goal_id, step_index),
+            project_id=slots.get("project_id"),
+            sb=sb,
         )
         if draft_res.get("error"):
             err_msg = str(draft_res["error"])

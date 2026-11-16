@@ -1,17 +1,24 @@
+import logging
 from typing import Any
 import google.auth
 from googleapiclient.discovery import build
 
 from app.config import get_settings
 
+logger = logging.getLogger(__name__)
+
 BACKUP_TABS = [
+    "customers",
+    "vendors",
+    "people",
+    "payment_accounts",
     "projects",
     "project_items",
-    "item_parts",
     "item_materials",
-    "cash_ledger",
-    "followups",
+    "stage_events",
+    "agent_goals",
     "v_project_pnl",
+    "v_whos_doing_what",
     "v_master_purchase_list",
 ]
 
@@ -42,25 +49,29 @@ def export_readonly_sheet_snapshot(sb: Any) -> dict[str, Any]:
 
     row_counts: dict[str, int] = {}
     for tab in BACKUP_TABS:
-        rows = sb.table(tab).select("*").limit(5000).execute().data or []
-        row_counts[tab] = len(rows)
-        if not rows:
-            values = [["(empty)"]]
-        else:
-            headers = list(rows[0].keys())
-            values = [headers] + [
-                [str(r.get(h, "")) if r.get(h) is not None else "" for h in headers]
-                for r in rows
-            ]
+        try:
+            rows = sb.table(tab).select("*").limit(5000).execute().data or []
+            row_counts[tab] = len(rows)
+            if not rows:
+                values = [["(empty)"]]
+            else:
+                headers = list(rows[0].keys())
+                values = [headers] + [
+                    [str(r.get(h, "")) if r.get(h) is not None else "" for h in headers]
+                    for r in rows
+                ]
 
-        sheets_api.values().clear(
-            spreadsheetId=settings.backup_sheet_id, range=f"{tab}!A:ZZ"
-        ).execute()
-        sheets_api.values().update(
-            spreadsheetId=settings.backup_sheet_id,
-            range=f"{tab}!A1",
-            valueInputOption="RAW",
-            body={"values": values},
-        ).execute()
+            sheets_api.values().clear(
+                spreadsheetId=settings.backup_sheet_id, range=f"{tab}!A:ZZ"
+            ).execute()
+            sheets_api.values().update(
+                spreadsheetId=settings.backup_sheet_id,
+                range=f"{tab}!A1",
+                valueInputOption="RAW",
+                body={"values": values},
+            ).execute()
+        except Exception as exc:
+            logger.warning("Sheets backup skipped tab '%s': %s", tab, exc)
+            row_counts[tab] = -1
 
     return {"exported": True, "row_counts": row_counts}

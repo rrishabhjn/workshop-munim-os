@@ -4,6 +4,10 @@ from typing import Any
 import httpx
 
 from app.config import get_settings
+from app.services.goal_primitives import (
+    build_zoho_standard_order_tags,
+    classify_external_error,
+)
 
 logger = logging.getLogger(__name__)
 _token_cache: dict[str, Any] = {"access_token": None, "expires_at": 0.0}
@@ -358,6 +362,10 @@ async def create_draft_bill(
     line_items: list[dict[str, Any]],
     notes: str = "",
     vendor_id: str | None = None,
+    *,
+    reference_number: str | None = None,
+    project_id: str | None = None,
+    sb: Any = None,
 ) -> dict[str, Any]:
     """Create a supplier bill strictly in DRAFT status in Zoho Books India.
 
@@ -371,8 +379,33 @@ async def create_draft_bill(
             "message": "Zoho Books India not configured yet (Wave 2); bill logged locally.",
         }
 
+    order_tags: dict[str, Any] = {}
+    if project_id and sb is not None:
+        bridge = await ensure_project_zoho_bridge(sb, project_id)
+        order_tags = build_zoho_standard_order_tags(
+            project_code=bridge.get("cf_project_code"),
+            zoho_tag_id=bridge.get("zoho_tag_id") or settings.zoho_project_tag_id,
+            zoho_tag_option_id=bridge.get("zoho_tag_option_id"),
+            custom_field_api_name=settings.zoho_project_custom_field,
+        )
+
     try:
         async with httpx.AsyncClient(timeout=12.0) as client:
+            if reference_number:
+                existing_bill_id = await _find_existing_by_reference(
+                    client, "/bills", "bills", "bill_id", reference_number
+                )
+                if existing_bill_id:
+                    return {
+                        "stubbed": False,
+                        "deduped": True,
+                        "bill": {
+                            "bill_id": existing_bill_id,
+                            "status": "draft",
+                            "reference_number": reference_number,
+                        },
+                    }
+
             if not vendor_id:
                 c_resp = await _zoho_request(
                     client,
@@ -381,15 +414,23 @@ async def create_draft_bill(
                     params={"contact_name": supplier_name, "contact_type": "vendor"},
                 )
                 if not c_resp.is_success:
-                    return {"stubbed": False, "error": f"Zoho contacts error {c_resp.status_code}"}
+                    return {
+                        "stubbed": False,
+                        "status_code": c_resp.status_code,
+                        "error_kind": classify_external_error(c_resp.status_code),
+                        "error": f"Zoho contacts error {c_resp.status_code}",
+                    }
                 contacts = c_resp.json().get("contacts", [])
                 if not contacts:
                     return {
                         "stubbed": False,
+                        "status_code": 400,
+                        "error_kind": "validation_400",
                         "error": f"Vendor '{supplier_name}' not found in Zoho Books.",
                     }
                 vendor_id = contacts[0]["contact_id"]
 
+            line_tags = {"tags": order_tags["tags"]} if order_tags.get("tags") else {}
             payload: dict[str, Any] = {
                 "vendor_id": vendor_id,
                 "status": "draft",  # HARDCODED DRAFT-ONLY BOUNDARY
@@ -400,72 +441,174 @@ async def create_draft_bill(
                         "name": li.get("description", "Material"),
                         "rate": li.get("rate", 0),
                         "quantity": li.get("quantity", 1),
+                        **line_tags,
                     }
                     for li in (line_items or [{"description": "Workshop Material", "rate": 0, "quantity": 1}])
                 ],
+                **order_tags,
             }
+            if reference_number:
+                payload["reference_number"] = reference_number
             if bill_date:
                 payload["date"] = bill_date
 
             b_resp = await _zoho_request(client, "POST", "/bills", json_body=payload)
             if not b_resp.is_success:
-                return {"stubbed": False, "error": f"Zoho Bill error {b_resp.status_code}: {b_resp.text[:160]}"}
+                return {
+                    "stubbed": False,
+                    "status_code": b_resp.status_code,
+                    "error_kind": classify_external_error(b_resp.status_code),
+                    "error": f"Zoho Bill error {b_resp.status_code}: {b_resp.text[:160]}",
+                }
             return {"stubbed": False, "bill": b_resp.json().get("bill", {})}
+    except httpx.TimeoutException as exc:
+        logger.warning("Zoho create_draft_bill timed out: %s", exc)
+        return {
+            "stubbed": False,
+            "status_code": None,
+            "error_kind": "transient_5xx",
+            "error": f"Zoho request timed out: {exc}",
+        }
     except httpx.HTTPError as exc:
         logger.warning("Zoho create_draft_bill failed: %s", exc)
-        return {"stubbed": False, "error": f"Zoho request failed: {exc}"}
+        return {
+            "stubbed": False,
+            "status_code": 503,
+            "error_kind": "transient_5xx",
+            "error": f"Zoho request failed: {exc}",
+        }
+
+
+def _extract_zoho_doc_project_keys(
+    doc: dict[str, Any], cf_api_name: str = "cf_project_code"
+) -> tuple[set[str], set[str], str]:
+    """Extract (tag_option_ids, lowercase project codes, legacy zoho_project_id) from a Zoho doc."""
+    tag_opt_ids: set[str] = set()
+    codes: set[str] = set()
+
+    for tag_entry in [*(doc.get("tags") or []), *(
+        t for li in (doc.get("line_items") or []) for t in (li.get("tags") or [])
+    )]:
+        if isinstance(tag_entry, dict):
+            if tag_entry.get("tag_option_id"):
+                tag_opt_ids.add(str(tag_entry["tag_option_id"]).strip())
+            opt_name = str(tag_entry.get("tag_option_name") or "").strip()
+            if opt_name:
+                codes.add(opt_name.split(" - ", 1)[0].strip().lower())
+
+    for cf in doc.get("custom_fields") or []:
+        if isinstance(cf, dict):
+            api_n = str(cf.get("api_name") or cf.get("customfield_id") or "").strip()
+            val = str(cf.get("value") or "").strip()
+            if val and (api_n == cf_api_name or api_n == "cf_project_code"):
+                codes.add(val.lower())
+
+    cf_hash = doc.get("custom_field_hash") or {}
+    if isinstance(cf_hash, dict):
+        cf_val = cf_hash.get(cf_api_name) or cf_hash.get(f"{cf_api_name}_unformatted") or cf_hash.get("cf_project_code")
+        if cf_val:
+            codes.add(str(cf_val).strip().lower())
+
+    zp_id = str(doc.get("project_id") or "").strip()
+    return tag_opt_ids, codes, zp_id
+
+
+async def _list_all_zoho_docs(
+    client: httpx.AsyncClient, path: str, key: str, max_pages: int = 5
+) -> tuple[bool, list[dict[str, Any]]]:
+    """Fetch paginated Zoho Books invoices or bills safely."""
+    rows: list[dict[str, Any]] = []
+    for page in range(1, max_pages + 1):
+        resp = await _zoho_request(client, "GET", path, params={"page": page, "per_page": 200})
+        if not resp.is_success:
+            return False, rows
+        data = resp.json()
+        rows.extend(data.get(key, []) or [])
+        has_more = bool((data.get("page_context") or {}).get("has_more_page"))
+        if not has_more:
+            break
+    return True, rows
 
 
 async def sync_project_financial_caches(sb: Any) -> dict[str, Any]:
-    """Nightly 02:00 IST refresh of zoho_invoiced_cache and zoho_bills_cache on active projects."""
+    """Nightly 02:00 IST & manual refresh of zoho_invoiced_cache / zoho_bills_cache.
+
+    Aggregates non-void Zoho invoices & bills per active project using Zoho Standard Plan
+    Reporting Tags (zoho_tag_option_id) and cf_project_code, with legacy zoho_project_id fallback.
+    """
     settings = get_settings()
     if not settings.zoho_enabled:
         return {"synced": 0, "stubbed": True, "reason": "Zoho credentials not configured"}
 
-    token = await _get_access_token()
-    headers = {"Authorization": f"Zoho-oauthtoken {token}"}
     projects = (
         sb.table("projects")
-        .select("id,zoho_project_id")
+        .select("id,project_code,cf_project_code,zoho_project_id,zoho_tag_id,zoho_tag_option_id")
         .eq("status", "active")
-        .not_.is_("zoho_project_id", "null")
         .execute()
         .data
         or []
     )
+    if not projects:
+        return {"synced": 0, "stubbed": False}
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            inv_ok, invoices = await _list_all_zoho_docs(client, "/invoices", "invoices")
+            bill_ok, bills = await _list_all_zoho_docs(client, "/bills", "bills")
+    except httpx.HTTPError as exc:
+        logger.warning("sync_project_financial_caches failed: %s", exc)
+        return {"synced": 0, "stubbed": False, "error": str(exc)}
+
+    if not inv_ok and not bill_ok:
+        return {"synced": 0, "stubbed": False, "error": "Failed to fetch Zoho invoices and bills"}
+
+    cf_name = settings.zoho_project_custom_field
+    inv_docs = [
+        (doc, *_extract_zoho_doc_project_keys(doc, cf_name))
+        for doc in invoices
+        if doc.get("status") != "void"
+    ]
+    bill_docs = [
+        (doc, *_extract_zoho_doc_project_keys(doc, cf_name))
+        for doc in bills
+        if doc.get("status") != "void"
+    ]
 
     synced = 0
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        for prj in projects:
-            zp_id = prj["zoho_project_id"]
-            inv_resp = await client.get(
-                f"{settings.zoho_books_api_base}/invoices",
-                headers=headers,
-                params={"organization_id": settings.zoho_org_id, "project_id": zp_id},
-            )
-            bill_resp = await client.get(
-                f"{settings.zoho_books_api_base}/bills",
-                headers=headers,
-                params={"organization_id": settings.zoho_org_id, "project_id": zp_id},
-            )
+    for prj in projects:
+        opt_id = str(prj.get("zoho_tag_option_id") or "").strip()
+        pcode = str(prj.get("cf_project_code") or prj.get("project_code") or "").strip().lower()
+        zp_id = str(prj.get("zoho_project_id") or "").strip()
+        if not (opt_id or pcode or zp_id):
+            continue
+
+        def _matches(tag_opts: set[str], codes: set[str], doc_zp: str) -> bool:
+            if opt_id and opt_id in tag_opts:
+                return True
+            if pcode and pcode in codes:
+                return True
+            if zp_id and doc_zp and zp_id == doc_zp:
+                return True
+            return False
+
+        patch: dict[str, Any] = {"zoho_synced_at": "now()"}
+        if inv_ok:
             inv_total = sum(
-                float(i.get("total", 0))
-                for i in (inv_resp.json().get("invoices", []) if inv_resp.is_success else [])
-                if i.get("status") != "void"
+                float(doc.get("total") or 0)
+                for doc, t_opts, codes, doc_zp in inv_docs
+                if _matches(t_opts, codes, doc_zp)
             )
+            patch["zoho_invoiced_cache"] = round(inv_total, 2)
+        if bill_ok:
             bill_total = sum(
-                float(b.get("total", 0))
-                for b in (bill_resp.json().get("bills", []) if bill_resp.is_success else [])
-                if b.get("status") != "void"
+                float(doc.get("total") or 0)
+                for doc, t_opts, codes, doc_zp in bill_docs
+                if _matches(t_opts, codes, doc_zp)
             )
-            sb.table("projects").update(
-                {
-                    "zoho_invoiced_cache": round(inv_total, 2),
-                    "zoho_bills_cache": round(bill_total, 2),
-                    "zoho_synced_at": "now()",
-                }
-            ).eq("id", prj["id"]).execute()
-            synced += 1
+            patch["zoho_bills_cache"] = round(bill_total, 2)
+
+        sb.table("projects").update(patch).eq("id", prj["id"]).execute()
+        synced += 1
 
     return {"synced": synced, "stubbed": False}
 
@@ -603,10 +746,6 @@ async def sync_cash_entry_to_zoho(
 #   - Multi-Account Instant Push (Banks, Cash Galla, Supervisor Floats)
 #   - Draft-Only Supplier Bills & Owner Pulse Sync
 # ===========================================================================
-from app.services.goal_primitives import (
-    build_zoho_standard_order_tags,
-    classify_external_error,
-)
 
 
 async def _find_existing_by_reference(
@@ -701,13 +840,38 @@ async def ensure_project_zoho_bridge(sb: Any, project_id: str) -> dict[str, Any]
     tag_option_id = prj.get("zoho_tag_option_id")
     option_label = f"{prj['project_code']} - {prj['customer_name']}"[:95]
 
-    if tag_id and not tag_option_id:
+    if not tag_option_id:
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
-                tag_resp = await _zoho_request(client, "GET", f"/settings/tags/{tag_id}")
-                if tag_resp.is_success:
-                    tag_obj = tag_resp.json().get("reporting_tag") or tag_resp.json().get("tag") or {}
-                    opts = tag_obj.get("tag_options") or []
+                if not tag_id:
+                    tags_resp = await _zoho_request(client, "GET", "/reportingtags")
+                    if tags_resp.is_success:
+                        tags_json = tags_resp.json()
+                        all_tags = tags_json.get("reporting_tags") or tags_json.get("tags") or []
+                        project_tag = next(
+                            (
+                                t
+                                for t in all_tags
+                                if t.get("is_active", True)
+                                and "project" in (t.get("tag_name") or "").lower()
+                            ),
+                            None,
+                        )
+                        if project_tag and project_tag.get("tag_id"):
+                            tag_id = str(project_tag["tag_id"])
+
+                if tag_id:
+                    tag_resp = await _zoho_request(client, "GET", f"/reportingtags/{tag_id}")
+                    opts: list[dict[str, Any]] = []
+                    if tag_resp.is_success:
+                        tag_json = tag_resp.json()
+                        tag_obj = tag_json.get("reporting_tag") or tag_json.get("tag") or tag_json
+                        opts = list(tag_obj.get("tag_options") or tag_json.get("tag_options") or [])
+                    if not opts:
+                        opts_resp = await _zoho_request(client, "GET", f"/reportingtags/{tag_id}/options/all")
+                        if opts_resp.is_success:
+                            opts = list(opts_resp.json().get("tag_options") or [])
+
                     existing_opt = next(
                         (
                             o
@@ -717,20 +881,60 @@ async def ensure_project_zoho_bridge(sb: Any, project_id: str) -> dict[str, Any]
                         None,
                     )
                     if existing_opt:
-                        tag_option_id = str(existing_opt.get("tag_option_id"))
+                        tag_option_id = str(existing_opt.get("tag_option_id") or "") or None
                     else:
                         add_resp = await _zoho_request(
                             client,
                             "POST",
-                            f"/settings/tags/{tag_id}/options",
-                            json_body={"tag_option_name": option_label},
+                            f"/reportingtags/{tag_id}/options",
+                            json_body={"tag_option_name": option_label, "is_active": True},
                         )
-                        if add_resp.is_success:
-                            created_opt = (
-                                add_resp.json().get("tag_option")
-                                or (add_resp.json().get("tag_options") or [{}])[0]
+                        if not add_resp.is_success:
+                            merged_opts = [
+                                {
+                                    "tag_option_id": o.get("tag_option_id"),
+                                    "tag_option_name": o.get("tag_option_name"),
+                                    "is_active": o.get("is_active", True),
+                                }
+                                for o in opts
+                                if o.get("tag_option_name")
+                            ] + [{"tag_option_name": option_label, "is_active": True}]
+                            add_resp = await _zoho_request(
+                                client,
+                                "PUT",
+                                f"/reportingtags/{tag_id}/options",
+                                json_body={"tag_options": merged_opts},
                             )
-                            tag_option_id = str(created_opt.get("tag_option_id") or "") or None
+                        if add_resp.is_success:
+                            add_json = add_resp.json()
+                            created_opt = add_json.get("tag_option")
+                            if not created_opt:
+                                resp_opts = add_json.get("tag_options") or []
+                                created_opt = next(
+                                    (
+                                        o
+                                        for o in resp_opts
+                                        if prj["project_code"].lower() in (o.get("tag_option_name") or "").lower()
+                                    ),
+                                    resp_opts[0] if resp_opts else {},
+                                )
+                            tag_option_id = str((created_opt or {}).get("tag_option_id") or "") or None
+                            if not tag_option_id:
+                                ref_resp = await _zoho_request(client, "GET", f"/reportingtags/{tag_id}")
+                                if ref_resp.is_success:
+                                    r_json = ref_resp.json()
+                                    r_obj = r_json.get("reporting_tag") or r_json.get("tag") or r_json
+                                    r_opts = r_obj.get("tag_options") or r_json.get("tag_options") or []
+                                    matched = next(
+                                        (
+                                            o
+                                            for o in r_opts
+                                            if prj["project_code"].lower() in (o.get("tag_option_name") or "").lower()
+                                        ),
+                                        None,
+                                    )
+                                    if matched:
+                                        tag_option_id = str(matched.get("tag_option_id") or "") or None
         except httpx.HTTPError as exc:
             logger.warning("Zoho Reporting Tag option auto-create skipped: %s", exc)
 

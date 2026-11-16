@@ -33,6 +33,27 @@ from app.services.goal_primitives import (
 
 router = APIRouter(tags=["telegram"])
 logger = logging.getLogger(__name__)
+_BURST_LOCKS: dict[tuple[int, int], asyncio.Lock] = {}
+_STALE_CLAIM_SECONDS = 120
+
+
+def _get_burst_lock(chat_id: int, user_id: int) -> asyncio.Lock:
+    key = (int(chat_id), int(user_id))
+    if key not in _BURST_LOCKS:
+        _BURST_LOCKS[key] = asyncio.Lock()
+    return _BURST_LOCKS[key]
+
+
+def _parse_iso_ts(raw: Any) -> datetime | None:
+    if isinstance(raw, datetime):
+        return raw if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
+    if not raw or not isinstance(raw, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -381,21 +402,81 @@ async def process_debounced_burst(
     chat_id: int, user_id: int, wait_locally: bool = False
 ) -> None:
     settings = get_settings()
-    if wait_locally and settings.telegram_burst_debounce_seconds > 0:
-        await asyncio.sleep(settings.telegram_burst_debounce_seconds)
+    debounce_s = max(float(settings.telegram_burst_debounce_seconds or 0.0), 0.0)
+    if wait_locally and debounce_s > 0:
+        await asyncio.sleep(debounce_s)
 
     sb = get_supabase_admin()
-    claim_token = str(uuid.uuid4())
-    claimed_rows = (
-        sb.table("telegram_inbox_buffer")
-        .update({"status": "claimed", "claim_token": claim_token, "claimed_at": datetime.now(timezone.utc).isoformat()})
-        .eq("chat_id", chat_id)
-        .eq("user_id", user_id)
-        .eq("status", "buffered")
-        .execute()
-        .data
-        or []
-    )
+    claimed_rows: list[dict[str, Any]] = []
+    async with _get_burst_lock(chat_id, user_id):
+        for attempt in range(3):
+            now_utc = datetime.now(timezone.utc)
+            active_rows = (
+                sb.table("telegram_inbox_buffer")
+                .select("*")
+                .eq("chat_id", chat_id)
+                .eq("user_id", user_id)
+                .in_("status", ["buffered", "claimed"])
+                .execute()
+                .data
+                or []
+            )
+            if not active_rows:
+                return
+
+            stale_cutoff = now_utc - timedelta(seconds=_STALE_CLAIM_SECONDS)
+            recovered_ids: set[str] = set()
+            for r in active_rows:
+                if r.get("status") == "claimed":
+                    c_at = _parse_iso_ts(r.get("claimed_at")) or _parse_iso_ts(r.get("created_at"))
+                    if c_at and c_at < stale_cutoff:
+                        sb.table("telegram_inbox_buffer").update(
+                            {"status": "buffered", "claim_token": None}
+                        ).eq("id", r["id"]).eq("status", "claimed").execute()
+                        recovered_ids.add(str(r["id"]))
+
+            buffered_rows = [
+                r
+                for r in active_rows
+                if r.get("status") == "buffered" or str(r.get("id")) in recovered_ids
+            ]
+            if not buffered_rows:
+                return
+
+            if debounce_s > 0 and attempt < 2:
+                created_times = [
+                    ts
+                    for ts in (_parse_iso_ts(r.get("created_at")) for r in buffered_rows)
+                    if ts is not None
+                ]
+                if created_times:
+                    latest_ts = max(created_times)
+                    remaining = debounce_s - (now_utc - latest_ts).total_seconds()
+                    if 0.05 < remaining <= debounce_s:
+                        await asyncio.sleep(remaining)
+                        continue
+
+            claim_token = str(uuid.uuid4())
+            target_ids = [r["id"] for r in buffered_rows]
+            claimed_rows = (
+                sb.table("telegram_inbox_buffer")
+                .update(
+                    {
+                        "status": "claimed",
+                        "claim_token": claim_token,
+                        "claimed_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+                .eq("chat_id", chat_id)
+                .eq("user_id", user_id)
+                .eq("status", "buffered")
+                .in_("id", target_ids)
+                .execute()
+                .data
+                or []
+            )
+            break
+
     if not claimed_rows:
         return
 
@@ -441,9 +522,13 @@ async def process_debounced_burst(
                 ).in_("id", row_ids).execute()
                 return
 
-        audio_bytes: bytes | None = None
-        if merged["voice_file_ids"]:
-            audio_bytes, _ = await telegram_api.download_file_bytes(merged["voice_file_ids"][0])
+        voice_clips: list[tuple[bytes, str]] = []
+        for vfid in merged["voice_file_ids"]:
+            v_data, _ = await telegram_api.download_file_bytes(vfid)
+            if v_data:
+                voice_clips.append((v_data, "audio/ogg"))
+        audio_bytes = voice_clips[0][0] if voice_clips else None
+        extra_audio_files = voice_clips[1:] or None
 
         media_files: list[tuple[bytes, str]] = []
         for fid in merged["photo_file_ids"]:
@@ -466,6 +551,7 @@ async def process_debounced_burst(
             text=combined_text or None,
             audio_bytes=audio_bytes,
             audio_mime_type="audio/ogg",
+            extra_audio_files=extra_audio_files,
             media_files=media_files or None,
             telegram_chat_id=chat_id,
         )

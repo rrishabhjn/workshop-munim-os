@@ -1567,3 +1567,445 @@ async def test_ai_text_update_adversarial_null_uuid_typecast_and_fallback_harden
         app.dependency_overrides.clear()
 
 
+# ===========================================================================
+# Pass 1 Audit Verification Tests
+# ===========================================================================
+@pytest.mark.asyncio
+async def test_pass1_zoho_reporting_tags_draft_bill_and_pnl_sync():
+    from app.services import zoho
+
+    pid = "11111111-1111-1111-1111-111111111101"
+    cid = "22222222-2222-2222-2222-222222222201"
+    sb = FakeSupabase(
+        {
+            "customers": [
+                {"id": cid, "full_name": "Mehta Garment", "area_landmark": "Sendra Road", "phone": "9829000001"}
+            ],
+            "projects": [
+                {
+                    "id": pid,
+                    "project_code": "PRJ-101",
+                    "cf_project_code": "PRJ-101",
+                    "customer_id": cid,
+                    "customer_name": "Mehta Garment",
+                    "phone": "9829000001",
+                    "status": "active",
+                    "project_type": "customer",
+                    "zoho_contact_id": "zc-1",
+                    "zoho_tag_id": None,
+                    "zoho_tag_option_id": None,
+                    "zoho_project_id": None,
+                }
+            ],
+            "entity_dictionary": [],
+        }
+    )
+
+    fake_settings = Settings(
+        zoho_client_id="cid",
+        zoho_client_secret="csec",
+        zoho_refresh_token="rtok",
+        zoho_org_id="org1",
+        zoho_project_tag_id="",
+    )
+
+    async def fake_zoho_request(client, method, path, *, params=None, json_body=None):
+        assert "/settings/tags" not in path
+        if method == "GET" and path == "/reportingtags":
+            return httpx.Response(200, json={"reporting_tags": [{"tag_id": "tag-prj", "tag_name": "Project", "is_active": True}]})
+        if method == "GET" and path == "/reportingtags/tag-prj":
+            return httpx.Response(200, json={"reporting_tag": {"tag_id": "tag-prj", "tag_options": []}})
+        if method == "GET" and path == "/reportingtags/tag-prj/options/all":
+            return httpx.Response(200, json={"tag_options": []})
+        if method == "POST" and path == "/reportingtags/tag-prj/options":
+            return httpx.Response(200, json={"tag_option": {"tag_option_id": "opt-101", "tag_option_name": "PRJ-101 - Mehta Garment"}})
+        if method == "GET" and path == "/bills" and (params or {}).get("reference_number") == "MUNIM-G1-S1":
+            return httpx.Response(200, json={"bills": []})
+        if method == "GET" and path == "/bills" and (params or {}).get("reference_number") == "MUNIM-DUP-S0":
+            return httpx.Response(200, json={"bills": [{"bill_id": "zb-existing", "reference_number": "MUNIM-DUP-S0"}]})
+        if method == "POST" and path == "/bills":
+            assert json_body["status"] == "draft"
+            assert json_body["reference_number"] == "MUNIM-G1-S1"
+            assert json_body["tags"] == [{"tag_id": "tag-prj", "tag_option_id": "opt-101"}]
+            assert json_body["line_items"][0]["tags"] == [{"tag_id": "tag-prj", "tag_option_id": "opt-101"}]
+            assert json_body["custom_fields"] == [{"api_name": "cf_project_code", "value": "PRJ-101"}]
+            return httpx.Response(200, json={"bill": {"bill_id": "zb-new", "status": "draft"}})
+        if method == "GET" and path == "/invoices":
+            return httpx.Response(
+                200,
+                json={
+                    "invoices": [
+                        {"invoice_id": "i1", "status": "sent", "total": 120000, "tags": [{"tag_option_id": "opt-101"}]},
+                        {"invoice_id": "i2", "status": "void", "total": 99999, "tags": [{"tag_option_id": "opt-101"}]},
+                    ],
+                    "page_context": {"has_more_page": False},
+                },
+            )
+        if method == "GET" and path == "/bills":
+            return httpx.Response(
+                200,
+                json={
+                    "bills": [
+                        {"bill_id": "b1", "status": "draft", "total": 45000, "custom_field_hash": {"cf_project_code": "PRJ-101"}},
+                        {"bill_id": "b2", "status": "void", "total": 5000, "tags": [{"tag_option_id": "opt-101"}]},
+                    ],
+                    "page_context": {"has_more_page": False},
+                },
+            )
+        raise AssertionError(f"Unexpected Zoho call: {method} {path} params={params}")
+
+    with (
+        patch("app.services.zoho.get_settings", return_value=fake_settings),
+        patch("app.services.zoho._zoho_request", side_effect=fake_zoho_request),
+    ):
+        bridge = await zoho.ensure_project_zoho_bridge(sb, pid)
+        assert bridge["zoho_tag_id"] == "tag-prj"
+        assert bridge["zoho_tag_option_id"] == "opt-101"
+
+        bill_res = await zoho.create_draft_bill(
+            supplier_name="Bikaner Timber",
+            invoice_no="INV-77",
+            bill_date="2026-11-16",
+            line_items=[{"description": "Teak Ply", "rate": 45000, "quantity": 1}],
+            vendor_id="zv-1",
+            reference_number="MUNIM-G1-S1",
+            project_id=pid,
+            sb=sb,
+        )
+        assert bill_res["bill"]["bill_id"] == "zb-new"
+        assert bill_res["bill"]["status"] == "draft"
+
+        dup_res = await zoho.create_draft_bill(
+            supplier_name="Bikaner Timber",
+            invoice_no="INV-77",
+            bill_date="2026-11-16",
+            line_items=[{"description": "Teak Ply", "rate": 45000, "quantity": 1}],
+            vendor_id="zv-1",
+            reference_number="MUNIM-DUP-S0",
+            project_id=pid,
+            sb=sb,
+        )
+        assert dup_res["deduped"] is True
+        assert dup_res["bill"]["bill_id"] == "zb-existing"
+
+        sync_res = await zoho.sync_project_financial_caches(sb)
+        assert sync_res["synced"] == 1
+
+    prj_after = sb.store["projects"][0]
+    assert prj_after["zoho_tag_id"] == "tag-prj"
+    assert prj_after["zoho_tag_option_id"] == "opt-101"
+    assert prj_after["zoho_invoiced_cache"] == 120000.0
+    assert prj_after["zoho_bills_cache"] == 45000.0
+
+
+def test_pass1_sheets_backup_v1_tabs_and_error_resilience():
+    from app.services import sheets_backup
+
+    assert "item_parts" not in sheets_backup.BACKUP_TABS
+    assert "cash_ledger" not in sheets_backup.BACKUP_TABS
+    assert "followups" not in sheets_backup.BACKUP_TABS
+    for required_tab in (
+        "customers",
+        "vendors",
+        "people",
+        "payment_accounts",
+        "projects",
+        "project_items",
+        "item_materials",
+        "stage_events",
+        "agent_goals",
+        "v_project_pnl",
+        "v_whos_doing_what",
+        "v_master_purchase_list",
+    ):
+        assert required_tab in sheets_backup.BACKUP_TABS
+
+    class FailingTabSupabase(FakeSupabase):
+        def table(self, name: str):
+            if name == "v_master_purchase_list":
+                raise RuntimeError("view timeout")
+            return super().table(name)
+
+    sb = FailingTabSupabase({"customers": [{"id": "c1", "full_name": "Praveen"}]})
+    fake_settings = Settings(backup_sheet_id="sheet-123")
+    mock_service = MagicMock()
+    mock_sheets_api = mock_service.spreadsheets.return_value
+    mock_sheets_api.get.return_value.execute.return_value = {"sheets": []}
+    with (
+        patch("app.services.sheets_backup.get_settings", return_value=fake_settings),
+        patch("app.services.sheets_backup.google.auth.default", return_value=(MagicMock(), "proj")),
+        patch("app.services.sheets_backup.build", return_value=mock_service),
+    ):
+        out = sheets_backup.export_readonly_sheet_snapshot(sb)
+
+    assert out["exported"] is True
+    assert out["row_counts"]["customers"] == 1
+    assert out["row_counts"]["v_master_purchase_list"] == -1
+    assert out["row_counts"]["projects"] == 0
+
+
+def test_pass1_customer_dedup_on_repeat_lead():
+    from app.services import step_executors
+
+    sb = FakeSupabase(
+        {
+            "customers": [],
+            "projects": [],
+            "stage_events": [],
+        }
+    )
+    first = step_executors.create_customer_and_lead(
+        sb,
+        full_name="Ramesh Sharma",
+        area_landmark="Ajmer Road",
+        rough_scope="Modular Kitchen",
+        phone="9829011111",
+    )
+    second = step_executors.create_customer_and_lead(
+        sb,
+        full_name="ramesh sharma",
+        area_landmark="Civil Lines",
+        rough_scope="Master Wardrobe",
+    )
+    assert second["customer_id"] == first["customer_id"]
+    assert len(sb.store["customers"]) == 1
+    assert len(sb.store["projects"]) == 2
+    assert sb.store["projects"][0]["site_area_landmark"] == "Ajmer Road"
+    assert sb.store["projects"][1]["site_area_landmark"] == "Civil Lines"
+
+    conflict = step_executors.create_customer_and_lead(
+        sb,
+        full_name="Ramesh Sharma",
+        area_landmark="Vaishali Nagar",
+        rough_scope="TV Unit",
+        phone="9999900000",
+    )
+    assert conflict["customer_id"] != first["customer_id"]
+    assert len(sb.store["customers"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_pass1_rbac_can_login_munim_and_packed_ready_owner():
+    from pathlib import Path
+    from app.services import step_executors
+
+    pid_shreyansh = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa1"
+    pid_harshit = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa2"
+    pid_manish = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa3"
+    sb = FakeSupabase(
+        {
+            "people": [
+                {
+                    "id": pid_shreyansh,
+                    "full_name": "Shreyansh",
+                    "email": "shreyansh@example.com",
+                    "is_active": True,
+                    "can_login_prod": True,
+                    "can_login_munim": True,
+                    "is_default_qc": True,
+                },
+                {
+                    "id": pid_harshit,
+                    "full_name": "Harshit Bhaiya",
+                    "email": "harshit@example.com",
+                    "is_active": True,
+                    "can_login_prod": True,
+                    "can_login_munim": False,
+                    "is_default_qc": False,
+                },
+                {
+                    "id": pid_manish,
+                    "full_name": "Manish",
+                    "is_active": True,
+                    "person_type": "salaried_karigar",
+                    "is_default_qc": False,
+                },
+            ],
+            "payment_accounts": [],
+            "project_pipeline_stages": [],
+            "material_track_stages": [],
+            "payment_track_stages": [],
+            "workshop_stages": [],
+            "material_categories": [],
+            "customers": [],
+            "vendors": [],
+            "projects": [],
+            "project_items": [
+                {"id": "item-packed", "item_name": "Crockery Unit", "stage": "packed_ready", "production_mistri_id": pid_manish}
+            ],
+            "item_materials": [],
+            "v_whos_doing_what": [
+                {
+                    "work_kind": "item_execution",
+                    "project_id": "prj-1",
+                    "item_id": "item-packed",
+                    "customer_name": "Mehta — Crockery Unit",
+                    "stage_code": "packed_ready",
+                    "assigned_person_ids": [],
+                    "days_in_stage": 1,
+                }
+            ],
+            "v_project_pnl": [],
+            "v_needs_info_queue": [],
+        }
+    )
+
+    enriched = step_executors.enrich_whos_doing_what_rows(sb, sb.store["v_whos_doing_what"])
+    assert enriched[0]["assigned_person_ids"] == [pid_shreyansh]
+
+    # Fallback to production_mistri_id when no default QC owner exists
+    sb_no_qc = FakeSupabase(
+        {
+            "people": [{"id": pid_manish, "full_name": "Manish", "is_active": True, "is_default_qc": False}],
+            "project_items": sb.store["project_items"],
+        }
+    )
+    enriched_fb = step_executors.enrich_whos_doing_what_rows(sb_no_qc, sb.store["v_whos_doing_what"])
+    assert enriched_fb[0]["assigned_person_ids"] == [pid_manish]
+
+    # Migration 007 security invariants check
+    mig_007 = (Path(__file__).resolve().parents[2] / "supabase" / "migrations" / "007_packed_ready_queue_owner.sql").read_text(encoding="utf-8")
+    assert "WITH (security_invoker = true)" in mig_007
+    assert "is_default_qc = TRUE" in mig_007
+    assert "SECURITY DEFINER" not in mig_007.upper()
+    assert "auth.role()" not in mig_007
+    assert "user_metadata" not in mig_007
+
+    # Harshit (can_login_munim=False) allowed on /production, blocked (403) on /munim
+    app.dependency_overrides[get_current_user] = lambda: CurrentUser(
+        auth_type="supabase", identifier="harshit@example.com", display_name="Harshit"
+    )
+    try:
+        with patch("app.routers.domains.get_supabase_admin", return_value=sb):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                r_prod = await client.get("/api/production/overview")
+                assert r_prod.status_code == 200
+                p_body = r_prod.json()
+                assert p_body["me"]["can_login_munim"] is False
+                assert p_body["whos_doing_what"][0]["assigned_person_ids"] == [pid_shreyansh]
+
+                assert (await client.get("/api/munim/overview")).status_code == 403
+                assert (await client.post("/api/munim/sync-zoho")).status_code == 403
+                assert (
+                    await client.post("/api/munim/vendors", json={"canonical_name": "Test Ply"})
+                ).status_code == 403
+                assert (
+                    await client.post(
+                        "/api/munim/customers",
+                        json={"full_name": "New Cust", "area_landmark": "Sendra Road"},
+                    )
+                ).status_code == 403
+                r_agent = await client.post("/api/agent/turn", data={"text": "test", "domain_scope": "munim"})
+                assert r_agent.status_code == 200
+                assert r_agent.json()["is_error"] is True
+
+                r_people = await client.post(
+                    "/api/munim/people",
+                    json={"full_name": "Karan Mistri", "person_type": "salaried_karigar"},
+                )
+                assert r_people.status_code == 200
+
+        # Shreyansh (can_login_munim=True) allowed on /munim
+        app.dependency_overrides[get_current_user] = lambda: CurrentUser(
+            auth_type="supabase", identifier="shreyansh@example.com", display_name="Shreyansh"
+        )
+        with patch("app.routers.domains.get_supabase_admin", return_value=sb):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                r_m = await client.get("/api/munim/overview")
+                assert r_m.status_code == 200
+                assert r_m.json()["me"]["can_login_munim"] is True
+                r_sync = await client.post("/api/munim/sync-zoho")
+                assert r_sync.status_code == 200
+                assert "project_caches" in r_sync.json()
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_pass1_telegram_stale_claim_recovery_and_multi_voice_burst():
+    from datetime import datetime, timedelta, timezone
+    from app.routers import telegram as tg_router
+
+    now_utc = datetime.now(timezone.utc)
+    sb = FakeSupabase(
+        {
+            "people": [
+                {
+                    "id": "p-owner",
+                    "full_name": "Shreyansh",
+                    "telegram_user_id": 1001,
+                    "is_active": True,
+                }
+            ],
+            "telegram_inbox_buffer": [
+                {
+                    "id": "buf-stale",
+                    "telegram_update_id": 101,
+                    "chat_id": -9001,
+                    "user_id": 1001,
+                    "domain_channel": "production",
+                    "status": "claimed",
+                    "claimed_at": (now_utc - timedelta(seconds=180)).isoformat(),
+                    "created_at": (now_utc - timedelta(seconds=200)).isoformat(),
+                    "raw_payload": {
+                        "message": {
+                            "message_id": 11,
+                            "chat": {"id": -9001, "type": "supergroup"},
+                            "from": {"id": 1001, "first_name": "Shreyansh"},
+                            "voice": {"file_id": "voice-1"},
+                        }
+                    },
+                },
+                {
+                    "id": "buf-fresh",
+                    "telegram_update_id": 102,
+                    "chat_id": -9001,
+                    "user_id": 1001,
+                    "domain_channel": "production",
+                    "status": "buffered",
+                    "created_at": (now_utc - timedelta(seconds=10)).isoformat(),
+                    "raw_payload": {
+                        "message": {
+                            "message_id": 12,
+                            "chat": {"id": -9001, "type": "supergroup"},
+                            "from": {"id": 1001, "first_name": "Shreyansh"},
+                            "voice": {"file_id": "voice-2"},
+                            "caption": "Also check kitchen",
+                        }
+                    },
+                },
+            ],
+            "agent_goals": [],
+        }
+    )
+
+    captured: dict[str, Any] = {}
+
+    async def fake_download(fid: str):
+        return f"audio-{fid}".encode("utf-8"), "audio/ogg"
+
+    async def fake_run_turn(sb_arg, **kwargs):
+        captured.update(kwargs)
+        return {"kind": "direct_reply", "heard_transcript": "Clip1 + Clip2", "reply_text": "All noted.", "goals": []}
+
+    fake_settings = Settings(telegram_burst_debounce_seconds=2.5)
+    with (
+        patch("app.routers.telegram.get_supabase_admin", return_value=sb),
+        patch("app.routers.telegram.get_settings", return_value=fake_settings),
+        patch("app.routers.telegram.telegram_api.download_file_bytes", side_effect=fake_download),
+        patch("app.routers.telegram.telegram_api.send_message", new=AsyncMock(return_value={"result": {"message_id": 99}})),
+        patch("app.routers.telegram.agent_core.run_agent_turn", side_effect=fake_run_turn),
+    ):
+        await tg_router.process_debounced_burst(-9001, 1001, wait_locally=False)
+
+    assert captured["audio_bytes"] == b"audio-voice-1"
+    assert captured["extra_audio_files"] == [(b"audio-voice-2", "audio/ogg")]
+    assert "Also check kitchen" in (captured["text"] or "")
+    assert all(r["status"] == "processed" for r in sb.store["telegram_inbox_buffer"])
+
+
+
