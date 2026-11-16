@@ -6,8 +6,11 @@ import httpx
 
 from app.config import get_settings
 from app.services.goal_primitives import (
+    EXPENSE_CATEGORIES,
     build_zoho_standard_order_tags,
     classify_external_error,
+    get_expense_category_label,
+    normalize_or_infer_expense_category,
 )
 
 logger = logging.getLogger(__name__)
@@ -1081,6 +1084,54 @@ async def _resolve_zoho_paid_account_id(
     return None
 
 
+def _pick_zoho_expense_account(
+    accounts: list[dict[str, Any]], expense_category: str | None
+) -> dict[str, Any] | None:
+    """Select best matching Zoho Books Expense / COGS account for an expense_category."""
+    active_exp = [
+        a
+        for a in accounts
+        if a.get("account_type") in ("expense", "cost_of_goods_sold")
+        and a.get("is_active", True)
+    ]
+    if not active_exp:
+        return None
+
+    cat_code = normalize_or_infer_expense_category(expense_category)
+    target_names = [
+        n.lower()
+        for n in (EXPENSE_CATEGORIES.get(cat_code) or EXPENSE_CATEGORIES["other_expense"])[
+            "zoho_names"
+        ]
+    ]
+
+    for tname in target_names:
+        exact = next(
+            (a for a in active_exp if (a.get("account_name") or "").strip().lower() == tname),
+            None,
+        )
+        if exact:
+            return exact
+
+    for tname in target_names:
+        sub = next(
+            (a for a in active_exp if tname in (a.get("account_name") or "").strip().lower()),
+            None,
+        )
+        if sub:
+            return sub
+
+    for fallback_name in ("other expenses", "uncategorized"):
+        fb = next(
+            (a for a in active_exp if fallback_name in (a.get("account_name") or "").strip().lower()),
+            None,
+        )
+        if fb:
+            return fb
+
+    return active_exp[0]
+
+
 async def push_management_entry_to_zoho(
     sb: Any,
     *,
@@ -1088,13 +1139,14 @@ async def push_management_entry_to_zoho(
     amount_inr: float,
     payment_account_id: str,
     to_payment_account_id: str | None = None,
-    reference_number: str,
-    txn_date: str | None = None,
     party_name: str = "",
     zoho_contact_id: str | None = None,
     project_id: str | None = None,
+    reference_number: str,
+    txn_date: str | None = None,
     notes: str = "",
     actor_label: str = "Munim",
+    expense_category: str | None = None,
 ) -> dict[str, Any]:
     """Push a confirmed management ledger transaction to Zoho Books India (GST-off Standard Plan)
     with reference_number idempotency and 1:1 Project Reporting Tag linking.
@@ -1125,7 +1177,7 @@ async def push_management_entry_to_zoho(
             zoho_contact_id = bridge.get("zoho_contact_id")
 
     if not settings.zoho_enabled:
-        return {
+        stub_out: dict[str, Any] = {
             "ok": True,
             "stubbed": True,
             "status_code": 200,
@@ -1134,6 +1186,11 @@ async def push_management_entry_to_zoho(
             "zoho_id": f"STUB-{reference_number}",
             "account_name": from_acc["display_name"],
         }
+        if entry_kind == "expense":
+            inferred_cat = normalize_or_infer_expense_category(expense_category, party_name, notes)
+            stub_out["expense_category"] = inferred_cat
+            stub_out["expense_account_name"] = get_expense_category_label(inferred_cat)
+        return stub_out
 
     order_tags = build_zoho_standard_order_tags(
         project_code=bridge.get("cf_project_code"),
@@ -1342,11 +1399,9 @@ async def push_management_entry_to_zoho(
                 }
             coa_resp = await _zoho_request(client, "GET", "/chartofaccounts")
             accounts = coa_resp.json().get("chartofaccounts", []) if coa_resp.is_success else []
-            expense_acc = next(
-                (a["account_id"] for a in accounts if a.get("account_type") in ("expense", "cost_of_goods_sold") and a.get("is_active")),
-                None,
-            )
-            if not expense_acc:
+            cat_code = normalize_or_infer_expense_category(expense_category, party_name, notes)
+            matched_coa = _pick_zoho_expense_account(accounts, cat_code)
+            if not matched_coa:
                 return {
                     "ok": False,
                     "status_code": 400,
@@ -1354,7 +1409,7 @@ async def push_management_entry_to_zoho(
                     "error": {"message": "No active Expense account found in Zoho Chart of Accounts."},
                 }
             exp_payload = {
-                "account_id": expense_acc,
+                "account_id": matched_coa["account_id"],
                 "paid_through_account_id": from_zoho_acc,
                 "amount": round(float(amount_inr), 2),
                 "reference_number": reference_number,
@@ -1374,6 +1429,8 @@ async def push_management_entry_to_zoho(
                     "error_kind": "none",
                     "zoho_type": "expense",
                     "zoho_id": eid,
+                    "expense_category": cat_code,
+                    "expense_account_name": matched_coa.get("account_name"),
                 }
             return {
                 "ok": False,

@@ -2143,5 +2143,171 @@ async def test_four_cash_wallets_natural_shorthand_and_zoho_safe_matching():
     assert by_code["float_shreyansh"]["zoho_account_id"] == "z-shr"
 
 
+@pytest.mark.asyncio
+async def test_expense_categorization_salary_routing_and_zoho_coa_selection():
+    from app.services import goal_primitives, zoho
+
+    # 1. Inference & LLM normalization across all workshop categories
+    assert goal_primitives.normalize_or_infer_expense_category(None, "Paid 15,000 salary to Lala Ji") == "salary_wages"
+    assert goal_primitives.normalize_or_infer_expense_category("Salaries", "") == "salary_wages"
+    assert goal_primitives.normalize_or_infer_expense_category(None, "Ansh paid 650 for tempo bhada") == "transport_freight"
+    assert goal_primitives.normalize_or_infer_expense_category(None, "Rohit paid 420 for fevicol and screws") == "raw_materials"
+    assert goal_primitives.normalize_or_infer_expense_category(None, "200 chai nasta workshop") == "food_tea_mess"
+    assert goal_primitives.normalize_or_infer_expense_category(None, "Shop rent 25,000 from RGB") == "rent"
+    assert goal_primitives.normalize_or_infer_expense_category(None, "Electricity bijli bill 4500") == "utilities_office"
+    assert goal_primitives.normalize_or_infer_expense_category(None, "Cutter blade sharpening 300") == "repairs_maintenance"
+    assert goal_primitives.normalize_or_infer_expense_category(None, "Random misc 100") == "other_expense"
+
+    # 2. Salaried-karigar auto-guard flips vendor_payment -> expense(salary_wages), keeps real vendors untouched
+    sb = FakeSupabase(
+        {
+            "payment_accounts": [
+                {
+                    "id": "acc-axis",
+                    "code": "axis",
+                    "display_name": "Axis Bank",
+                    "account_kind": "bank",
+                    "aliases": ["axis", "axis bank"],
+                    "zoho_account_id": "za-axis",
+                    "is_active": True,
+                }
+            ],
+            "people": [
+                {
+                    "id": "p-lala",
+                    "full_name": "Lala Ji",
+                    "person_type": "salaried_karigar",
+                    "aliases": ["Lala"],
+                    "payout_aliases": ["Ruksar Bano"],
+                    "is_active": True,
+                },
+                {
+                    "id": "p-manish",
+                    "full_name": "Manish Cushioning",
+                    "person_type": "contractor_mistri",
+                    "aliases": ["Manish"],
+                    "payout_aliases": [],
+                    "is_active": True,
+                },
+            ],
+            "vendors": [
+                {
+                    "id": "v-doorset",
+                    "canonical_name": "Doorset",
+                    "vendor_kind": "supplier",
+                    "aliases": [],
+                    "is_active": True,
+                }
+            ],
+        }
+    )
+
+    karigar_slots = {
+        "operation_kind": "vendor_payment",
+        "party_name": "Lala Ji",
+        "amount_inr": 15000,
+        "payment_account_code": "axis",
+        "summary_title": "Paid Lala Ji",
+    }
+    agent_core._backfill_financial_slots_from_text(
+        sb, karigar_slots, user_text="Paid 15,000 to Lala Ji from Axis", heard_transcript=None
+    )
+    assert karigar_slots["operation_kind"] == "expense"
+    assert karigar_slots["expense_category"] == "salary_wages"
+
+    proxy_slots = {
+        "operation_kind": "vendor_payment",
+        "party_name": "Ruksar Bano",
+        "amount_inr": 8000,
+        "payment_account_code": "axis",
+        "summary_title": "Transfer to Ruksar Bano",
+    }
+    agent_core._backfill_financial_slots_from_text(
+        sb, proxy_slots, user_text="Paid 8,000 to Ruksar Bano from Axis", heard_transcript=None
+    )
+    assert proxy_slots["operation_kind"] == "expense"
+    assert proxy_slots["expense_category"] == "salary_wages"
+
+    vendor_slots = {
+        "operation_kind": "vendor_payment",
+        "party_name": "Doorset",
+        "amount_inr": 12000,
+        "payment_account_code": "axis",
+        "summary_title": "Paid Doorset",
+    }
+    agent_core._backfill_financial_slots_from_text(
+        sb, vendor_slots, user_text="Paid 12,000 to Doorset from Axis", heard_transcript=None
+    )
+    assert vendor_slots["operation_kind"] == "vendor_payment"
+
+    # 3. Confirmation card includes human Category line
+    confirm_txt = agent_core._format_confirmation_summary("expense", karigar_slots)
+    assert "Category: *Salaries & Wages*" in confirm_txt
+
+    # 4. Zoho push selects exact Chart of Accounts account_id (never blindly index 0)
+    fake_coa = [
+        {"account_id": "coa-it", "account_name": "IT and Internet Expenses", "account_type": "expense", "is_active": True},
+        {"account_id": "coa-sal", "account_name": "Salaries and Employee Wages", "account_type": "expense", "is_active": True},
+        {"account_id": "coa-trn", "account_name": "Transportation Expense", "account_type": "expense", "is_active": True},
+        {"account_id": "coa-oth", "account_name": "Other Expenses", "account_type": "expense", "is_active": True},
+    ]
+    fake_settings = Settings(
+        zoho_client_id="cid",
+        zoho_client_secret="csec",
+        zoho_refresh_token="rtok",
+        zoho_org_id="org1",
+    )
+    posted_account_ids: list[str] = []
+
+    async def fake_zoho_req(client, method, path, *, params=None, json_body=None):
+        if method == "GET" and path == "/expenses":
+            return httpx.Response(200, json={"expenses": []})
+        if method == "GET" and path == "/chartofaccounts":
+            return httpx.Response(200, json={"chartofaccounts": fake_coa})
+        if method == "POST" and path == "/expenses":
+            posted_account_ids.append(str(json_body["account_id"]))
+            return httpx.Response(200, json={"expense": {"expense_id": f"ze-{len(posted_account_ids)}"}})
+        raise AssertionError(f"Unexpected Zoho call: {method} {path}")
+
+    with (
+        patch("app.services.zoho.get_settings", return_value=fake_settings),
+        patch("app.services.zoho._zoho_request", side_effect=fake_zoho_req),
+    ):
+        res_sal = await zoho.push_management_entry_to_zoho(
+            sb,
+            entry_kind="expense",
+            amount_inr=15000,
+            payment_account_id="acc-axis",
+            reference_number="MUNIM-SAL-1",
+            party_name="Lala Ji",
+            notes="October salary",
+            expense_category="salary_wages",
+        )
+        res_trn = await zoho.push_management_entry_to_zoho(
+            sb,
+            entry_kind="expense",
+            amount_inr=650,
+            payment_account_id="acc-axis",
+            reference_number="MUNIM-TRN-1",
+            notes="tempo bhada",
+            expense_category="transport_freight",
+        )
+        res_oth = await zoho.push_management_entry_to_zoho(
+            sb,
+            entry_kind="expense",
+            amount_inr=100,
+            payment_account_id="acc-axis",
+            reference_number="MUNIM-OTH-1",
+            notes="random",
+            expense_category="other_expense",
+        )
+
+    assert posted_account_ids == ["coa-sal", "coa-trn", "coa-oth"]
+    assert res_sal["expense_account_name"] == "Salaries and Employee Wages"
+    assert res_trn["expense_account_name"] == "Transportation Expense"
+    assert res_oth["expense_account_name"] == "Other Expenses"
+
+
+
 
 

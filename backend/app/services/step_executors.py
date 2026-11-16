@@ -25,6 +25,7 @@ from app.services.goal_primitives import (
     PROJECT_PIPELINE_STAGES,
     build_stage_undo_snapshot,
     format_inr,
+    get_expense_category_label,
     make_zoho_reference_number,
     merge_unique_str_list,
 )
@@ -825,6 +826,7 @@ async def execute_munim_financial_step(
     txn_date: str | None = None,
     notes: str = "",
     actor_label: str = "Munim",
+    expense_category: str | None = None,
 ) -> dict[str, Any]:
     """Idempotent Munim -> Zoho Books Standard push + Smart Auto-Bridge Payment Track sync."""
     ref_no = make_zoho_reference_number(goal_id, step_index)
@@ -837,13 +839,14 @@ async def execute_munim_financial_step(
         amount_inr=amount_inr,
         payment_account_id=payment_account_id,
         to_payment_account_id=to_payment_account_id,
-        reference_number=ref_no,
-        txn_date=clean_txn_date,
         party_name=party_name,
         zoho_contact_id=zoho_contact_id,
         project_id=project_id,
+        reference_number=ref_no,
+        txn_date=clean_txn_date,
         notes=notes,
         actor_label=actor_label,
+        expense_category=expense_category,
     )
     if not z_res.get("ok"):
         return z_res
@@ -881,6 +884,10 @@ async def execute_munim_financial_step(
     acc_label = acc_row[0]["display_name"] if acc_row else "Account"
     arrow = "🟢 IN" if entry_kind == "customer_receipt" else ("🔄 TRANSFER" if entry_kind == "float_transfer" else "🔴 OUT")
     z_badge = "Zoho Stub" if z_res.get("stubbed") else f"Zoho `{z_res.get('zoho_type')}`"
+    cat_note = ""
+    if entry_kind == "expense":
+        cat_lbl = z_res.get("expense_account_name") or get_expense_category_label(expense_category)
+        cat_note = f" · _{cat_lbl}_"
 
     return {
         "ok": True,
@@ -888,7 +895,7 @@ async def execute_munim_financial_step(
         "error_kind": "none",
         "zoho_id": z_res.get("zoho_id"),
         "reference_number": ref_no,
-        "receipt": f"{arrow} *{format_inr(amount_inr)}* ({acc_label}) — {party_name or entry_kind} [{z_badge}]{pay_stage_note}",
+        "receipt": f"{arrow} *{format_inr(amount_inr)}* ({acc_label}) — {party_name or entry_kind}{cat_note} [{z_badge}]{pay_stage_note}",
     }
 
 

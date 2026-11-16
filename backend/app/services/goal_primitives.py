@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from datetime import datetime, time as dt_time, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
+import re
 from typing import Any, Literal
 import uuid
 
@@ -487,3 +488,138 @@ def compute_ist_attendance_minutes(
         int((out_ist - ot_start).total_seconds() // 60) if out_ist > ot_start else 0
     )
     return worked_minutes, overtime_minutes
+
+
+# ---------------------------------------------------------------------------
+# Munim Expense Categorization & Zoho Chart-of-Accounts Routing
+# ---------------------------------------------------------------------------
+EXPENSE_CATEGORIES: dict[str, dict[str, Any]] = {
+    "salary_wages": {
+        "label": "Salaries & Wages",
+        "zoho_names": ["salaries and employee wages", "salaries", "wages"],
+        "pattern": r"\b(salary|salaries|tankhwah|tankha|pagar|wages|wage|dihadi|fnf|bonus|karigar\s+advance|salary\s+advance|staff\s+advance)\b",
+    },
+    "contractor_labor": {
+        "label": "Contractor / Site Labor",
+        "zoho_names": ["subcontractor", "labor", "job costing", "consultant expense"],
+        "pattern": r"\b(majdoori|mazdoori|labour|labor|theka|contractor|fitting\s+charge|polish\s+labour|unloading\s+labour|loading\s+labour|cushioning\s+charge)\b",
+    },
+    "transport_freight": {
+        "label": "Transport & Freight",
+        "zoho_names": ["transportation expense", "automobile expense", "travel expense"],
+        "pattern": r"\b(tempo|auto|truck|pickup|transport|transportation|bhada|bhaada|freight|cartage|petrol|diesel|fuel|toll|riksa|rickshaw)\b",
+    },
+    "raw_materials": {
+        "label": "Raw Materials & Hardware",
+        "zoho_names": ["raw materials and consumables", "materials", "merchandise", "cost of goods sold"],
+        "pattern": r"\b(ply|plywood|hdhmr|mdf|board|laminate|sunmica|mica|veneer|acrylic|hardware|hinge|hinges|channel|screw|screws|fevicol|adhesive|glue|edgeband|pvc\s+tape|foam|fabric|glass|mirror|handle|handles|lock|locks)\b",
+    },
+    "food_tea_mess": {
+        "label": "Tea, Mess & Staff Welfare",
+        "zoho_names": ["meals and entertainment"],
+        "pattern": r"\b(chai|tea|coffee|nasta|nashta|snacks|lunch|dinner|khana|mess|ration|water\s+camper|pani|milk|doodh)\b",
+    },
+    "rent": {
+        "label": "Shop / Godown Rent",
+        "zoho_names": ["rent expense"],
+        "pattern": r"\b(rent|godown\s+rent|shop\s+rent|dukan\s+kiraya|godam\s+kiraya)\b",
+    },
+    "utilities_office": {
+        "label": "Electricity, Phone & Office",
+        "zoho_names": ["telephone expense", "it and internet expenses", "office supplies", "printing and stationery"],
+        "pattern": r"\b(electricity|bijli|light\s+bill|power\s+bill|internet|wifi|broadband|recharge|mobile\s+bill|telephone|stationery|printing|paper|pen|office)\b",
+    },
+    "repairs_maintenance": {
+        "label": "Machine & Shop Maintenance",
+        "zoho_names": ["repairs and maintenance", "janitorial expense"],
+        "pattern": r"\b(repair|repairs|maintenance|blade|dhaar|sharpening|cutter|compressor|machine|tool\s+repair|welding|cleaning|safai|plumber|electrician)\b",
+    },
+    "other_expense": {
+        "label": "Other Workshop Expense",
+        "zoho_names": ["other expenses", "uncategorized"],
+        "pattern": "",
+    },
+}
+
+_EXPENSE_CATEGORY_ALIASES: dict[str, str] = {
+    "salary": "salary_wages",
+    "salaries": "salary_wages",
+    "salaries_and_wages": "salary_wages",
+    "salaries_and_employee_wages": "salary_wages",
+    "salary_advance": "salary_wages",
+    "wages": "salary_wages",
+    "payroll": "salary_wages",
+    "labor": "contractor_labor",
+    "labour": "contractor_labor",
+    "subcontractor": "contractor_labor",
+    "contractor": "contractor_labor",
+    "transport": "transport_freight",
+    "transportation": "transport_freight",
+    "transportation_expense": "transport_freight",
+    "freight": "transport_freight",
+    "travel": "transport_freight",
+    "fuel": "transport_freight",
+    "material": "raw_materials",
+    "materials": "raw_materials",
+    "raw_material": "raw_materials",
+    "raw_materials_and_consumables": "raw_materials",
+    "hardware": "raw_materials",
+    "food": "food_tea_mess",
+    "tea": "food_tea_mess",
+    "mess": "food_tea_mess",
+    "meals": "food_tea_mess",
+    "meals_and_entertainment": "food_tea_mess",
+    "shop_rent": "rent",
+    "godown_rent": "rent",
+    "rent_expense": "rent",
+    "utilities": "utilities_office",
+    "electricity": "utilities_office",
+    "internet": "utilities_office",
+    "telephone": "utilities_office",
+    "office": "utilities_office",
+    "stationery": "utilities_office",
+    "repairs": "repairs_maintenance",
+    "repair": "repairs_maintenance",
+    "maintenance": "repairs_maintenance",
+    "other": "other_expense",
+    "other_expenses": "other_expense",
+}
+
+_INFER_SCAN_ORDER: tuple[str, ...] = (
+    "salary_wages",
+    "rent",
+    "transport_freight",
+    "food_tea_mess",
+    "repairs_maintenance",
+    "utilities_office",
+    "contractor_labor",
+    "raw_materials",
+)
+
+
+def normalize_or_infer_expense_category(
+    raw_category: str | None, *texts: str | None
+) -> str:
+    """Resolve canonical expense category key from LLM hint and/or Hinglish text cues."""
+    if raw_category and str(raw_category).strip():
+        key = re.sub(r"[\s/&,-]+", "_", str(raw_category).strip().lower()).strip("_")
+        if key in EXPENSE_CATEGORIES and key != "other_expense":
+            return key
+        mapped = _EXPENSE_CATEGORY_ALIASES.get(key)
+        if mapped and mapped != "other_expense":
+            return mapped
+
+    combined = " ".join((t or "").strip().lower() for t in texts if t and str(t).strip())
+    if combined:
+        for code in _INFER_SCAN_ORDER:
+            pat = EXPENSE_CATEGORIES[code]["pattern"]
+            if pat and re.search(pat, combined):
+                return code
+    return "other_expense"
+
+
+def get_expense_category_label(code: str | None) -> str:
+    """Return human-readable workshop expense category label."""
+    if code and code in EXPENSE_CATEGORIES:
+        return str(EXPENSE_CATEGORIES[code]["label"])
+    return str(EXPENSE_CATEGORIES["other_expense"]["label"])

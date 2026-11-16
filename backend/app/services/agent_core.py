@@ -40,8 +40,10 @@ from app.services.goal_primitives import (
     compute_missing_customer_onboarding_slots,
     format_inr,
     format_voice_receipt_header,
+    get_expense_category_label,
     is_high_sensitivity_master_mutation,
     make_zoho_reference_number,
+    normalize_or_infer_expense_category,
     select_hydrogen_thinking_level,
 )
 
@@ -272,6 +274,10 @@ class GoalIntentItem(BaseModel):
         description="REQUIRED for money entries: exact account code from PAYMENT_ACCOUNTS (e.g. 'cash_galla', 'axis', 'rgb', 'ccrgb', 'paytm', 'float_ansh', 'float_kamlesh', 'float_rohit', 'float_shreyansh').",
     )
     to_payment_account_code: str | None = None
+    expense_category: str | None = Field(
+        default=None,
+        description="For expense (including salaries/karigar payouts): 'salary_wages' | 'contractor_labor' | 'raw_materials' | 'transport_freight' | 'food_tea_mess' | 'rent' | 'utilities_office' | 'repairs_maintenance' | 'other_expense'.",
+    )
     party_name: str | None = Field(
         default=None,
         description="Customer, vendor, or payee name for receipts, bills, or payouts.",
@@ -585,6 +591,8 @@ def _build_system_instruction(grounding_json: str) -> str:
         "4. MUNIM FINANCIAL RULES (Zoho 100% Management Ledger, GST-Off): Every receipt, expense, "
         "vendor payment, or float transfer MUST populate the JSON fields `amount_inr` (number) AND `payment_account_code` "
         "(from `payment_accounts`, e.g., `cash_galla`, `axis`, `float_ansh`), plus `party_name`. "
+        "For staff/karigar salary or salary advance payouts use `operation_kind='expense'` with `expense_category='salary_wages'` (never `vendor_payment`); "
+        "for all `expense` entries populate `expense_category` (`salary_wages` | `contractor_labor` | `raw_materials` | `transport_freight` | `food_tea_mess` | `rent` | `utilities_office` | `repairs_maintenance` | `other_expense`). "
         "CRITICAL: Never put the amount or account ONLY inside `summary_title` or `direct_reply_text` — always fill "
         "`amount_inr` and `payment_account_code` in `goal_items`. If account or party is truly missing, ask for ALL "
         "missing fields in ONE consolidated `clarification_question`. "
@@ -1012,6 +1020,51 @@ def _extract_payment_account_code_from_text(sb: Any, *texts: str | None) -> str 
     return None
 
 
+def _match_person_kind_for_party(
+    sb: Any, party_name: str | None
+) -> str | None:
+    """Return person_type ('salaried_karigar' / 'contractor_mistri') if party_name matches a non-vendor worker."""
+    pname = (party_name or "").strip().lower()
+    if not pname:
+        return None
+    try:
+        vendors = (
+            sb.table("vendors")
+            .select("canonical_name,aliases,is_active")
+            .eq("is_active", True)
+            .execute()
+            .data
+            or []
+        )
+        for v in vendors:
+            v_names = [
+                str(v.get("canonical_name") or "").strip().lower(),
+                *[str(a).strip().lower() for a in (v.get("aliases") or [])],
+            ]
+            if any(vn and vn == pname for vn in v_names):
+                return None
+
+        people = (
+            sb.table("people")
+            .select("full_name,person_type,aliases,payout_aliases,is_active")
+            .eq("is_active", True)
+            .execute()
+            .data
+            or []
+        )
+        for p in people:
+            p_names = [
+                str(p.get("full_name") or "").strip().lower(),
+                *[str(a).strip().lower() for a in (p.get("aliases") or [])],
+                *[str(pa).strip().lower() for pa in (p.get("payout_aliases") or [])],
+            ]
+            if any(pn and pn == pname for pn in p_names):
+                return str(p.get("person_type") or "")
+    except Exception:
+        return None
+    return None
+
+
 def _backfill_financial_slots_from_text(
     sb: Any,
     slots: dict[str, Any],
@@ -1019,7 +1072,7 @@ def _backfill_financial_slots_from_text(
     user_text: str | None,
     heard_transcript: str | None,
 ) -> None:
-    """Ensure amount_inr, payment_account_code, and party_name are populated if mentioned in text/summary."""
+    """Ensure amount_inr, payment_account_code, expense_category, and party_name are populated cleanly."""
     op = str(slots.get("operation_kind") or "")
     if op not in ("customer_receipt", "vendor_payment", "expense", "float_transfer"):
         return
@@ -1045,6 +1098,50 @@ def _backfill_financial_slots_from_text(
         )
         if p_rows and p_rows[0].get("customer_name"):
             slots["party_name"] = p_rows[0]["customer_name"]
+
+    matched_person_kind = _match_person_kind_for_party(sb, slots.get("party_name"))
+    combined_cues = " ".join(
+        str(x).strip().lower()
+        for x in (
+            user_text,
+            heard_transcript,
+            slots.get("notes"),
+            slots.get("summary_title"),
+        )
+        if x and str(x).strip()
+    )
+    has_salary_kw = bool(
+        re.search(
+            r"\b(salary|salaries|tankhwah|tankha|pagar|wages|wage|dihadi|fnf|bonus)\b",
+            combined_cues,
+        )
+    )
+
+    # Salaried-karigar / salary payouts belong in Zoho Salaries Expense, never Vendor Payments
+    if op == "vendor_payment" and (
+        matched_person_kind == "salaried_karigar"
+        or slots.get("expense_category") == "salary_wages"
+        or has_salary_kw
+    ):
+        slots["operation_kind"] = "expense"
+        op = "expense"
+        slots["expense_category"] = "salary_wages"
+
+    if op == "expense":
+        cat = normalize_or_infer_expense_category(
+            slots.get("expense_category"),
+            user_text,
+            heard_transcript,
+            slots.get("notes"),
+            slots.get("summary_title"),
+            slots.get("party_name"),
+        )
+        if cat == "other_expense":
+            if matched_person_kind == "salaried_karigar":
+                cat = "salary_wages"
+            elif matched_person_kind == "contractor_mistri":
+                cat = "contractor_labor"
+        slots["expense_category"] = cat
 
 
 def _is_valid_uuid(val: Any) -> bool:
@@ -1663,7 +1760,12 @@ def _format_confirmation_summary(
         acc = (slots.get("payment_account_code") or "").upper()
         badge = "🟢 PAISA AAYA (IN)" if op == "customer_receipt" else ("🔄 TRANSFER" if op == "float_transfer" else "🔴 PAISA GAYA (OUT)")
         party = slots.get("party_name") or slots.get("to_payment_account_code") or op
-        return f"{badge}: *{amt}*\n• Party/To: *{party}*\n• Account: `{acc}`\n• Note: _{slots.get('notes') or slots.get('summary_title') or '-'}_"
+        cat_line = (
+            f"\n• Category: *{get_expense_category_label(slots.get('expense_category'))}*"
+            if op == "expense"
+            else ""
+        )
+        return f"{badge}: *{amt}*\n• Party/To: *{party}*{cat_line}\n• Account: `{acc}`\n• Note: _{slots.get('notes') or slots.get('summary_title') or '-'}_"
     if op == "supplier_draft_bill":
         amt = format_inr(float(slots.get("amount_inr") or 0))
         return (
@@ -2174,6 +2276,7 @@ async def _run_single_step(
             txn_date=slots.get("txn_date"),
             notes=str(slots.get("notes") or ""),
             actor_label=actor_label,
+            expense_category=slots.get("expense_category"),
         )
     if op == "supplier_draft_bill":
         vendor_name = str(slots.get("party_name") or "")
