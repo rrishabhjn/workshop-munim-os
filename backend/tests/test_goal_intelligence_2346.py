@@ -1117,3 +1117,38 @@ def test_agent_envelope_sanitizes_literal_null_strings():
     assert item.estimator_ids == []
     assert item.project_id == "7923bc50-77dc-4779-9a73-61cf722c318e"
 
+
+def test_financial_slot_backfill_extracts_amount_and_cash_account():
+    sb = FakeSupabase(
+        {
+            "payment_accounts": [
+                {"code": "cash_galla", "display_name": "Cash Galla", "aliases": ["cash", "galla", "nakad"], "is_active": True},
+                {"code": "rgb", "display_name": "RGB (Gramin Bank)", "aliases": ["rgb", "gramin bank"], "is_active": True},
+            ],
+            "projects": [
+                {"id": "7923bc50-77dc-4779-9a73-61cf722c318e", "customer_name": "Praveen Mehta"}
+            ],
+        }
+    )
+    slots = {
+        "operation_kind": "customer_receipt",
+        "project_id": "7923bc50-77dc-4779-9a73-61cf722c318e",
+        "summary_title": "Praveen Mehta se ₹20,000 advance Cash Galla mein receive",
+    }
+    agent_core._backfill_financial_slots_from_text(
+        sb,
+        slots,
+        user_text="Praveen Mehta Advance Received 20,000 cash",
+        heard_transcript=None,
+    )
+    assert slots["amount_inr"] == 20000.0
+    assert slots["payment_account_code"] == "cash_galla"
+    assert slots["party_name"] == "Praveen Mehta"
+
+    slots_k = {"operation_kind": "customer_receipt", "summary_title": "Received 50k in RGB"}
+    agent_core._backfill_financial_slots_from_text(
+        sb, slots_k, user_text="50k rgb", heard_transcript=None
+    )
+    assert slots_k["amount_inr"] == 50000.0
+    assert slots_k["payment_account_code"] == "rgb"
+

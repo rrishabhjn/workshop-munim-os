@@ -21,6 +21,7 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import json
 import logging
+import re
 from typing import Any, Literal
 import uuid
 
@@ -154,13 +155,19 @@ class GoalIntentItem(BaseModel):
     assembly_mistri_id: str | None = None
 
     # Munim Financial & Bill Slots
-    amount_inr: float | None = None
+    amount_inr: float | None = Field(
+        default=None,
+        description="REQUIRED for money entries: numeric INR amount (e.g. 20000 for ₹20,000 or 50000 for 50k).",
+    )
     payment_account_code: str | None = Field(
         default=None,
-        description="Account code from PAYMENT_ACCOUNTS (e.g. 'cash_galla', 'axis', 'float_ansh').",
+        description="REQUIRED for money entries: exact account code from PAYMENT_ACCOUNTS (e.g. 'cash_galla' for cash/galla, 'axis', 'rgb', 'paytm', 'float_ansh').",
     )
     to_payment_account_code: str | None = None
-    party_name: str | None = None
+    party_name: str | None = Field(
+        default=None,
+        description="Customer, vendor, or payee name for receipts, bills, or payouts.",
+    )
     zoho_contact_id: str | None = None
     txn_date: str | None = None
     invoice_no: str | None = None
@@ -463,9 +470,11 @@ def _build_system_instruction(grounding_json: str) -> str:
         "(items/rooms). If homonyms exist, set `is_ambiguous=true`, populate `choices` "
         "(1: Existing Active Order, 2: Repeat Customer New Lead, 3: Brand-New Customer), and ask in `clarification_question`.\n"
         "4. MUNIM FINANCIAL RULES (Zoho 100% Management Ledger, GST-Off): Every receipt, expense, "
-        "vendor payment, or float transfer MUST have `amount_inr` AND `payment_account_code` "
-        "(from `payment_accounts`, e.g., `cash_galla`, `axis`, `float_ansh`). If account or party is "
-        "missing, ask for ALL missing fields in ONE consolidated `clarification_question`. "
+        "vendor payment, or float transfer MUST populate the JSON fields `amount_inr` (number) AND `payment_account_code` "
+        "(from `payment_accounts`, e.g., `cash_galla`, `axis`, `float_ansh`), plus `party_name`. "
+        "CRITICAL: Never put the amount or account ONLY inside `summary_title` or `direct_reply_text` — always fill "
+        "`amount_inr` and `payment_account_code` in `goal_items`. If account or party is truly missing, ask for ALL "
+        "missing fields in ONE consolidated `clarification_question`. "
         "Never put a Supabase UUID into `zoho_contact_id`.\n"
         "5. PRODUCTION LIFECYCLE STAGES:\n"
         "   - Project `pipeline_stage_move`: `lead` -> `design` -> `estimating` -> `quoted_awaiting_advance` -> `site_sizing_boq` -> `execution` -> `completed`.\n"
@@ -806,6 +815,99 @@ def _fetch_target_row_for_slots(sb: Any, op: str, slots: dict[str, Any]) -> dict
     return rows[0] if rows else None
 
 
+def _extract_inr_amount_from_text(*texts: str | None) -> float | None:
+    """Deterministic fallback to extract an INR amount (e.g. ₹20,000, 50k, 1.5L) if LLM left amount_inr blank."""
+    for raw in texts:
+        txt = (raw or "").strip()
+        if not txt:
+            continue
+        cleaned = re.sub(r"\bPRJ-[A-Z0-9-]+\b", " ", txt, flags=re.IGNORECASE)
+        m_lakh = re.search(r"(?:₹|rs\.?|inr)?\s*(\d+(?:\.\d+)?)\s*(?:lakh|lac|l)\b", cleaned, re.IGNORECASE)
+        if m_lakh:
+            val = round(float(m_lakh.group(1)) * 100000.0, 2)
+            if val > 0:
+                return val
+        m_k = re.search(r"(?:₹|rs\.?|inr)?\s*(\d+(?:\.\d+)?)\s*k\b", cleaned, re.IGNORECASE)
+        if m_k:
+            val = round(float(m_k.group(1)) * 1000.0, 2)
+            if val > 0:
+                return val
+        for m_num in re.finditer(r"(?:₹|rs\.?|inr)?\s*(\d[\d,]*(?:\.\d{1,2})?)", cleaned, re.IGNORECASE):
+            num_str = m_num.group(1).replace(",", "")
+            try:
+                val = round(float(num_str), 2)
+                if val >= 10:
+                    return val
+            except ValueError:
+                continue
+    return None
+
+
+def _extract_payment_account_code_from_text(sb: Any, *texts: str | None) -> str | None:
+    """Deterministic fallback to match payment_accounts aliases when LLM omitted payment_account_code."""
+    combined = " ".join((t or "").strip().lower() for t in texts if t and t.strip())
+    if not combined:
+        return None
+    accounts = (
+        sb.table("payment_accounts")
+        .select("code,display_name,aliases")
+        .eq("is_active", True)
+        .execute()
+        .data
+        or []
+    )
+    candidates: list[tuple[str, str]] = []
+    for a in accounts:
+        code = str(a.get("code") or "").strip()
+        if not code:
+            continue
+        tokens = [code.replace("_", " "), str(a.get("display_name") or ""), *(a.get("aliases") or [])]
+        for tok in tokens:
+            t_low = str(tok).strip().lower()
+            if len(t_low) >= 2:
+                candidates.append((t_low, code))
+    candidates.sort(key=lambda pair: len(pair[0]), reverse=True)
+    for tok, code in candidates:
+        if re.search(rf"\b{re.escape(tok)}\b", combined):
+            return code
+    return None
+
+
+def _backfill_financial_slots_from_text(
+    sb: Any,
+    slots: dict[str, Any],
+    *,
+    user_text: str | None,
+    heard_transcript: str | None,
+) -> None:
+    """Ensure amount_inr, payment_account_code, and party_name are populated if mentioned in text/summary."""
+    op = str(slots.get("operation_kind") or "")
+    if op not in ("customer_receipt", "vendor_payment", "expense", "float_transfer"):
+        return
+    if slots.get("amount_inr") in (None, "", 0, 0.0):
+        amt = _extract_inr_amount_from_text(user_text, heard_transcript, slots.get("summary_title"))
+        if amt is not None:
+            slots["amount_inr"] = amt
+    if not slots.get("payment_account_code"):
+        acc_code = _extract_payment_account_code_from_text(
+            sb, user_text, heard_transcript, slots.get("summary_title")
+        )
+        if acc_code:
+            slots["payment_account_code"] = acc_code
+    if not slots.get("party_name") and slots.get("project_id") and op == "customer_receipt":
+        p_rows = (
+            sb.table("projects")
+            .select("customer_name")
+            .eq("id", slots["project_id"])
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if p_rows and p_rows[0].get("customer_name"):
+            slots["party_name"] = p_rows[0]["customer_name"]
+
+
 async def _process_goal_intent_item(
     sb: Any,
     *,
@@ -880,6 +982,13 @@ async def _process_goal_intent_item(
         and slots.get("archive_entity_kind") == "order"
     ):
         slots["project_id"] = ui_context["viewing_project_id"]
+
+    _backfill_financial_slots_from_text(
+        sb,
+        slots,
+        user_text=user_text,
+        heard_transcript=heard_transcript,
+    )
 
     # Resolve payment_account_code -> payment_account_id
     if slots.get("payment_account_code") and slots["payment_account_code"] in acc_code_to_id:
