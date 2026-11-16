@@ -50,32 +50,77 @@ def _get_decisions_client() -> genai.Client:
     )
 
 
-def is_group_message_relevant(text: str, domain_channel: str = "production") -> bool:
-    """Return True if an unaddressed group text message is an actionable workshop update or query."""
+def is_group_message_relevant(
+    text: str,
+    domain_channel: str = "production",
+    pending_goals: list[dict[str, Any]] | None = None,
+) -> bool:
+    """Return True if an unaddressed group text message is an actionable update or answers an open goal."""
     clean = (text or "").strip()
     if not clean:
         return False
     if clean.startswith("/") or "@" in clean:
         return True
 
+    pending_lines: list[str] = []
+    for g in (pending_goals or [])[:3]:
+        st = str(g.get("status") or "")
+        summary = str(g.get("summary_title") or "")[:90]
+        missing = ", ".join(str(m) for m in (g.get("missing_slots") or []))
+        prompt = str(g.get("pending_prompt") or "").replace("\n", " ")[:140]
+        pending_lines.append(
+            f"- [{st}] {summary} | missing=[{missing}] | bot_asked={prompt}"
+        )
+
     settings = get_settings()
     if not settings.gemini_api_key:
+        if pending_lines:
+            return clean.lower().strip("!.?,") not in {
+                "good morning",
+                "gm",
+                "good night",
+                "gn",
+                "ok",
+                "okay",
+                "thanks",
+                "thank you",
+            }
         return any(ch.isdigit() for ch in clean)
+
+    if pending_lines:
+        input_text = (
+            f"Channel={domain_channel}\n"
+            f"PendingOpenGoals:\n"
+            + "\n".join(pending_lines)
+            + f"\nMessage: {clean[:600]}"
+        )
+        instructions = (
+            "Is this Hindi/Hinglish/English message EITHER (1) reporting or asking about "
+            "furniture orders, customer leads, design/sizing/BOQ, mistri assignments, "
+            "material stock/orders, deliveries, bills, payments, cash, or balances, OR "
+            "(2) answering, providing a requested detail (such as a city/landmark, name, "
+            "scope, amount, account, or mistri), confirming, editing, or cancelling one "
+            "of the PendingOpenGoals above — as opposed to unrelated casual social greetings "
+            "like 'good morning' or 'chai mangwa lo'?"
+        )
+    else:
+        input_text = f"Channel={domain_channel}\nMessage: {clean[:600]}"
+        instructions = (
+            "Is this Hindi/Hinglish/English message reporting or asking about "
+            "furniture orders, customer leads, design/sizing/BOQ, mistri assignments, "
+            "material stock/orders, deliveries, bills, payments, cash, or balances "
+            "(as opposed to casual social greetings like 'good morning' or 'ok')?"
+        )
 
     try:
         client = _get_decisions_client()
         resp = client.decisions.create(
             model=settings.gemini_decision_model,
-            input=f"Channel={domain_channel}\nMessage: {clean[:600]}",
+            input=input_text,
             questions={
                 "is_workshop_relevant": {
                     "type": "noul",
-                    "instructions": (
-                        "Is this Hindi/Hinglish/English message reporting or asking about "
-                        "furniture orders, customer leads, design/sizing/BOQ, mistri assignments, "
-                        "material stock/orders, deliveries, bills, payments, cash, or balances "
-                        "(as opposed to casual social greetings like 'good morning' or 'ok')?"
-                    ),
+                    "instructions": instructions,
                 }
             },
         )

@@ -177,24 +177,189 @@ def select_hydrogen_thinking_level(
     return "low"
 
 
+_PURE_SOCIAL_CHATTER: frozenset[str] = frozenset(
+    {
+        "good morning",
+        "gm",
+        "good night",
+        "gn",
+        "ram ram",
+        "jai jinendra",
+        "jai shree krishna",
+        "happy diwali",
+        "ok",
+        "okay",
+        "k",
+        "kk",
+        "hmm",
+        "acha",
+        "accha",
+        "thik hai",
+        "theek hai",
+        "thanks",
+        "thank you",
+        "👍",
+        "🙏",
+    }
+)
+
+
+def _parse_goal_utc(raw: Any) -> datetime | None:
+    """Parse an ISO timestamp from an agent_goals row into UTC datetime."""
+    if isinstance(raw, datetime):
+        return raw if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
+    if not raw or not isinstance(raw, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _safe_int(val: Any) -> int | None:
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def rank_open_goals_for_turn(
+    open_goal_rows: list[dict[str, Any]],
+    *,
+    owner_person_id: str | None,
+    telegram_chat_id: int | None,
+    domain_scope: str,
+    reply_to_bot_msg_id: int | None = None,
+    max_goals: int = 4,
+) -> list[dict[str, Any]]:
+    """Rank active open goals by reply match, channel match, and operator ownership."""
+    target_reply_mid = _safe_int(reply_to_bot_msg_id)
+    target_chat_id = _safe_int(telegram_chat_id)
+    candidates: list[tuple[int, int, float, int, dict[str, Any]]] = []
+
+    for idx, row in enumerate(open_goal_rows):
+        row_chat_id = _safe_int(row.get("telegram_chat_id"))
+        row_bot_mid = _safe_int(row.get("telegram_bot_msg_id"))
+        row_owner = row.get("owner_person_id")
+        row_domain = row.get("domain_scope")
+
+        tier: int | None = None
+        if (
+            target_reply_mid is not None
+            and row_bot_mid is not None
+            and row_bot_mid == target_reply_mid
+            and (target_chat_id is None or row_chat_id in (None, target_chat_id))
+        ):
+            tier = 0
+        elif (
+            target_chat_id is not None
+            and row_chat_id == target_chat_id
+            and owner_person_id is not None
+            and row_owner == owner_person_id
+        ):
+            tier = 1
+        elif target_chat_id is not None and row_chat_id == target_chat_id:
+            tier = 2
+        elif (owner_person_id is None or row_owner == owner_person_id) and row_domain in (
+            None,
+            domain_scope,
+            "shared",
+        ):
+            tier = 3
+
+        if tier is None:
+            continue
+
+        ts = _parse_goal_utc(row.get("updated_at")) or _parse_goal_utc(row.get("created_at"))
+        has_ts = 0 if ts is not None else 1
+        neg_ts = -ts.timestamp() if ts is not None else 0.0
+        candidates.append((tier, has_ts, neg_ts, idx, row))
+
+    candidates.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+    return [item[4] for item in candidates[:max_goals]]
+
+
 def build_compact_open_goals_tray(
-    open_goal_rows: list[dict[str, Any]], max_goals: int = 3
+    open_goal_rows: list[dict[str, Any]],
+    max_goals: int = 4,
+    reply_to_bot_msg_id: int | None = None,
 ) -> list[dict[str, Any]]:
     """Build an O(1) ~150-token active-goal tray so Hydrogen handles compound replies + new tasks."""
+    target_reply_mid = _safe_int(reply_to_bot_msg_id)
     tray: list[dict[str, Any]] = []
     for row in open_goal_rows[:max_goals]:
-        tray.append(
-            {
-                "goal_id": str(row.get("id", "")),
-                "goal_type": row.get("goal_type"),
-                "status": row.get("status"),
-                "summary": (row.get("summary_title") or "")[:100],
-                "missing_slots": list(row.get("missing_slots") or []),
-                "pending_prompt": (row.get("pending_prompt") or "")[:140],
-                "collected_slots": row.get("collected_slots") or {},
-            }
-        )
+        entry: dict[str, Any] = {
+            "goal_id": str(row.get("id", "")),
+            "goal_type": row.get("goal_type"),
+            "status": row.get("status"),
+            "summary": (row.get("summary_title") or "")[:100],
+            "missing_slots": list(row.get("missing_slots") or []),
+            "pending_prompt": (row.get("pending_prompt") or "")[:140],
+            "collected_slots": row.get("collected_slots") or {},
+        }
+        row_bot_mid = _safe_int(row.get("telegram_bot_msg_id"))
+        if target_reply_mid is not None and row_bot_mid is not None and row_bot_mid == target_reply_mid:
+            entry["replied_directly"] = True
+        tray.append(entry)
     return tray
+
+
+def should_bypass_group_triage_for_open_goal(
+    *,
+    text: str,
+    incoming_message_id: int | None,
+    reply_to_message_id: int | None,
+    actor_person_id: str | None,
+    chat_id: int,
+    open_goals: list[dict[str, Any]],
+    now_utc: datetime | None = None,
+    fresh_window_seconds: int = 900,
+) -> bool:
+    """Bypass Decisions chatter filter for direct bot replies, immediate next answers, or fresh open prompts."""
+    clean = re.sub(r"\s+", " ", (text or "").strip()).lower().strip("!.?,")
+    if not clean:
+        return False
+
+    target_reply_mid = _safe_int(reply_to_message_id)
+    target_incoming_mid = _safe_int(incoming_message_id)
+    target_chat_id = _safe_int(chat_id)
+
+    if target_reply_mid is not None:
+        for g in open_goals:
+            bot_mid = _safe_int(g.get("telegram_bot_msg_id"))
+            g_chat = _safe_int(g.get("telegram_chat_id"))
+            if (
+                bot_mid is not None
+                and bot_mid == target_reply_mid
+                and (target_chat_id is None or g_chat in (None, target_chat_id))
+            ):
+                return True
+
+    if clean in _PURE_SOCIAL_CHATTER:
+        return False
+
+    ref_now = now_utc or datetime.now(timezone.utc)
+    for g in open_goals:
+        if g.get("status") not in ("gathering_info", "needs_error_fix"):
+            continue
+        if _safe_int(g.get("telegram_chat_id")) != target_chat_id:
+            continue
+
+        bot_mid = _safe_int(g.get("telegram_bot_msg_id"))
+        if target_incoming_mid is not None and bot_mid is not None:
+            gap = target_incoming_mid - bot_mid
+            if 0 < gap <= 2:
+                return True
+
+        if actor_person_id and g.get("owner_person_id") == actor_person_id:
+            ts = _parse_goal_utc(g.get("updated_at")) or _parse_goal_utc(g.get("created_at"))
+            if ts and 0 <= (ref_now - ts).total_seconds() <= fresh_window_seconds:
+                return True
+
+    return False
 
 
 # ---------------------------------------------------------------------------

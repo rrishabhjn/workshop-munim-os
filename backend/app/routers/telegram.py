@@ -28,6 +28,8 @@ from app.services import agent_core, decisions_triage, goal_intelligence, telegr
 from app.services.goal_primitives import (
     format_voice_receipt_header,
     merge_buffered_telegram_burst,
+    rank_open_goals_for_turn,
+    should_bypass_group_triage_for_open_goal,
     should_run_decisions_front_door,
 )
 
@@ -270,8 +272,19 @@ def _build_goal_keyboard(goal_out: dict[str, Any]) -> dict[str, Any] | None:
 
     if st in ("gathering_info", "needs_error_fix"):
         rows: list[list[dict[str, str]]] = []
-        for idx, ch in enumerate(choices[:4]):
-            rows.append([{"text": str(ch.get("label") or f"Option {idx + 1}")[:48], "callback_data": f"ag_choice:{gid}:{idx}"}])
+        btns = [
+            {
+                "text": str(ch.get("label") or f"Option {idx + 1}")[:48],
+                "callback_data": f"ag_choice:{gid}:{idx}",
+            }
+            for idx, ch in enumerate(choices[:4])
+        ]
+        if len(btns) >= 2 and all(len(b["text"]) <= 22 for b in btns):
+            for i in range(0, len(btns), 2):
+                rows.append(btns[i : i + 2])
+        else:
+            for b in btns:
+                rows.append([b])
         bottom_row = []
         if st == "needs_error_fix":
             bottom_row.append({"text": "📥 Let Clerk Fix Later", "callback_data": f"ag_park:{gid}"})
@@ -495,10 +508,48 @@ async def process_debounced_burst(
         first_raw = claimed_rows[0].get("raw_payload") or {}
         first_msg = first_raw.get("message") or first_raw.get("edited_message") or {}
         is_group = first_msg.get("chat", {}).get("type", "private") != "private"
-        is_reply_to_bot = bool(first_msg.get("reply_to_message", {}).get("from", {}).get("is_bot"))
+        is_reply_to_bot = any(
+            bool(
+                (
+                    (r.get("raw_payload") or {}).get("message")
+                    or (r.get("raw_payload") or {}).get("edited_message")
+                    or {}
+                )
+                .get("reply_to_message", {})
+                .get("from", {})
+                .get("is_bot")
+            )
+            for r in claimed_rows
+        )
         has_media = bool(merged["photo_file_ids"] or merged["document_file_ids"])
         has_voice = bool(merged["voice_file_ids"])
         combined_text = merged["combined_text"]
+
+        sender_name = (first_msg.get("from") or {}).get("first_name") or "Operator"
+        actor_person_id, actor_label = _resolve_person_by_telegram(sb, user_id, sender_name)
+        scope = "munim" if domain_channel == "munim" else "production"
+
+        raw_open_goals = (
+            sb.table("agent_goals")
+            .select(
+                "id,owner_person_id,telegram_chat_id,telegram_bot_msg_id,domain_scope,"
+                "goal_type,status,summary_title,missing_slots,pending_prompt,updated_at,created_at"
+            )
+            .in_("status", ["gathering_info", "awaiting_confirmation", "needs_error_fix"])
+            .order("updated_at", desc=True)
+            .limit(20)
+            .execute()
+            .data
+            or []
+        )
+        relevant_open_goals = rank_open_goals_for_turn(
+            raw_open_goals,
+            owner_person_id=actor_person_id,
+            telegram_chat_id=chat_id,
+            domain_scope=scope,
+            reply_to_bot_msg_id=merged["reply_to_message_id"],
+            max_goals=4,
+        )
 
         # Surgical Decisions API group-chatter filter (text-only unaddressed group messages)
         if (
@@ -513,14 +564,26 @@ async def process_debounced_burst(
                 domain_channel=domain_channel,
             )
         ):
-            is_rel = await asyncio.to_thread(
-                decisions_triage.is_group_message_relevant, combined_text, domain_channel
+            bypass_for_goal = should_bypass_group_triage_for_open_goal(
+                text=combined_text,
+                incoming_message_id=merged["latest_message_id"],
+                reply_to_message_id=merged["reply_to_message_id"],
+                actor_person_id=actor_person_id,
+                chat_id=chat_id,
+                open_goals=relevant_open_goals,
             )
-            if not is_rel:
-                sb.table("telegram_inbox_buffer").update(
-                    {"status": "ignored", "processed_at": datetime.now(timezone.utc).isoformat()}
-                ).in_("id", row_ids).execute()
-                return
+            if not bypass_for_goal:
+                is_rel = await asyncio.to_thread(
+                    decisions_triage.is_group_message_relevant,
+                    combined_text,
+                    domain_channel,
+                    relevant_open_goals,
+                )
+                if not is_rel:
+                    sb.table("telegram_inbox_buffer").update(
+                        {"status": "ignored", "processed_at": datetime.now(timezone.utc).isoformat()}
+                    ).in_("id", row_ids).execute()
+                    return
 
         voice_clips: list[tuple[bytes, str]] = []
         for vfid in merged["voice_file_ids"]:
@@ -538,10 +601,6 @@ async def process_debounced_burst(
             b_data, _ = await telegram_api.download_file_bytes(dfid)
             media_files.append((b_data, "application/pdf"))
 
-        sender_name = (first_msg.get("from") or {}).get("first_name") or "Operator"
-        actor_person_id, actor_label = _resolve_person_by_telegram(sb, user_id, sender_name)
-        scope = "munim" if domain_channel == "munim" else "production"
-
         turn_res = await agent_core.run_agent_turn(
             sb,
             owner_person_id=actor_person_id,
@@ -554,6 +613,7 @@ async def process_debounced_burst(
             extra_audio_files=extra_audio_files,
             media_files=media_files or None,
             telegram_chat_id=chat_id,
+            reply_to_bot_msg_id=merged["reply_to_message_id"],
         )
 
         heard_hdr = format_voice_receipt_header(turn_res.get("heard_transcript"))

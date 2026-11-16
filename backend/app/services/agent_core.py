@@ -44,6 +44,7 @@ from app.services.goal_primitives import (
     is_high_sensitivity_master_mutation,
     make_zoho_reference_number,
     normalize_or_infer_expense_category,
+    rank_open_goals_for_turn,
     select_hydrogen_thinking_level,
 )
 
@@ -222,13 +223,26 @@ class GoalIntentItem(BaseModel):
     customer_id: str | None = None
     vendor_id: str | None = None
     person_id: str | None = None
-    full_name: str | None = None
+    full_name: str | None = Field(
+        default=None,
+        description="REQUIRED for new_lead / add_customer / add_person_or_vendor: customer, person, or vendor name (e.g. 'Arjun').",
+    )
     new_name: str | None = Field(
         default=None,
         description="Populate ONLY when explicitly renaming an existing Customer, Vendor, or Person.",
     )
-    area_landmark: str | None = None
-    rough_scope: str | None = None
+    area_landmark: str | None = Field(
+        default=None,
+        description=(
+            "REQUIRED for new_lead (and customer/order area updates): city, locality, or site landmark "
+            "(e.g. 'Jaipur', 'Civil Lines, Jaipur', 'Beawar'). CRITICAL: Always populate this field directly — "
+            "never put the city/area only inside summary_title."
+        ),
+    )
+    rough_scope: str | None = Field(
+        default=None,
+        description="REQUIRED for new_lead: rooms or furniture items scope (e.g. '3 Bedrooms — Beds & Almirahs').",
+    )
     phone: str | None = None
     gstin: str | None = None
     specialty: str | None = None
@@ -416,6 +430,7 @@ def _build_compact_grounding(
     ui_context: dict[str, Any] | None,
     source_channel: str = "web_command_bar",
     telegram_chat_id: int | None = None,
+    reply_to_bot_msg_id: int | None = None,
 ) -> tuple[str, dict[str, str]]:
     """Build O(1) <1,200-token static + open-goals context (relying on tools for search)."""
     today_ist = datetime.now(IST).date().isoformat()
@@ -450,16 +465,27 @@ def _build_compact_grounding(
         or []
     )
 
-    open_q = (
+    raw_open_rows = (
         sb.table("agent_goals")
-        .select("id,goal_type,status,summary_title,missing_slots,pending_prompt,collected_slots")
+        .select(
+            "id,owner_person_id,telegram_chat_id,telegram_bot_msg_id,domain_scope,"
+            "goal_type,status,summary_title,missing_slots,pending_prompt,collected_slots,updated_at,created_at"
+        )
         .in_("status", ["gathering_info", "awaiting_confirmation", "needs_error_fix"])
         .order("updated_at", desc=True)
-        .limit(3)
+        .limit(20)
+        .execute()
+        .data
+        or []
     )
-    if owner_person_id:
-        open_q = open_q.eq("owner_person_id", owner_person_id)
-    open_rows = open_q.execute().data or []
+    open_rows = rank_open_goals_for_turn(
+        raw_open_rows,
+        owner_person_id=owner_person_id,
+        telegram_chat_id=telegram_chat_id,
+        domain_scope=domain_scope,
+        reply_to_bot_msg_id=reply_to_bot_msg_id,
+        max_goals=4,
+    )
 
     ui_prj = None
     if ui_context and ui_context.get("viewing_project_id"):
@@ -561,7 +587,9 @@ def _build_compact_grounding(
         "team_and_mistri_roster": people,
         "active_orders_index": active_orders_index,
         "learned_workshop_rules": rules,
-        "open_goals_tray": build_compact_open_goals_tray(open_rows),
+        "open_goals_tray": build_compact_open_goals_tray(
+            open_rows, max_goals=4, reply_to_bot_msg_id=reply_to_bot_msg_id
+        ),
         "recent_conversation_turns": recent_turns,
         "currently_open_ui_order": ui_prj,
     }
@@ -583,10 +611,17 @@ def _build_system_instruction(grounding_json: str) -> str:
         "NOT in `active_orders_index`, ALWAYS call `search_projects_and_items` (and `search_customers`) before concluding it does not exist.\n"
         "2. COMPOUND REPLIES & OPEN GOALS: Check `open_goals_tray` in CONTEXT. A single user message "
         "may answer an open goal (`target_open_goal_id` set) AND also issue a brand-new update "
-        "(`target_open_goal_id` = null) in the same `goal_items` list. Never drop either half!\n"
+        "(`target_open_goal_id` = null) in the same `goal_items` list. Never drop either half! "
+        "If an item in `open_goals_tray` has `replied_directly=true`, or its `missing_slots` / `pending_prompt` "
+        "matches the user's short reply (e.g. a city/landmark like 'Jaipur', an amount, an account name, or a mistri name), "
+        "set `target_open_goal_id` to that `goal_id` AND ALWAYS populate the exact JSON slot field(s) named in its "
+        "`missing_slots` (e.g. if `missing_slots=['area_landmark']` and the user replies 'Jaipur', set `area_landmark='Jaipur'` "
+        "in `goal_items` — NEVER put the answer only inside `summary_title`, and NEVER use `intent_category='direct_answer'` "
+        "for a slot reply!).\n"
         "3. NEW CUSTOMER ONBOARDING (X, Y, Z): If a customer is brand-new, require ALL 3 of: "
         "`full_name`, `area_landmark` (locality/city like Civil Lines, Ajmer Road, Jaipur), and `rough_scope` "
-        "(items/rooms). If homonyms exist, set `is_ambiguous=true`, populate `choices` "
+        "(items/rooms). A standalone city name (e.g. 'Jaipur', 'Beawar', 'Ajmer', 'Chittorgarh') is 100% sufficient for "
+        "`area_landmark` — never leave `area_landmark` null waiting for a street/locality. If homonyms exist, set `is_ambiguous=true`, populate `choices` "
         "(1: Existing Active Order, 2: Repeat Customer New Lead, 3: Brand-New Customer), and ask in `clarification_question`.\n"
         "4. MUNIM FINANCIAL RULES (Zoho 100% Management Ledger, GST-Off): Every receipt, expense, "
         "vendor payment, or float transfer MUST populate the JSON fields `amount_inr` (number) AND `payment_account_code` "
@@ -634,6 +669,7 @@ async def run_agent_turn(
     media_files: list[tuple[bytes, str]] | None = None,  # [(bytes, mime_type)]
     ui_context: dict[str, Any] | None = None,
     telegram_chat_id: int | None = None,
+    reply_to_bot_msg_id: int | None = None,
 ) -> dict[str, Any]:
     """Execute one complete omnichannel AgentCore turn and return structured UI/Telegram response."""
     settings = get_settings()
@@ -644,6 +680,7 @@ async def run_agent_turn(
         ui_context=ui_context,
         source_channel=source_channel,
         telegram_chat_id=telegram_chat_id,
+        reply_to_bot_msg_id=reply_to_bot_msg_id,
     )
     sys_inst = _build_system_instruction(grounding_json)
 
@@ -864,6 +901,7 @@ async def run_agent_turn(
             ui_context=ui_context or {},
             telegram_chat_id=telegram_chat_id,
             user_text=text,
+            reply_to_bot_msg_id=reply_to_bot_msg_id,
         )
         processed_goals.append(g_out)
 
@@ -1337,6 +1375,30 @@ def _sanitize_and_resolve_slot_ids(sb: Any, slots: dict[str, Any]) -> None:
             else:
                 slots.pop(dcol, None)
 
+    # 6. Resolve payment_account_code / to_payment_account_code -> payment_account_id
+    if slots.get("payment_account_code") or slots.get("to_payment_account_code"):
+        acc_rows = (
+            sb.table("payment_accounts")
+            .select("id,code")
+            .eq("is_active", True)
+            .execute()
+            .data
+            or []
+        )
+        code_map = {
+            str(a["code"]).strip().lower(): (str(a["code"]), str(a["id"]))
+            for a in acc_rows
+            if a.get("code") and a.get("id")
+        }
+        if slots.get("payment_account_code"):
+            c_key = str(slots["payment_account_code"]).strip().lower()
+            if c_key in code_map:
+                slots["payment_account_code"], slots["payment_account_id"] = code_map[c_key]
+        if slots.get("to_payment_account_code"):
+            tc_key = str(slots["to_payment_account_code"]).strip().lower()
+            if tc_key in code_map:
+                slots["to_payment_account_code"], slots["to_payment_account_id"] = code_map[tc_key]
+
 
 _MAT_UNIT_RE = (
     r"(sheets?|pcs?|pieces?|mtrs?|meters?|sqft|sq\.?ft|rft|kg|kgs|ltrs?|liters?|litres?|box(?:es)?|sets?|rolls?)"
@@ -1391,104 +1453,102 @@ def _backfill_material_slots_from_text(
             slots["material_status"] = "needed"
 
 
-async def _process_goal_intent_item(
-    sb: Any,
-    *,
-    item: GoalIntentItem,
-    acc_code_to_id: dict[str, str],
-    owner_person_id: str | None,
-    actor_label: str,
-    source_channel: str,
-    domain_scope: str,
-    thinking_level: ThinkingLevel,
-    heard_transcript: str | None,
-    uploaded_gcs_paths: list[str],
-    ui_context: dict[str, Any],
-    telegram_chat_id: int | None,
-    user_text: str | None = None,
-) -> dict[str, Any]:
-    prior_slots: dict[str, Any] = {}
-    prior_summary = ""
-    existing_goal_id: str | None = None
-
-    if item.target_open_goal_id and _accept_id(sb, item.target_open_goal_id, "agent_goals"):
-        g_rows = (
-            sb.table("agent_goals")
-            .select("*")
-            .eq("id", item.target_open_goal_id)
-            .limit(1)
-            .execute()
-            .data
-            or []
-        )
-        if g_rows:
-            existing_goal_id = g_rows[0]["id"]
-            prior_slots = dict(g_rows[0].get("collected_slots") or {})
-            prior_summary = str(g_rows[0].get("summary_title") or "")
-
-    # Merge non-null slots from current turn over prior_slots
-    new_slots = {
-        k: v
-        for k, v in item.model_dump(
-            exclude={"target_open_goal_id", "is_ambiguous", "clarification_question", "choices"}
-        ).items()
-        if v is not None and v != [] and v != ""
+_NON_AREA_PARENS: frozenset[str] = frozenset(
+    {
+        "lead",
+        "new lead",
+        "execution",
+        "design",
+        "estimating",
+        "completed",
+        "material to order",
+        "check stock",
+        "ordered",
+        "in shop",
+        "packed",
     }
-    slots: dict[str, Any] = {**prior_slots, **new_slots}
-    if slots.get("zoho_contact_id") and "-" in str(slots["zoho_contact_id"]):
-        slots.pop("zoho_contact_id", None)
-    if uploaded_gcs_paths and not slots.get("uploaded_gcs_paths"):
-        slots["uploaded_gcs_paths"] = uploaded_gcs_paths
+)
 
-    if existing_goal_id and prior_slots:
-        await asyncio.to_thread(
-            goal_intelligence.maybe_distill_procedural_memory,
-            sb,
-            prior_summary=prior_summary,
-            prior_slots=prior_slots,
-            updated_slots=slots,
-            user_correction_text=user_text or heard_transcript,
-        )
 
-    # Resolve UI open project fallback when unambiguous
-    if not slots.get("project_id") and ui_context.get("viewing_project_id") and item.operation_kind in (
-        "pipeline_stage_move",
-        "material_stage_move",
-        "item_upsert_or_move",
-        "item_material_upsert",
-        "update_order_details",
-    ):
-        slots["project_id"] = ui_context["viewing_project_id"]
+def _backfill_onboarding_and_open_goal_slots(
+    slots: dict[str, Any],
+    *,
+    summary_title: str | None,
+    user_text: str | None,
+    heard_transcript: str | None,
+    prior_missing_slots: list[str] | None = None,
+    is_ambiguous: bool = False,
+) -> None:
+    """Deterministically rescue area_landmark and single-slot open-goal answers when LLM puts them only in summary_title."""
+    op = str(slots.get("operation_kind") or "")
+    if op in ("new_lead", "add_customer", "update_customer", "update_order_details") and not str(
+        slots.get("area_landmark") or ""
+    ).strip():
+        for raw_txt in (user_text, heard_transcript):
+            txt = (raw_txt or "").strip()
+            if not txt:
+                continue
+            m_explicit = re.search(
+                r"\b(?:site\s+area(?:\s*/\s*landmark)?|area\s+landmark)\s*(?:is|=|:|-)?\s*([A-Za-z][A-Za-z0-9\s,.'/-]{1,48})",
+                txt,
+                flags=re.IGNORECASE,
+            )
+            if m_explicit:
+                cand_area = re.sub(r"\s+", " ", m_explicit.group(1)).strip(" \t\r\n.,;!-")
+                if cand_area:
+                    slots["area_landmark"] = cand_area
+                    break
+
+    if op in ("new_lead", "add_customer", "update_customer", "update_order_details") and not str(
+        slots.get("area_landmark") or ""
+    ).strip():
+        fname = str(slots.get("full_name") or "").strip()
+        if fname:
+            for title_src in (summary_title, slots.get("summary_title")):
+                t_str = (title_src or "").strip()
+                if not t_str:
+                    continue
+                m_paren = re.search(
+                    rf"{re.escape(fname)}\s*\(([^()]+)\)",
+                    t_str,
+                    flags=re.IGNORECASE,
+                )
+                if m_paren:
+                    cand = re.sub(r"\s+", " ", m_paren.group(1)).strip(" \t\r\n.,;!-")
+                    c_low = cand.lower()
+                    if (
+                        2 <= len(cand) <= 48
+                        and not c_low.startswith("prj-")
+                        and "₹" not in cand
+                        and c_low not in _NON_AREA_PARENS
+                        and "material" not in c_low
+                        and "execution" not in c_low
+                    ):
+                        slots["area_landmark"] = cand
+                        break
+
     if (
-        not slots.get("project_id")
-        and ui_context.get("viewing_project_id")
-        and item.operation_kind == "archive_record"
-        and slots.get("archive_entity_kind") == "order"
+        prior_missing_slots
+        and len(prior_missing_slots) == 1
+        and not is_ambiguous
+        and prior_missing_slots[0] in ("area_landmark", "rough_scope", "full_name", "party_name")
     ):
-        slots["project_id"] = ui_context["viewing_project_id"]
+        only_slot = prior_missing_slots[0]
+        if not str(slots.get(only_slot) or "").strip():
+            raw_reply = (user_text or heard_transcript or "").strip()
+            clean_reply = raw_reply.strip(" \t\r\n\"'.,!")
+            if (
+                clean_reply
+                and 1 <= len(clean_reply) <= 120
+                and not raw_reply.endswith("?")
+                and not clean_reply.startswith("/")
+                and clean_reply.lower() not in {"cancel", "discard", "stop", "nahi", "no", "wait", "later"}
+            ):
+                slots[only_slot] = clean_reply
 
-    _backfill_financial_slots_from_text(
-        sb,
-        slots,
-        user_text=user_text,
-        heard_transcript=heard_transcript,
-    )
-    _backfill_material_slots_from_text(
-        slots,
-        user_text=user_text,
-        heard_transcript=heard_transcript,
-    )
-    _sanitize_and_resolve_slot_ids(sb, slots)
 
-    # Resolve payment_account_code -> payment_account_id
-    if slots.get("payment_account_code") and slots["payment_account_code"] in acc_code_to_id:
-        slots["payment_account_id"] = acc_code_to_id[slots["payment_account_code"]]
-    if slots.get("to_payment_account_code") and slots["to_payment_account_code"] in acc_code_to_id:
-        slots["to_payment_account_id"] = acc_code_to_id[slots["to_payment_account_code"]]
-
-    op = str(slots.get("operation_kind") or item.operation_kind)
-
-    # Compute deterministic missing slots
+def _compute_missing_slots_for_op(op: str, slots: dict[str, Any]) -> list[str]:
+    """Compute required missing slots deterministically for a given operation kind."""
     missing: list[str] = []
     if op == "new_lead" and not slots.get("customer_id"):
         missing = compute_missing_customer_onboarding_slots(slots)
@@ -1548,16 +1608,240 @@ async def _process_goal_intent_item(
             missing.append("party_name")
         if slots.get("amount_inr") is None:
             missing.append("amount_inr")
+    return missing
+
+
+def _format_quick_account_label(code: str, display_name: str, account_kind: str) -> str:
+    c_low = code.strip().lower()
+    raw_name = re.sub(r"\s*\([^)]*\)", "", display_name or "").strip()
+    if account_kind == "cash_galla" or c_low == "cash_galla":
+        icon = "💵"
+        short = raw_name or "Cash Galla"
+    elif account_kind == "supervisor_float" or c_low.startswith("float_"):
+        icon = "👛"
+        short = re.sub(r"\s+(?:wallet|float)$", "", raw_name, flags=re.IGNORECASE).strip() or raw_name or c_low
+    else:
+        icon = "🏦"
+        short = raw_name or c_low.upper()
+    return f"{icon} {short}"[:22].strip()
+
+
+def _build_default_missing_slot_choices(
+    sb: Any, missing_slot: str, op: str
+) -> list[dict[str, Any]]:
+    """Build 1-tap quick-pick choices for single-slot prompts with predictable workshop defaults."""
+    if missing_slot == "area_landmark":
+        cities = ("Beawar", "Jaipur", "Ajmer", "Chittorgarh")
+        return [
+            {
+                "choice_id": f"area_{city.lower()}",
+                "label": f"📍 {city}",
+                "slot_patch_json": json.dumps({"area_landmark": city}),
+            }
+            for city in cities
+        ]
+
+    if missing_slot in ("payment_account_code", "to_payment_account_code"):
+        acc_rows = (
+            sb.table("payment_accounts")
+            .select("code,display_name,account_kind,sort_order")
+            .eq("is_active", True)
+            .order("sort_order")
+            .execute()
+            .data
+            or []
+        )
+        preferred_order = ("cash_galla", "axis", "rgb", "float_ansh")
+        pref_rank = {c: idx for idx, c in enumerate(preferred_order)}
+        ordered = sorted(
+            [a for a in acc_rows if a.get("code")],
+            key=lambda a: (
+                pref_rank.get(str(a["code"]).strip().lower(), len(preferred_order)),
+                int(a.get("sort_order") or 999),
+                str(a["code"]),
+            ),
+        )
+        return [
+            {
+                "choice_id": f"acc_{a['code']}",
+                "label": _format_quick_account_label(
+                    str(a["code"]),
+                    str(a.get("display_name") or a["code"]),
+                    str(a.get("account_kind") or ""),
+                ),
+                "slot_patch_json": json.dumps({missing_slot: str(a["code"])}),
+            }
+            for a in ordered[:4]
+        ]
+
+    if missing_slot == "to_stage" and op == "material_stage_move":
+        mat_stages = (
+            ("check_stock", "📦 Check Stock"),
+            ("ordered_pending", "🚚 Ordered"),
+            ("all_in_shop", "✅ All In Shop"),
+        )
+        return [
+            {
+                "choice_id": f"mat_{stage_code}",
+                "label": label,
+                "slot_patch_json": json.dumps({"to_stage": stage_code}),
+            }
+            for stage_code, label in mat_stages
+        ]
+
+    return []
+
+
+async def _process_goal_intent_item(
+    sb: Any,
+    *,
+    item: GoalIntentItem,
+    acc_code_to_id: dict[str, str],
+    owner_person_id: str | None,
+    actor_label: str,
+    source_channel: str,
+    domain_scope: str,
+    thinking_level: ThinkingLevel,
+    heard_transcript: str | None,
+    uploaded_gcs_paths: list[str],
+    ui_context: dict[str, Any],
+    telegram_chat_id: int | None,
+    user_text: str | None = None,
+    reply_to_bot_msg_id: int | None = None,
+) -> dict[str, Any]:
+    prior_slots: dict[str, Any] = {}
+    prior_summary = ""
+    prior_missing_slots: list[str] = []
+    existing_goal_id: str | None = None
+    existing_owner_person_id: str | None = None
+
+    if item.target_open_goal_id and _accept_id(sb, item.target_open_goal_id, "agent_goals"):
+        g_rows = (
+            sb.table("agent_goals")
+            .select("*")
+            .eq("id", item.target_open_goal_id)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if g_rows:
+            existing_goal_id = g_rows[0]["id"]
+            existing_owner_person_id = g_rows[0].get("owner_person_id")
+            prior_slots = dict(g_rows[0].get("collected_slots") or {})
+            prior_summary = str(g_rows[0].get("summary_title") or "")
+            prior_missing_slots = list(g_rows[0].get("missing_slots") or [])
+
+    if not existing_goal_id and reply_to_bot_msg_id is not None:
+        pinned_rows = (
+            sb.table("agent_goals")
+            .select("*")
+            .in_("status", ["gathering_info", "needs_error_fix"])
+            .eq("telegram_bot_msg_id", int(reply_to_bot_msg_id))
+            .execute()
+            .data
+            or []
+        )
+        expected_gtype = _map_op_to_db_goal_type(item.operation_kind)
+        matched_pinned = [
+            r
+            for r in pinned_rows
+            if (telegram_chat_id is None or r.get("telegram_chat_id") in (None, telegram_chat_id))
+            and r.get("goal_type") == expected_gtype
+        ]
+        if len(matched_pinned) == 1:
+            g_pin = matched_pinned[0]
+            existing_goal_id = g_pin["id"]
+            existing_owner_person_id = g_pin.get("owner_person_id")
+            prior_slots = dict(g_pin.get("collected_slots") or {})
+            prior_summary = str(g_pin.get("summary_title") or "")
+            prior_missing_slots = list(g_pin.get("missing_slots") or [])
+
+    # Merge non-null slots from current turn over prior_slots
+    new_slots = {
+        k: v
+        for k, v in item.model_dump(
+            exclude={"target_open_goal_id", "is_ambiguous", "clarification_question", "choices"}
+        ).items()
+        if v is not None and v != [] and v != ""
+    }
+    slots: dict[str, Any] = {**prior_slots, **new_slots}
+    if slots.get("zoho_contact_id") and "-" in str(slots["zoho_contact_id"]):
+        slots.pop("zoho_contact_id", None)
+    if uploaded_gcs_paths and not slots.get("uploaded_gcs_paths"):
+        slots["uploaded_gcs_paths"] = uploaded_gcs_paths
+
+    if existing_goal_id and prior_slots:
+        await asyncio.to_thread(
+            goal_intelligence.maybe_distill_procedural_memory,
+            sb,
+            prior_summary=prior_summary,
+            prior_slots=prior_slots,
+            updated_slots=slots,
+            user_correction_text=user_text or heard_transcript,
+        )
+
+    # Resolve UI open project fallback when unambiguous
+    if not slots.get("project_id") and ui_context.get("viewing_project_id") and item.operation_kind in (
+        "pipeline_stage_move",
+        "material_stage_move",
+        "item_upsert_or_move",
+        "item_material_upsert",
+        "update_order_details",
+    ):
+        slots["project_id"] = ui_context["viewing_project_id"]
+    if (
+        not slots.get("project_id")
+        and ui_context.get("viewing_project_id")
+        and item.operation_kind == "archive_record"
+        and slots.get("archive_entity_kind") == "order"
+    ):
+        slots["project_id"] = ui_context["viewing_project_id"]
+
+    _backfill_financial_slots_from_text(
+        sb,
+        slots,
+        user_text=user_text,
+        heard_transcript=heard_transcript,
+    )
+    _backfill_material_slots_from_text(
+        slots,
+        user_text=user_text,
+        heard_transcript=heard_transcript,
+    )
+    _backfill_onboarding_and_open_goal_slots(
+        slots,
+        summary_title=item.summary_title,
+        user_text=user_text,
+        heard_transcript=heard_transcript,
+        prior_missing_slots=prior_missing_slots if existing_goal_id else None,
+        is_ambiguous=item.is_ambiguous,
+    )
+    _sanitize_and_resolve_slot_ids(sb, slots)
+
+    # Resolve payment_account_code -> payment_account_id
+    if slots.get("payment_account_code") and slots["payment_account_code"] in acc_code_to_id:
+        slots["payment_account_id"] = acc_code_to_id[slots["payment_account_code"]]
+    if slots.get("to_payment_account_code") and slots["to_payment_account_code"] in acc_code_to_id:
+        slots["to_payment_account_id"] = acc_code_to_id[slots["to_payment_account_code"]]
+
+    op = str(slots.get("operation_kind") or item.operation_kind)
+    goal_owner_id = existing_owner_person_id or owner_person_id
+
+    # Compute deterministic missing slots
+    missing = _compute_missing_slots_for_op(op, slots)
 
     choices_serialized = [c.model_dump() for c in item.choices]
 
     # Case A: Missing slots or Homonym Ambiguity -> status = 'gathering_info'
     if item.is_ambiguous or missing:
+        if not choices_serialized and not item.is_ambiguous and len(missing) == 1:
+            choices_serialized = _build_default_missing_slot_choices(sb, missing[0], op)
         prompt_q = item.clarification_question or _default_missing_question(op, missing)
         goal_row = _upsert_goal_row(
             sb,
             goal_id=existing_goal_id,
-            owner_person_id=owner_person_id,
+            owner_person_id=goal_owner_id,
             source_channel=source_channel,
             domain_scope=domain_scope,
             telegram_chat_id=telegram_chat_id,
@@ -1602,7 +1886,7 @@ async def _process_goal_intent_item(
         goal_row = _upsert_goal_row(
             sb,
             goal_id=existing_goal_id,
-            owner_person_id=owner_person_id,
+            owner_person_id=goal_owner_id,
             source_channel=source_channel,
             domain_scope="production" if op in ("pipeline_stage_move", "material_stage_move", "item_upsert_or_move", "item_material_upsert", "update_order_details") else domain_scope,
             telegram_chat_id=telegram_chat_id,
@@ -1635,7 +1919,7 @@ async def _process_goal_intent_item(
     goal_row = _upsert_goal_row(
         sb,
         goal_id=existing_goal_id,
-        owner_person_id=owner_person_id,
+        owner_person_id=goal_owner_id,
         source_channel=source_channel,
         domain_scope="munim" if op in ("customer_receipt", "vendor_payment", "expense", "float_transfer", "supplier_draft_bill") else domain_scope,
         telegram_chat_id=telegram_chat_id,
@@ -2429,6 +2713,12 @@ async def apply_slot_patch_and_resume(
     g = rows[0]
     prior_slots = dict(g.get("collected_slots") or {})
     merged_slots = _sanitize_gemini_nulls({**prior_slots, **slot_patch})
+    _backfill_financial_slots_from_text(
+        sb,
+        merged_slots,
+        user_text=correction_note,
+        heard_transcript=g.get("heard_transcript"),
+    )
     _sanitize_and_resolve_slot_ids(sb, merged_slots)
     await asyncio.to_thread(
         goal_intelligence.maybe_distill_procedural_memory,
@@ -2440,6 +2730,35 @@ async def apply_slot_patch_and_resume(
     )
     op = str(merged_slots.get("operation_kind") or "stage_update")
     steps = _build_steps_for_slots(op, merged_slots)
+
+    still_missing = _compute_missing_slots_for_op(op, merged_slots)
+    if g.get("status") == "gathering_info" and still_missing:
+        next_prompt = _default_missing_question(op, still_missing)
+        next_choices = (
+            _build_default_missing_slot_choices(sb, still_missing[0], op)
+            if len(still_missing) == 1
+            else []
+        )
+        sb.table("agent_goals").update(
+            {
+                "collected_slots": merged_slots,
+                "missing_slots": still_missing,
+                "pending_prompt": next_prompt,
+                "repair_options": next_choices,
+                "steps": steps,
+                "status": "gathering_info",
+            }
+        ).eq("id", goal_id).execute()
+        return {
+            "goal_id": goal_id,
+            "status": "gathering_info",
+            "summary_title": g.get("summary_title"),
+            "prompt": next_prompt,
+            "choices": next_choices,
+            "missing_slots": still_missing,
+            "project_id": merged_slots.get("project_id"),
+            "collected_slots": merged_slots,
+        }
 
     # If resolving homonym disambiguation ('gathering_info') for a Confirm-Gated operation,
     # pause cleanly at 'awaiting_confirmation' with a Before->After preview card!
