@@ -24,7 +24,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, 
 
 from app.config import Settings, get_settings
 from app.db import get_supabase_admin
-from app.services import agent_core, decisions_triage, telegram_api
+from app.services import agent_core, decisions_triage, goal_intelligence, telegram_api
 from app.services.goal_primitives import (
     format_voice_receipt_header,
     merge_buffered_telegram_burst,
@@ -279,6 +279,7 @@ async def _handle_agent_callback(
     goal_id = parts[1] if len(parts) > 1 else ""
 
     if cmd == "ag_confirm":
+        await telegram_api.answer_callback_query(cq_id, "Saving...")
         out = await agent_core.confirm_and_execute_goal(
             sb,
             goal_id=goal_id,
@@ -294,7 +295,6 @@ async def _handle_agent_callback(
                 text=f"✅ *Saved*\n{out.get('receipt') or ''}",
                 reply_markup=kb,
             )
-            await telegram_api.answer_callback_query(cq_id, "Saved!")
             return {"ok": True}
 
         kb = _build_goal_keyboard(out) or {"inline_keyboard": []}
@@ -304,7 +304,6 @@ async def _handle_agent_callback(
             text=out.get("prompt") or "Needs attention.",
             reply_markup=kb,
         )
-        await telegram_api.answer_callback_query(cq_id, "Check details.")
         return {"ok": True}
 
     if cmd == "ag_undo":
@@ -342,6 +341,7 @@ async def _handle_agent_callback(
         return {"ok": True}
 
     if cmd == "ag_choice" and len(parts) >= 3:
+        await telegram_api.answer_callback_query(cq_id, "Applying...")
         choice_idx = int(parts[2])
         g_rows = sb.table("agent_goals").select("repair_options").eq("id", goal_id).limit(1).execute().data or []
         opts = (g_rows[0].get("repair_options") or []) if g_rows else []
@@ -368,7 +368,6 @@ async def _handle_agent_callback(
             text=txt,
             reply_markup=kb,
         )
-        await telegram_api.answer_callback_query(cq_id, "Applied!")
         return {"ok": True}
 
     await telegram_api.answer_callback_query(cq_id, "Action processed.")
@@ -433,7 +432,10 @@ async def process_debounced_burst(
                 domain_channel=domain_channel,
             )
         ):
-            if not decisions_triage.is_group_message_relevant(combined_text, domain_channel):
+            is_rel = await asyncio.to_thread(
+                decisions_triage.is_group_message_relevant, combined_text, domain_channel
+            )
+            if not is_rel:
                 sb.table("telegram_inbox_buffer").update(
                     {"status": "ignored", "processed_at": datetime.now(timezone.utc).isoformat()}
                 ).in_("id", row_ids).execute()
@@ -543,10 +545,7 @@ async def telegram_webhook(
 
     sb = get_supabase_admin()
 
-    if "callback_query" in update:
-        return await _handle_agent_callback(sb, update["callback_query"])
-
-    # 1. Idempotent update_id dedup
+    # 1. Idempotent update_id dedup (covers messages AND callback_query retries)
     try:
         sb.table("telegram_webhook_dedup").insert(
             {
@@ -562,6 +561,9 @@ async def telegram_webhook(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Webhook dedup insert failed.",
         ) from exc
+
+    if "callback_query" in update:
+        return await _handle_agent_callback(sb, update["callback_query"])
 
     msg = update.get("message") or update.get("edited_message") or {}
     if not msg or not chat_id or not user_id:
@@ -614,3 +616,28 @@ async def telegram_worker(
     if chat_id and user_id:
         await process_debounced_burst(chat_id, user_id, wait_locally=False)
     return {"ok": True}
+
+
+@router.post("/tasks/goal-retry")
+async def goal_retry_worker(
+    request: Request,
+    x_cron_secret: str | None = Header(default=None),
+    settings: Settings = Depends(get_settings),
+) -> dict[str, Any]:
+    if settings.cron_auth_secret and not hmac.compare_digest(
+        x_cron_secret or "", settings.cron_auth_secret
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid task worker secret.",
+        )
+    payload: dict[str, Any] = await request.json()
+    goal_id = str(payload.get("goal_id") or "")
+    if not goal_id:
+        return {"ok": False, "error": "Missing goal_id"}
+    return await goal_intelligence.execute_scheduled_goal_retry(
+        get_supabase_admin(),
+        goal_id=goal_id,
+        actor_person_id=payload.get("actor_person_id"),
+        actor_label=str(payload.get("actor_label") or "Auto-Retry"),
+    )

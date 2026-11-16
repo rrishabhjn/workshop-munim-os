@@ -49,6 +49,22 @@ export default function App() {
     }
   }
 
+  async function refreshActiveDomain(targetDomain = domain) {
+    if (targetDomain === "production") {
+      const pOverview = await apiFetch("/api/production/overview");
+      setProdData(pOverview);
+      apiFetch("/api/munim/overview")
+        .then(setMunimData)
+        .catch(() => {});
+    } else {
+      const mOverview = await apiFetch("/api/munim/overview");
+      setMunimData(mOverview);
+      apiFetch("/api/production/overview")
+        .then(setProdData)
+        .catch(() => {});
+    }
+  }
+
   useEffect(() => {
     const tg = window.Telegram?.WebApp;
     if (tg) {
@@ -94,7 +110,7 @@ export default function App() {
     if (!supabase) return;
     await supabase.auth.signInWithOAuth({
       provider: "google",
-      options: { redirectTo: window.location.origin },
+      options: { redirectTo: `${window.location.origin}${window.location.pathname}` },
     });
   }
 
@@ -327,13 +343,19 @@ export default function App() {
             ? selectedOrderId
             : null
         }
+        paymentAccounts={munimData?.payment_accounts || []}
         needsInfo={needsInfoList}
         showNeedsInfo={showNeedsInfo}
         onCloseNeedsInfo={() => setShowNeedsInfo(false)}
         undoToast={undoToast}
         onDismissUndoToast={() => setUndoToast(null)}
         onTriggerUndoEvents={handleUndoEvents}
-        onAfterAgentMutation={loadAllData}
+        onAfterAgentMutation={() => refreshActiveDomain(domain)}
+        onViewOrder={(projectId) => {
+          switchDomain("production");
+          setProdTab("all_orders");
+          setSelectedOrderId(projectId);
+        }}
       />
     </div>
   );

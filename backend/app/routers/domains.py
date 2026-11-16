@@ -6,6 +6,7 @@ All routes require an authenticated allowlisted operator via `get_current_user`
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -115,13 +116,36 @@ class PersonCreateRequest(BaseModel):
     is_default_qc: bool = False
 
 
+class PersonPatchRequest(BaseModel):
+    full_name: str | None = None
+    person_type: str | None = None
+    role_tags: list[str] | None = None
+    aliases: list[str] | None = None
+    payout_aliases: list[str] | None = None
+    email: str | None = None
+    phone: str | None = None
+    is_active: bool | None = None
+
+
 class VendorCreateRequest(BaseModel):
     canonical_name: str = Field(min_length=1, max_length=140)
     vendor_kind: str = "supplier"
     specialty: str | None = None
     phone: str | None = None
+    gstin: str | None = None
     aliases: list[str] = Field(default_factory=list)
     notes: str | None = None
+
+
+class VendorPatchRequest(BaseModel):
+    canonical_name: str | None = None
+    vendor_kind: str | None = None
+    specialty: str | None = None
+    phone: str | None = None
+    gstin: str | None = None
+    aliases: list[str] | None = None
+    notes: str | None = None
+    is_active: bool | None = None
 
 
 class CustomerCreateRequest(BaseModel):
@@ -132,8 +156,22 @@ class CustomerCreateRequest(BaseModel):
     notes: str | None = None
 
 
+class CustomerPatchRequest(BaseModel):
+    full_name: str | None = None
+    area_landmark: str | None = None
+    phone: str | None = None
+    aliases: list[str] | None = None
+    notes: str | None = None
+    is_active: bool | None = None
+
+
 class GoalChoiceRequest(BaseModel):
     slot_patch: dict[str, Any] = Field(default_factory=dict)
+
+
+class GoalEditRequest(BaseModel):
+    slot_patch: dict[str, Any] = Field(default_factory=dict)
+    correction_note: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -249,13 +287,29 @@ async def patch_production_order(
 ) -> dict[str, Any]:
     _ = user
     sb = get_supabase_admin()
-    patch = {k: v for k, v in body.model_dump().items() if v is not None}
-    if not patch:
-        return {"ok": True}
-    res = sb.table("projects").update(patch).eq("id", project_id).execute().data
-    if not res:
+    res = step_executors.update_order_metadata(
+        sb,
+        project_id=project_id,
+        quoted_total=body.quoted_total,
+        promised_delivery_date=body.promised_delivery_date,
+        rough_scope=body.rough_scope,
+        site_area_landmark=body.site_area_landmark,
+        phone=body.phone,
+        boq_scope_changed=body.boq_scope_changed,
+        boq_scope_note=body.boq_scope_note,
+    )
+    if not res.get("ok"):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
-    return {"ok": True, "order": res[0]}
+    extra_patch: dict[str, Any] = {}
+    if body.customer_name is not None and body.customer_name.strip():
+        extra_patch["customer_name"] = body.customer_name.strip()
+    if body.payment_stage is not None:
+        extra_patch["payment_stage"] = body.payment_stage
+    if extra_patch:
+        upd = sb.table("projects").update(extra_patch).eq("id", project_id).execute().data
+        if upd:
+            res["order"] = upd[0]
+    return res
 
 
 @router.post("/production/orders/{project_id}/pipeline")
@@ -459,6 +513,32 @@ async def add_person_to_roster(
     return {"ok": True, "person": res[0]}
 
 
+@router.patch("/munim/people/{person_id}")
+async def patch_person_in_roster(
+    person_id: str,
+    body: PersonPatchRequest,
+    user: CurrentUser = Depends(get_current_user),
+) -> dict[str, Any]:
+    _ = user
+    sb = get_supabase_admin()
+    res = step_executors.update_person_record(
+        sb,
+        person_id=person_id,
+        full_name=body.full_name,
+        person_type=body.person_type,
+        role_tags=body.role_tags,
+        phone=body.phone,
+        email=body.email,
+        aliases=body.aliases,
+        payout_aliases=body.payout_aliases,
+        is_active=body.is_active,
+        replace_lists=True,
+    )
+    if not res.get("ok"):
+        raise HTTPException(status_code=404, detail=res.get("error", {}).get("message", "Person not found"))
+    return res
+
+
 @router.post("/munim/vendors")
 async def add_vendor_to_directory(
     body: VendorCreateRequest,
@@ -466,8 +546,37 @@ async def add_vendor_to_directory(
 ) -> dict[str, Any]:
     _ = user
     sb = get_supabase_admin()
-    res = sb.table("vendors").insert(body.model_dump(exclude_none=True)).execute().data
+    payload = body.model_dump(exclude_none=True)
+    if payload.get("gstin"):
+        payload["gstin"] = str(payload["gstin"]).strip().upper()
+    res = sb.table("vendors").insert(payload).execute().data
     return {"ok": True, "vendor": res[0]}
+
+
+@router.patch("/munim/vendors/{vendor_id}")
+async def patch_vendor_in_directory(
+    vendor_id: str,
+    body: VendorPatchRequest,
+    user: CurrentUser = Depends(get_current_user),
+) -> dict[str, Any]:
+    _ = user
+    sb = get_supabase_admin()
+    res = await step_executors.update_vendor_record(
+        sb,
+        vendor_id=vendor_id,
+        canonical_name=body.canonical_name,
+        vendor_kind=body.vendor_kind,
+        phone=body.phone,
+        gstin=body.gstin,
+        specialty=body.specialty,
+        aliases=body.aliases,
+        notes=body.notes,
+        is_active=body.is_active,
+        replace_lists_and_notes=True,
+    )
+    if not res.get("ok"):
+        raise HTTPException(status_code=404, detail=res.get("error", {}).get("message", "Vendor not found"))
+    return res
 
 
 @router.post("/munim/customers")
@@ -477,8 +586,41 @@ async def add_customer_to_directory(
 ) -> dict[str, Any]:
     _ = user
     sb = get_supabase_admin()
-    res = sb.table("customers").insert(body.model_dump(exclude_none=True)).execute().data
-    return {"ok": True, "customer": res[0]}
+    res = step_executors.create_standalone_customer(
+        sb,
+        full_name=body.full_name,
+        area_landmark=body.area_landmark,
+        phone=body.phone,
+        aliases=body.aliases,
+        notes=body.notes,
+    )
+    if not res.get("ok"):
+        raise HTTPException(status_code=400, detail=res.get("error", {}).get("message", "Invalid customer"))
+    return res
+
+
+@router.patch("/munim/customers/{customer_id}")
+async def patch_customer_in_directory(
+    customer_id: str,
+    body: CustomerPatchRequest,
+    user: CurrentUser = Depends(get_current_user),
+) -> dict[str, Any]:
+    _ = user
+    sb = get_supabase_admin()
+    res = await step_executors.update_customer_record(
+        sb,
+        customer_id=customer_id,
+        full_name=body.full_name,
+        area_landmark=body.area_landmark,
+        phone=body.phone,
+        aliases=body.aliases,
+        notes=body.notes,
+        is_active=body.is_active,
+        replace_lists_and_notes=True,
+    )
+    if not res.get("ok"):
+        raise HTTPException(status_code=404, detail=res.get("error", {}).get("message", "Customer not found"))
+    return res
 
 
 # ---------------------------------------------------------------------------
@@ -598,3 +740,20 @@ async def discard_agent_goal(
     _ = user
     sb = get_supabase_admin()
     return agent_core.discard_goal(sb, goal_id)
+
+
+@router.post("/agent/goals/{goal_id}/edit")
+async def edit_agent_goal(
+    goal_id: str,
+    body: GoalEditRequest,
+    user: CurrentUser = Depends(get_current_user),
+) -> dict[str, Any]:
+    _ = user
+    sb = get_supabase_admin()
+    return await asyncio.to_thread(
+        agent_core.edit_open_goal_slots,
+        sb,
+        goal_id=goal_id,
+        slot_patch=body.slot_patch,
+        correction_note=body.correction_note,
+    )

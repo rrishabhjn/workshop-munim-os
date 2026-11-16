@@ -558,3 +558,187 @@ async def test_fastapi_domains_and_debounced_telegram_webhook_endpoints():
     finally:
         app.dependency_overrides.clear()
 
+
+@pytest.mark.asyncio
+async def test_master_spine_low_risk_auto_commit_cascade_zoho_sync_and_undo():
+    sb = _seed_fake_sb()
+    sb.store["customers"][0]["zoho_contact_id"] = "zc-ambure-99"
+
+    envelope_json = AgentTurnEnvelope(
+        intent_category="goal_actions",
+        goal_items=[
+            agent_core.GoalIntentItem(
+                operation_kind="update_customer",
+                summary_title="Update Ambure Ji phone & area",
+                customer_id="c-ambure",
+                phone="9999988888",
+                area_landmark="Vaishali Nagar Jaipur",
+                aliases=["Ambure Sir"],
+            )
+        ],
+    ).model_dump_json()
+
+    fake_client = MagicMock()
+    fake_client.interactions.create.return_value = SimpleNamespace(
+        id="int_cust_upd", steps=[], output_text=envelope_json
+    )
+
+    with (
+        patch("app.services.agent_core.get_settings", return_value=Settings(gemini_api_key="test-key")),
+        patch("app.services.agent_core._get_interactions_client", return_value=fake_client),
+        patch("app.services.zoho.sync_existing_zoho_contact", new=AsyncMock(return_value=True)) as mock_zoho_sync,
+    ):
+        out = await agent_core.run_agent_turn(
+            sb,
+            owner_person_id="p-shreyansh",
+            actor_label="Shreyansh",
+            source_channel="web_command_bar",
+            domain_scope="munim",
+            text="Ambure ji ka phone 9999988888 aur area Vaishali Nagar Jaipur kar do",
+        )
+
+    goal_out = out["goals"][0]
+    assert goal_out["status"] == "completed"
+    assert goal_out["undo_available"] is True
+    assert sb.store["customers"][0]["phone"] == "9999988888"
+    assert sb.store["customers"][0]["area_landmark"] == "Vaishali Nagar Jaipur"
+    assert "Ambure Sir" in sb.store["customers"][0]["aliases"]
+    # Cascaded onto active project!
+    assert sb.store["projects"][0]["customer_name"] == "Ambure Ji (Vaishali Nagar Jaipur)"
+    assert sb.store["projects"][0]["site_area_landmark"] == "Vaishali Nagar Jaipur"
+    assert sb.store["projects"][0]["phone"] == "9999988888"
+    mock_zoho_sync.assert_awaited_once()
+
+    # 1-Tap [↩️ Undo] restores BOTH customer and active project!
+    with patch("app.services.zoho.sync_existing_zoho_contact", new=AsyncMock(return_value=True)):
+        undo_res = agent_core.undo_completed_goal(sb, goal_id=goal_out["goal_id"], actor_person_id="p-shreyansh")
+    assert undo_res["ok"] is True
+    assert sb.store["customers"][0]["phone"] == "9829000001"
+    assert sb.store["customers"][0]["area_landmark"] == "Jaipur"
+    assert sb.store["projects"][0]["customer_name"] == "Ambure Ji (Jaipur)"
+
+
+@pytest.mark.asyncio
+async def test_master_spine_high_sensitivity_edits_and_archive_require_confirm():
+    sb = _seed_fake_sb()
+
+    # 1. Updating Order quoted_total ₹ + adding Worker bank payout_aliases + Soft-Archiving a Person
+    envelope_json = AgentTurnEnvelope(
+        intent_category="goal_actions",
+        goal_items=[
+            agent_core.GoalIntentItem(
+                operation_kind="update_order_details",
+                summary_title="Update Ambure Ji deal value to ₹25,00,000",
+                project_id="prj-ambure",
+                quoted_total=2500000,
+            ),
+            agent_core.GoalIntentItem(
+                operation_kind="update_person",
+                summary_title="Add bank proxy Ruksar Bano for Ramesh Mistri",
+                person_id="p-ramesh",
+                payout_aliases=["Ruksar Bano"],
+            ),
+            agent_core.GoalIntentItem(
+                operation_kind="archive_record",
+                summary_title="Archive Ramesh Mistri",
+                archive_entity_kind="person",
+                person_id="p-ramesh",
+            ),
+        ],
+    ).model_dump_json()
+
+    fake_client = MagicMock()
+    fake_client.interactions.create.return_value = SimpleNamespace(
+        id="int_sens", steps=[], output_text=envelope_json
+    )
+
+    with (
+        patch("app.services.agent_core.get_settings", return_value=Settings(gemini_api_key="test-key")),
+        patch("app.services.agent_core._get_interactions_client", return_value=fake_client),
+    ):
+        out = await agent_core.run_agent_turn(
+            sb,
+            owner_person_id="p-shreyansh",
+            actor_label="Shreyansh",
+            source_channel="telegram",
+            domain_scope="munim",
+            text="Ambure deal 25L karo, Ramesh bank Ruksar Bano, aur Ramesh archive karo",
+        )
+
+    # All 3 MUST pause for confirmation with Before -> After diffs!
+    for g in out["goals"]:
+        assert g["status"] == "awaiting_confirmation"
+    assert "₹23,00,000" in out["goals"][0]["prompt"]
+    assert "₹25,00,000" in out["goals"][0]["prompt"]
+    assert "Ruksar Bano" in out["goals"][1]["prompt"]
+    assert "Soft-Archive" in out["goals"][2]["prompt"]
+    assert sb.store["projects"][0]["quoted_total"] == 2300000.0
+    assert sb.store["people"][2]["is_active"] is True
+
+    # Confirm all 3 -> executes cleanly without hard-deleting any row!
+    for g in out["goals"]:
+        res = await agent_core.confirm_and_execute_goal(
+            sb, goal_id=g["goal_id"], actor_person_id="p-shreyansh", actor_label="Shreyansh"
+        )
+        assert res["status"] == "completed"
+
+    assert sb.store["projects"][0]["quoted_total"] == 2500000.0
+    assert "Ruksar Bano" in sb.store["people"][2]["payout_aliases"]
+    assert sb.store["people"][2]["is_active"] is False
+    assert len(sb.store["people"]) == 3  # Soft-archived, NOT SQL deleted!
+
+
+@pytest.mark.asyncio
+async def test_munim_master_directory_patch_endpoints():
+    import httpx
+    from app.auth import CurrentUser, get_current_user
+    from app.main import app
+
+    sb = _seed_fake_sb()
+    sb.store["vendors"].append(
+        {
+            "id": "v-patel",
+            "canonical_name": "Patel Ply",
+            "vendor_kind": "supplier",
+            "phone": None,
+            "gstin": None,
+            "specialty": "Plywood",
+            "aliases": [],
+            "notes": None,
+            "is_active": True,
+        }
+    )
+
+    app.dependency_overrides[get_current_user] = lambda: CurrentUser(
+        auth_type="telegram", identifier="1001", display_name="Shreyansh"
+    )
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            with (
+                patch("app.routers.domains.get_supabase_admin", return_value=sb),
+                patch("app.services.zoho.get_settings", return_value=Settings(_env_file=None)),
+            ):
+                rc = await client.patch(
+                    "/api/munim/customers/c-ambure",
+                    json={"phone": "9111222333", "area_landmark": "C-Scheme Jaipur"},
+                )
+                assert rc.status_code == 200
+                assert sb.store["projects"][0]["customer_name"] == "Ambure Ji (C-Scheme Jaipur)"
+
+                rv = await client.patch(
+                    "/api/munim/vendors/v-patel",
+                    json={"gstin": "08abcde1234f1z5", "phone": "9414001122"},
+                )
+                assert rv.status_code == 200
+                assert sb.store["vendors"][0]["gstin"] == "08ABCDE1234F1Z5"
+
+                rp = await client.patch(
+                    "/api/munim/people/p-ramesh",
+                    json={"payout_aliases": ["Ruksar Bano"], "aliases": ["Ramu", "Ramesh Ji"]},
+                )
+                assert rp.status_code == 200
+                assert sb.store["people"][2]["payout_aliases"] == ["Ruksar Bano"]
+    finally:
+        app.dependency_overrides.clear()
+

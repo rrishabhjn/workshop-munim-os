@@ -34,11 +34,11 @@ class StageReorder(BaseModel):
 
 
 class ProjectCreate(BaseModel):
-    project_code: str
+    project_code: str | None = None
     customer_name: str
     phone: str | None = None
     quoted_total: float = 0.0
-    gst_flag: bool = True
+    gst_flag: bool = False
     promised_delivery_date: str | None = None
 
 
@@ -282,7 +282,12 @@ async def create_project(
     body: ProjectCreate, _: CurrentUser = Depends(get_current_user)
 ) -> dict[str, Any]:
     sb = get_supabase_admin()
-    res = sb.table("projects").insert(body.model_dump(exclude_none=True)).execute()
+    payload = body.model_dump(exclude_none=True)
+    if not (payload.get("project_code") or "").strip():
+        payload["project_code"] = f"PRJ-{datetime.now(timezone.utc):%y%m%d-%H%M%S}"
+    payload.setdefault("pipeline_stage", "lead")
+    payload.setdefault("gst_flag", False)
+    res = sb.table("projects").insert(payload).execute()
     return res.data[0]
 
 

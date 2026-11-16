@@ -1,9 +1,11 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   AlertTriangle,
+  Archive,
   ChevronDown,
   ChevronUp,
   History,
+  Pencil,
   Plus,
   Share2,
 } from "lucide-react";
@@ -34,11 +36,10 @@ export default function AllOrdersBoard({
   const [areaLandmark, setAreaLandmark] = useState("");
   const [roughScope, setRoughScope] = useState("");
   const [phone, setPhone] = useState("");
-  const [quotedTotal, setQuotedTotal] = useState("");
-  const [deliveryDate, setDeliveryDate] = useState("");
   const [newItemName, setNewItemName] = useState({});
   const [newItemMistri, setNewItemMistri] = useState({});
   const [timelines, setTimelines] = useState({});
+  const [editingOrder, setEditingOrder] = useState(null);
   const [busyId, setBusyId] = useState(null);
 
   const peopleById = Object.fromEntries((people || []).map((p) => [p.id, p]));
@@ -49,6 +50,30 @@ export default function AllOrdersBoard({
   const pipelineStages = lookups?.pipeline_stages || [];
   const materialStages = lookups?.material_stages || [];
   const itemStages = lookups?.item_stages || [];
+
+  useEffect(() => {
+    if (!selectedOrderId) return;
+    const target = (orders || []).find((o) => o.id === selectedOrderId);
+    if (!target) return;
+    const isVisible =
+      filter === "pre_prod"
+        ? PRE_PROD_CODES.has(target.pipeline_stage)
+        : filter === "execution"
+        ? target.pipeline_stage === "execution"
+        : filter === "packed_gate"
+        ? (target.items || []).some((it) => it.stage === "packed_ready")
+        : filter === "completed"
+        ? target.pipeline_stage === "completed"
+        : target.status === "active";
+    if (!isVisible) {
+      setFilter(target.pipeline_stage === "completed" ? "completed" : "active_all");
+    }
+    requestAnimationFrame(() => {
+      document
+        .getElementById(`order-card-${selectedOrderId}`)
+        ?.scrollIntoView({ behavior: "smooth", block: "center" });
+    });
+  }, [selectedOrderId]);
 
   const filteredOrders = (orders || []).filter((o) => {
     if (filter === "pre_prod") return PRE_PROD_CODES.has(o.pipeline_stage);
@@ -72,16 +97,12 @@ export default function AllOrdersBoard({
           area_landmark: areaLandmark.trim(),
           rough_scope: roughScope.trim(),
           phone: phone.trim() || null,
-          quoted_total: Number(quotedTotal || 0),
-          promised_delivery_date: deliveryDate || null,
         }),
       });
       setFullName("");
       setAreaLandmark("");
       setRoughScope("");
       setPhone("");
-      setQuotedTotal("");
-      setDeliveryDate("");
       setShowNewLead(false);
       await onMutated();
       if (res?.project_id) onSelectOrder(res.project_id);
@@ -128,6 +149,41 @@ export default function AllOrdersBoard({
       body: JSON.stringify({ boq_scope_changed: !order.boq_scope_changed }),
     });
     await onMutated();
+  }
+
+  function startEditOrderDetails(order) {
+    setEditingOrder({
+      id: order.id,
+      quoted_total: order.quoted_total ?? 0,
+      promised_delivery_date: order.promised_delivery_date || "",
+      rough_scope: order.rough_scope || "",
+      site_area_landmark: order.site_area_landmark || "",
+      phone: order.phone || "",
+      boq_scope_note: order.boq_scope_note || "",
+    });
+  }
+
+  async function handleSaveOrderDetails(e) {
+    e.preventDefault();
+    if (!editingOrder) return;
+    setBusyId(editingOrder.id);
+    try {
+      await apiFetch(`/api/production/orders/${editingOrder.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          quoted_total: Number(editingOrder.quoted_total || 0),
+          promised_delivery_date: editingOrder.promised_delivery_date || "",
+          rough_scope: editingOrder.rough_scope,
+          site_area_landmark: editingOrder.site_area_landmark,
+          phone: editingOrder.phone,
+          boq_scope_note: editingOrder.boq_scope_note,
+        }),
+      });
+      setEditingOrder(null);
+      await onMutated();
+    } finally {
+      setBusyId(null);
+    }
   }
 
   async function handleAddItem(orderId) {
@@ -240,27 +296,15 @@ export default function AllOrdersBoard({
             className="w-full min-h-[44px] px-3 rounded-xl border border-stone-300 text-sm"
             required
           />
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
-            <input
-              value={phone}
-              onChange={(e) => setPhone(e.target.value)}
-              placeholder="Phone (optional)"
-              className="min-h-[44px] px-3 rounded-xl border border-stone-300 text-sm"
-            />
-            <input
-              type="number"
-              value={quotedTotal}
-              onChange={(e) => setQuotedTotal(e.target.value)}
-              placeholder="Deal Estimate ₹ (optional)"
-              className="min-h-[44px] px-3 rounded-xl border border-stone-300 text-sm"
-            />
-            <input
-              type="date"
-              value={deliveryDate}
-              onChange={(e) => setDeliveryDate(e.target.value)}
-              className="min-h-[44px] px-3 rounded-xl border border-stone-300 text-sm"
-            />
-          </div>
+          <input
+            value={phone}
+            onChange={(e) => setPhone(e.target.value)}
+            placeholder="Phone (optional)"
+            className="w-full min-h-[44px] px-3 rounded-xl border border-stone-300 text-sm"
+          />
+          <p className="text-[11px] text-stone-500">
+            Project code is generated automatically. Quote ₹ &amp; target delivery date can be added later once finalised.
+          </p>
           <div className="flex justify-end gap-2">
             <button
               type="button"
@@ -299,6 +343,7 @@ export default function AllOrdersBoard({
             return (
               <div
                 key={order.id}
+                id={`order-card-${order.id}`}
                 className="bg-white rounded-2xl border border-stone-200 shadow-sm overflow-hidden"
               >
                 {/* Order Summary Header */}
@@ -658,20 +703,149 @@ export default function AllOrdersBoard({
                       </div>
                     </div>
 
-                    {/* 3. Accountability History ('Who Did What & When') */}
-                    <div className="pt-1">
-                      <button
-                        type="button"
-                        onClick={() => toggleTimeline(order.id)}
-                        className="text-xs font-semibold text-stone-600 hover:text-stone-900 flex items-center gap-1.5"
-                      >
-                        <History className="w-3.5 h-3.5" />
-                        <span>
-                          {timelines[order.id]
-                            ? "Hide Stage History"
-                            : "View Who Did What History"}
-                        </span>
-                      </button>
+                    {/* 3. Order Metadata Edit + Accountability History */}
+                    <div className="pt-1 space-y-2">
+                      <div className="flex items-center justify-between gap-2 flex-wrap">
+                        <button
+                          type="button"
+                          onClick={() => toggleTimeline(order.id)}
+                          className="text-xs font-semibold text-stone-600 hover:text-stone-900 flex items-center gap-1.5"
+                        >
+                          <History className="w-3.5 h-3.5" />
+                          <span>
+                            {timelines[order.id]
+                              ? "Hide Stage History"
+                              : "View Who Did What History"}
+                          </span>
+                        </button>
+
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              editingOrder?.id === order.id
+                                ? setEditingOrder(null)
+                                : startEditOrderDetails(order)
+                            }
+                            className="min-h-[38px] px-3 rounded-xl border border-stone-300 bg-white text-xs font-semibold text-stone-800 flex items-center gap-1.5"
+                          >
+                            <Pencil className="w-3.5 h-3.5" />
+                            <span>
+                              {editingOrder?.id === order.id
+                                ? "Close Edit"
+                                : "Edit Order Details"}
+                            </span>
+                          </button>
+                          {order.pipeline_stage !== "lost" && (
+                            <button
+                              type="button"
+                              onClick={() => handlePipelineChange(order, "lost")}
+                              className="min-h-[38px] px-3 rounded-xl border border-rose-200 bg-rose-50 text-xs font-semibold text-rose-700 flex items-center gap-1"
+                            >
+                              <Archive className="w-3.5 h-3.5" />
+                              <span>Mark Lost</span>
+                            </button>
+                          )}
+                        </div>
+                      </div>
+
+                      {editingOrder?.id === order.id && (
+                        <form
+                          onSubmit={handleSaveOrderDetails}
+                          className="bg-white rounded-xl border-2 border-amber-200 p-3.5 space-y-2.5"
+                        >
+                          <div className="text-xs font-bold uppercase text-amber-950">
+                            Edit Order Deal, Delivery &amp; Scope
+                          </div>
+                          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                            <input
+                              type="number"
+                              value={editingOrder.quoted_total}
+                              onChange={(e) =>
+                                setEditingOrder({
+                                  ...editingOrder,
+                                  quoted_total: e.target.value,
+                                })
+                              }
+                              placeholder="Deal Value ₹"
+                              className="min-h-[42px] px-3 rounded-xl border border-stone-300 text-sm"
+                            />
+                            <input
+                              type="date"
+                              value={editingOrder.promised_delivery_date}
+                              onChange={(e) =>
+                                setEditingOrder({
+                                  ...editingOrder,
+                                  promised_delivery_date: e.target.value,
+                                })
+                              }
+                              className="min-h-[42px] px-3 rounded-xl border border-stone-300 text-sm"
+                            />
+                            <input
+                              value={editingOrder.phone}
+                              onChange={(e) =>
+                                setEditingOrder({
+                                  ...editingOrder,
+                                  phone: e.target.value,
+                                })
+                              }
+                              placeholder="Customer Phone"
+                              className="min-h-[42px] px-3 rounded-xl border border-stone-300 text-sm"
+                            />
+                          </div>
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                            <input
+                              value={editingOrder.site_area_landmark}
+                              onChange={(e) =>
+                                setEditingOrder({
+                                  ...editingOrder,
+                                  site_area_landmark: e.target.value,
+                                })
+                              }
+                              placeholder="Site Area / Landmark"
+                              className="min-h-[42px] px-3 rounded-xl border border-stone-300 text-sm"
+                            />
+                            <input
+                              value={editingOrder.boq_scope_note}
+                              onChange={(e) =>
+                                setEditingOrder({
+                                  ...editingOrder,
+                                  boq_scope_note: e.target.value,
+                                })
+                              }
+                              placeholder="BOQ / Site Sizing Note"
+                              className="min-h-[42px] px-3 rounded-xl border border-stone-300 text-sm"
+                            />
+                          </div>
+                          <input
+                            value={editingOrder.rough_scope}
+                            onChange={(e) =>
+                              setEditingOrder({
+                                ...editingOrder,
+                                rough_scope: e.target.value,
+                              })
+                            }
+                            placeholder="Rough Scope"
+                            className="w-full min-h-[42px] px-3 rounded-xl border border-stone-300 text-sm"
+                          />
+                          <div className="flex justify-end gap-2">
+                            <button
+                              type="button"
+                              onClick={() => setEditingOrder(null)}
+                              className="min-h-[40px] px-3.5 rounded-xl border border-stone-300 text-xs font-semibold text-stone-700"
+                            >
+                              Cancel
+                            </button>
+                            <button
+                              type="submit"
+                              disabled={busyId === order.id}
+                              className="min-h-[40px] px-4 rounded-xl bg-amber-900 text-white text-xs font-bold"
+                            >
+                              {busyId === order.id ? "Saving..." : "Save Order Details"}
+                            </button>
+                          </div>
+                        </form>
+                      )}
 
                       {timelines[order.id] && (
                         <div className="mt-2 bg-white rounded-xl border border-stone-200 p-3 space-y-2 max-h-56 overflow-y-auto">

@@ -15,6 +15,7 @@ Implements all 6 AI/Systems Hardenings:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
@@ -27,7 +28,7 @@ from google import genai
 from pydantic import BaseModel, Field
 
 from app.config import get_settings
-from app.services import agent_tools, decisions_triage, step_executors, storage, zoho
+from app.services import agent_tools, decisions_triage, goal_intelligence, step_executors, storage, zoho
 from app.services.goal_primitives import (
     CheckpointedStep,
     IST,
@@ -38,6 +39,7 @@ from app.services.goal_primitives import (
     compute_missing_customer_onboarding_slots,
     format_inr,
     format_voice_receipt_header,
+    is_high_sensitivity_master_mutation,
     select_hydrogen_thinking_level,
 )
 
@@ -63,6 +65,12 @@ class GoalIntentItem(BaseModel):
     )
     operation_kind: Literal[
         "new_lead",
+        "add_customer",
+        "update_customer",
+        "update_vendor",
+        "update_person",
+        "update_order_details",
+        "archive_record",
         "pipeline_stage_move",
         "material_stage_move",
         "item_upsert_or_move",
@@ -84,19 +92,38 @@ class GoalIntentItem(BaseModel):
     )
     choices: list[DisambiguationChoice] = Field(default_factory=list)
 
-    # Production & Customer Slots
+    # Production, Master Spine & Customer Slots
     project_id: str | None = None
     customer_id: str | None = None
+    vendor_id: str | None = None
+    person_id: str | None = None
     full_name: str | None = None
+    new_name: str | None = Field(
+        default=None,
+        description="Populate ONLY when explicitly renaming an existing Customer, Vendor, or Person.",
+    )
     area_landmark: str | None = None
     rough_scope: str | None = None
     phone: str | None = None
+    gstin: str | None = None
+    specialty: str | None = None
+    aliases: list[str] = Field(default_factory=list)
+    payout_aliases: list[str] = Field(
+        default_factory=list,
+        description="Worker proxy bank payee names (e.g. ['Ruksar Bano'] for Lala Ji).",
+    )
+    role_tags: list[str] = Field(default_factory=list)
+    archive_entity_kind: str | None = Field(
+        default=None,
+        description="For archive_record ('delete'/'remove' requests): 'customer' | 'vendor' | 'person' | 'order'.",
+    )
     promised_delivery_date: str | None = None
     quoted_total: float | None = None
     to_stage: str | None = None
     estimator_ids: list[str] = Field(default_factory=list)
     sizing_mistri_id: str | None = None
     boq_scope_changed: bool | None = None
+    boq_scope_note: str | None = None
     item_id: str | None = None
     item_name: str | None = None
     dimensions: str | None = None
@@ -140,6 +167,14 @@ class AgentTurnEnvelope(BaseModel):
         default=None,
         description="Direct answer for Q&A, standalone WhatsApp customer draft, or brief note.",
     )
+    referenced_project_id: str | None = Field(
+        default=None,
+        description="If answering a question about a specific order, populate its project_id UUID from CONTEXT.",
+    )
+    referenced_customer_id: str | None = Field(
+        default=None,
+        description="If answering a question about a specific customer, populate their customer_id UUID.",
+    )
     goal_items: list[GoalIntentItem] = Field(default_factory=list)
 
 
@@ -158,8 +193,10 @@ class MemoryRuleOutput(BaseModel):
     category: Literal["entity", "account", "workflow", "style"]
 
 
-def _inline_json_schema(model_cls: type[BaseModel]) -> dict[str, Any]:
-    """Inline Pydantic $defs and strip unsupported keywords for Gemini response_format."""
+def _inline_json_schema(
+    model_cls: type[BaseModel], force_required: tuple[str, ...] = ()
+) -> dict[str, Any]:
+    """Inline Pydantic $defs, flatten nullable anyOfs, and strip unsupported keywords."""
     raw = deepcopy(model_cls.model_json_schema())
     defs = raw.pop("$defs", {}) or {}
 
@@ -168,17 +205,42 @@ def _inline_json_schema(model_cls: type[BaseModel]) -> dict[str, Any]:
             if "$ref" in node:
                 ref_name = str(node["$ref"]).split("/")[-1]
                 return _resolve(deepcopy(defs.get(ref_name, {})))
+            if "anyOf" in node:
+                non_null = [
+                    x
+                    for x in node["anyOf"]
+                    if not (isinstance(x, dict) and x.get("type") == "null")
+                ]
+                if len(non_null) == 1:
+                    merged = _resolve(non_null[0])
+                    if isinstance(merged, dict) and "description" in node:
+                        merged.setdefault("description", node["description"])
+                    return merged
             cleaned: dict[str, Any] = {}
             for k, v in node.items():
                 if k in ("title", "default"):
                     continue
                 cleaned[k] = _resolve(v)
+            if (
+                cleaned.get("type") == "object"
+                and isinstance(cleaned.get("properties"), dict)
+                and "choice_id" in cleaned["properties"]
+                and "slot_patch_json" in cleaned["properties"]
+            ):
+                cleaned["required"] = list(
+                    dict.fromkeys([*(cleaned.get("required") or []), "slot_patch_json"])
+                )
             return cleaned
         if isinstance(node, list):
             return [_resolve(x) for x in node]
         return node
 
-    return _resolve(raw)
+    out = _resolve(raw)
+    if force_required and isinstance(out, dict):
+        out["required"] = list(
+            dict.fromkeys([*(out.get("required") or []), *force_required])
+        )
+    return out
 
 
 def _get_interactions_client() -> genai.Client:
@@ -194,6 +256,8 @@ def _build_compact_grounding(
     owner_person_id: str | None,
     domain_scope: str,
     ui_context: dict[str, Any] | None,
+    source_channel: str = "web_command_bar",
+    telegram_chat_id: int | None = None,
 ) -> tuple[str, dict[str, str]]:
     """Build O(1) <1,200-token static + open-goals context (relying on tools for search)."""
     today_ist = datetime.now(IST).date().isoformat()
@@ -260,6 +324,61 @@ def _build_compact_grounding(
             )
             ui_prj = {**p_rows[0], "items": items}
 
+    active_orders_raw = (
+        sb.table("projects")
+        .select(
+            "id,project_code,customer_id,customer_name,site_area_landmark,rough_scope,"
+            "quoted_total,paid_cache_inr,pipeline_stage,material_stage,payment_stage"
+        )
+        .eq("project_type", "customer")
+        .eq("status", "active")
+        .order("updated_at", desc=True)
+        .limit(35)
+        .execute()
+        .data
+        or []
+    )
+    active_order_ids = [o["id"] for o in active_orders_raw]
+    active_items_raw = (
+        sb.table("project_items")
+        .select("id,project_id,item_name,stage,production_mistri_id,assembly_mistri_id")
+        .in_("project_id", active_order_ids)
+        .execute()
+        .data
+        or []
+    ) if active_order_ids else []
+    items_by_pid: dict[str, list[dict[str, Any]]] = {}
+    for it in active_items_raw:
+        items_by_pid.setdefault(it["project_id"], []).append(it)
+    active_orders_index = []
+    for o in active_orders_raw:
+        quoted_f = float(o.get("quoted_total") or 0.0)
+        paid_f = float(o.get("paid_cache_inr") or 0.0)
+        active_orders_index.append(
+            {
+                "project_id": o["id"],
+                "project_code": o["project_code"],
+                "customer_id": o.get("customer_id"),
+                "customer_name": o["customer_name"],
+                "area": o.get("site_area_landmark"),
+                "rough_scope": o.get("rough_scope"),
+                "quoted_total": quoted_f,
+                "paid_inr": paid_f,
+                "balance_pending_inr": round(max(quoted_f - paid_f, 0.0), 2),
+                "pipeline_stage": o["pipeline_stage"],
+                "material_stage": o["material_stage"],
+                "payment_stage": o["payment_stage"],
+                "items": items_by_pid.get(o["id"], []),
+            }
+        )
+
+    recent_turns = goal_intelligence.load_rolling_conversation_context(
+        sb,
+        owner_person_id=owner_person_id,
+        source_channel=source_channel,
+        telegram_chat_id=telegram_chat_id,
+    )
+
     ctx = {
         "today_ist": today_ist,
         "domain_scope": domain_scope,
@@ -282,8 +401,10 @@ def _build_compact_grounding(
             for a in accounts
         ],
         "team_and_mistri_roster": people,
+        "active_orders_index": active_orders_index,
         "learned_workshop_rules": rules,
         "open_goals_tray": build_compact_open_goals_tray(open_rows),
+        "recent_conversation_turns": recent_turns,
         "currently_open_ui_order": ui_prj,
     }
     return json.dumps(ctx, ensure_ascii=False, default=str), acc_code_to_id
@@ -295,10 +416,13 @@ def _build_system_instruction(grounding_json: str) -> str:
         "for Shreyansh's custom furniture & interior workshop in Beawar, Rajasthan.\n"
         "Users speak/type in Hinglish/Hindi/English.\n\n"
         "CORE PERSONAL-ASSISTANT RULES:\n"
-        "1. USE TOOLS BEFORE ACTING: Always call `search_customers` or `search_projects_and_items` "
-        "before creating leads, moving stages, or logging receipts so homonyms (e.g. 'Sharma Ji') "
-        "and repeat clients are caught cleanly. Call `search_people_and_vendors` for Mistris, "
-        "proxy bank aliases (e.g. 'Ruksar Bano' -> Lala Ji), or suppliers.\n"
+        "1. FAST GROUNDING FIRST, TOOLS WHEN NEEDED: Check `active_orders_index`, `team_and_mistri_roster`, "
+        "and `payment_accounts` in CONTEXT first! When moving/updating an active order, item, or Mistri that is "
+        "already unambiguously in `active_orders_index`, populate `goal_items` directly in 1 pass without extra tool calls. "
+        "Call `search_customers` before creating a NEW lead/customer (to catch past/completed homonyms), and call "
+        "`search_people_and_vendors` or `search_projects_and_items` for vendors, completed orders, or anything not in CONTEXT. "
+        "IMPORTANT: `active_orders_index` lists only the 35 most recently updated active orders — if a customer or order name is "
+        "NOT in `active_orders_index`, ALWAYS call `search_projects_and_items` (and `search_customers`) before concluding it does not exist.\n"
         "2. COMPOUND REPLIES & OPEN GOALS: Check `open_goals_tray` in CONTEXT. A single user message "
         "may answer an open goal (`target_open_goal_id` set) AND also issue a brand-new update "
         "(`target_open_goal_id` = null) in the same `goal_items` list. Never drop either half!\n"
@@ -309,13 +433,26 @@ def _build_system_instruction(grounding_json: str) -> str:
         "4. MUNIM FINANCIAL RULES (Zoho 100% Management Ledger, GST-Off): Every receipt, expense, "
         "vendor payment, or float transfer MUST have `amount_inr` AND `payment_account_code` "
         "(from `payment_accounts`, e.g., `cash_galla`, `axis`, `float_ansh`). If account or party is "
-        "missing, ask for ALL missing fields in ONE consolidated `clarification_question`.\n"
+        "missing, ask for ALL missing fields in ONE consolidated `clarification_question`. "
+        "Never put a Supabase UUID into `zoho_contact_id`.\n"
         "5. PRODUCTION LIFECYCLE STAGES:\n"
         "   - Project `pipeline_stage_move`: `lead` -> `design` -> `estimating` -> `quoted_awaiting_advance` -> `site_sizing_boq` -> `execution` -> `completed`.\n"
         "   - Ansh `material_stage_move`: `check_stock` -> `ordered_pending` -> `all_in_shop`.\n"
         "   - Flat Item `item_upsert_or_move` ('Kitchen', 'Master Bed'): `in_shop` -> `packed_ready` -> `at_site` -> `qc_done`.\n"
-        "6. AUDIO TRANSCRIPT: Whenever audio is present, populate `heard_transcript` faithfully.\n"
-        "7. OWN FIRM NAMES: Never treat 'The Furniture Company', 'The Work App', or 'Shreyansh Jain' as an external customer or vendor.\n\n"
+        "6. MASTER SPINE & ORDER METADATA CRUD:\n"
+        "   - Always search first to populate exact `customer_id`, `vendor_id`, `person_id`, or `project_id`.\n"
+        "   - Standalone customer (without an order): `add_customer`. Vendor or Mistri onboarding: `add_person_or_vendor`.\n"
+        "   - Edit existing Customer (`update_customer`), Vendor (`update_vendor`), Person/Mistri (`update_person` including `phone`, `aliases`, bank `payout_aliases`), or Order (`update_order_details` for `quoted_total`, `promised_delivery_date`, `rough_scope`, `area_landmark`, `boq_scope_note`).\n"
+        "   - Populate `new_name` ONLY when explicitly renaming an existing Customer, Vendor, or Person.\n"
+        "   - For any 'delete' or 'remove' request, use `archive_record` (`archive_entity_kind`: 'customer'|'vendor'|'person'|'order') — we safely soft-archive (`is_active=false` / `lost`), never hard-delete.\n"
+        "7. AUDIO TRANSCRIPT: Whenever audio is present, populate `heard_transcript` faithfully.\n"
+        "8. OWN FIRM NAMES: Never treat 'The Furniture Company', 'The Work App', or 'Shreyansh Jain' as an external customer or vendor.\n"
+        "9. CONVERSATIONAL CONTINUITY (10-TURN / 30-MIN ROLLING MEMORY): Check `recent_conversation_turns` "
+        "(ordered oldest -> newest) to resolve follow-up questions ('what about the 50k?', 'how much is left?', "
+        "'when did she pay?') and pronouns ('her / it / that order'). For follow-up actions that omit the customer/order "
+        "name, infer the `project_id` / `customer_id` / `party_name` from `recent_conversation_turns` when a single order "
+        "was just discussed; if 2+ different orders were discussed recently and the target is unclear, set `is_ambiguous=true` "
+        "and list them in `choices`. On `direct_answer` turns about a specific order/customer, set `referenced_project_id` / `referenced_customer_id`.\n\n"
         f"CONTEXT:\n{grounding_json}"
     )
 
@@ -341,6 +478,8 @@ async def run_agent_turn(
         owner_person_id=owner_person_id,
         domain_scope=domain_scope,
         ui_context=ui_context,
+        source_channel=source_channel,
+        telegram_chat_id=telegram_chat_id,
     )
     sys_inst = _build_system_instruction(grounding_json)
 
@@ -354,8 +493,12 @@ async def run_agent_turn(
     if media_files:
         now_ts = int(datetime.now(timezone.utc).timestamp())
         for idx, (m_bytes, m_mime) in enumerate(media_files):
-            triage = decisions_triage.triage_media_upload(
-                m_bytes, m_mime, caption=text or "", domain_scope=domain_scope
+            triage = await asyncio.to_thread(
+                decisions_triage.triage_media_upload,
+                m_bytes,
+                m_mime,
+                caption=text or "",
+                domain_scope=domain_scope,
             )
             if triage.media_kind == "multi_txn_screenshot":
                 return {
@@ -417,11 +560,12 @@ async def run_agent_turn(
     resp_format = {
         "type": "text",
         "mime_type": "application/json",
-        "schema": _inline_json_schema(AgentTurnEnvelope),
+        "schema": _inline_json_schema(AgentTurnEnvelope, force_required=("goal_items",)),
     }
 
     # 3. Bounded Tool-Calling Loop (Max 3 rounds; previous_interaction_id strictly within-turn!)
-    interaction = client.interactions.create(
+    interaction = await asyncio.to_thread(
+        client.interactions.create,
         model=settings.gemini_live_model,
         system_instruction=sys_inst,
         input=input_blocks,
@@ -450,7 +594,8 @@ async def run_agent_turn(
                     "result": [{"type": "text", "text": tool_out}],
                 }
             )
-        interaction = client.interactions.create(
+        interaction = await asyncio.to_thread(
+            client.interactions.create,
             model=settings.gemini_live_model,
             previous_interaction_id=interaction.id,
             system_instruction=sys_inst,
@@ -462,14 +607,73 @@ async def run_agent_turn(
 
     raw_json = getattr(interaction, "output_text", None) or ""
     envelope = AgentTurnEnvelope.model_validate_json(raw_json)
+    if envelope.intent_category == "goal_actions" and not envelope.goal_items:
+        try:
+            retry_interaction = await asyncio.to_thread(
+                client.interactions.create,
+                model=settings.gemini_live_model,
+                previous_interaction_id=getattr(interaction, "id", None),
+                system_instruction=sys_inst,
+                input=[
+                    {
+                        "type": "text",
+                        "text": (
+                            "You set intent_category='goal_actions' but omitted goal_items. "
+                            "Populate goal_items with the concrete action(s) now, or set "
+                            "intent_category='direct_answer' with an explanation in direct_reply_text."
+                        ),
+                    }
+                ],
+                generation_config={"thinking_level": thinking_level},
+                response_format=resp_format,
+            )
+            retry_json = getattr(retry_interaction, "output_text", None) or ""
+            if retry_json.strip():
+                envelope = AgentTurnEnvelope.model_validate_json(retry_json)
+        except Exception as exc:
+            logger.warning("Empty goal_items retry failed safely: %s", exc)
+
     heard = envelope.heard_transcript if audio_bytes else None
 
     if envelope.intent_category in ("direct_answer", "draft_whatsapp_message") and not envelope.goal_items:
+        raw_reply_txt = envelope.direct_reply_text or "Done."
+        goal_intelligence.record_query_turn_in_history(
+            sb,
+            owner_person_id=owner_person_id,
+            source_channel=source_channel,
+            domain_scope=domain_scope,
+            telegram_chat_id=telegram_chat_id,
+            ui_context=ui_context or {},
+            thinking_level=thinking_level,
+            user_text=text,
+            heard_transcript=heard,
+            reply_text=raw_reply_txt,
+            referenced_project_id=envelope.referenced_project_id,
+            referenced_customer_id=envelope.referenced_customer_id,
+        )
+        nudge = goal_intelligence.build_side_quest_parked_goal_nudge(
+            sb, owner_person_id=owner_person_id, touched_goal_ids=set()
+        )
+        reply_txt = f"{raw_reply_txt}\n\n{nudge['nudge_line']}" if nudge else raw_reply_txt
         return {
             "kind": envelope.intent_category,
             "heard_transcript": heard,
-            "reply_text": envelope.direct_reply_text or "Done.",
+            "reply_text": reply_txt,
             "goals": [],
+            "parked_goal_nudge": nudge,
+        }
+
+    if not envelope.goal_items:
+        return {
+            "kind": "unrecognized",
+            "is_error": True,
+            "heard_transcript": heard,
+            "reply_text": (
+                envelope.direct_reply_text
+                or "⚠️ Could not match that command to an order or action — please check the customer/order name and try again."
+            ),
+            "goals": [],
+            "parked_goal_nudge": None,
         }
 
     # 4. Process Each Goal Item Under Deterministic Risk-Tiered Autonomy
@@ -488,20 +692,48 @@ async def run_agent_turn(
             uploaded_gcs_paths=uploaded_gcs_paths,
             ui_context=ui_context or {},
             telegram_chat_id=telegram_chat_id,
+            user_text=text,
         )
         processed_goals.append(g_out)
+
+    parked_nudge: dict[str, Any] | None = None
+    if processed_goals and all(g.get("status") == "completed" for g in processed_goals):
+        touched = {
+            str(g["goal_id"]) for g in processed_goals if g.get("goal_id")
+        } | {
+            str(it.target_open_goal_id)
+            for it in envelope.goal_items
+            if it.target_open_goal_id
+        }
+        parked_nudge = goal_intelligence.build_side_quest_parked_goal_nudge(
+            sb, owner_person_id=owner_person_id, touched_goal_ids=touched
+        )
+        if parked_nudge:
+            prev_receipt = str(processed_goals[-1].get("receipt") or "").strip()
+            processed_goals[-1]["receipt"] = (
+                f"{prev_receipt}\n\n{parked_nudge['nudge_line']}"
+                if prev_receipt
+                else parked_nudge["nudge_line"]
+            )
 
     return {
         "kind": "goal_actions",
         "heard_transcript": heard,
         "reply_text": envelope.direct_reply_text,
         "goals": processed_goals,
+        "parked_goal_nudge": parked_nudge,
     }
 
 
 def _map_op_to_db_goal_type(op: str) -> str:
     mapping = {
         "new_lead": "new_lead",
+        "add_customer": "entity_onboarding",
+        "update_customer": "entity_onboarding",
+        "update_vendor": "entity_onboarding",
+        "update_person": "entity_onboarding",
+        "update_order_details": "stage_update",
+        "archive_record": "entity_onboarding",
         "pipeline_stage_move": "stage_update",
         "material_stage_move": "stage_update",
         "item_upsert_or_move": "stage_update",
@@ -513,6 +745,33 @@ def _map_op_to_db_goal_type(op: str) -> str:
         "add_person_or_vendor": "entity_onboarding",
     }
     return mapping.get(op, "stage_update")
+
+
+def _fetch_target_row_for_slots(sb: Any, op: str, slots: dict[str, Any]) -> dict[str, Any] | None:
+    """Fetch existing Supabase record for Before->After diffing & sensitivity checks."""
+    table_and_id: tuple[str, str | None] | None = None
+    if op == "update_customer":
+        table_and_id = ("customers", slots.get("customer_id"))
+    elif op == "update_vendor":
+        table_and_id = ("vendors", slots.get("vendor_id"))
+    elif op == "update_person":
+        table_and_id = ("people", slots.get("person_id"))
+    elif op == "update_order_details":
+        table_and_id = ("projects", slots.get("project_id"))
+    elif op == "archive_record":
+        kind = slots.get("archive_entity_kind")
+        if kind == "customer":
+            table_and_id = ("customers", slots.get("customer_id"))
+        elif kind == "vendor":
+            table_and_id = ("vendors", slots.get("vendor_id"))
+        elif kind == "person":
+            table_and_id = ("people", slots.get("person_id"))
+        elif kind == "order":
+            table_and_id = ("projects", slots.get("project_id"))
+    if not table_and_id or not table_and_id[1]:
+        return None
+    rows = sb.table(table_and_id[0]).select("*").eq("id", table_and_id[1]).limit(1).execute().data or []
+    return rows[0] if rows else None
 
 
 async def _process_goal_intent_item(
@@ -529,8 +788,10 @@ async def _process_goal_intent_item(
     uploaded_gcs_paths: list[str],
     ui_context: dict[str, Any],
     telegram_chat_id: int | None,
+    user_text: str | None = None,
 ) -> dict[str, Any]:
     prior_slots: dict[str, Any] = {}
+    prior_summary = ""
     existing_goal_id: str | None = None
 
     if item.target_open_goal_id:
@@ -546,6 +807,7 @@ async def _process_goal_intent_item(
         if g_rows:
             existing_goal_id = g_rows[0]["id"]
             prior_slots = dict(g_rows[0].get("collected_slots") or {})
+            prior_summary = str(g_rows[0].get("summary_title") or "")
 
     # Merge non-null slots from current turn over prior_slots
     new_slots = {
@@ -556,14 +818,34 @@ async def _process_goal_intent_item(
         if v is not None and v != [] and v != ""
     }
     slots: dict[str, Any] = {**prior_slots, **new_slots}
+    if slots.get("zoho_contact_id") and "-" in str(slots["zoho_contact_id"]):
+        slots.pop("zoho_contact_id", None)
     if uploaded_gcs_paths and not slots.get("uploaded_gcs_paths"):
         slots["uploaded_gcs_paths"] = uploaded_gcs_paths
+
+    if existing_goal_id and prior_slots:
+        await asyncio.to_thread(
+            goal_intelligence.maybe_distill_procedural_memory,
+            sb,
+            prior_summary=prior_summary,
+            prior_slots=prior_slots,
+            updated_slots=slots,
+            user_correction_text=user_text or heard_transcript,
+        )
 
     # Resolve UI open project fallback when unambiguous
     if not slots.get("project_id") and ui_context.get("viewing_project_id") and item.operation_kind in (
         "pipeline_stage_move",
         "material_stage_move",
         "item_upsert_or_move",
+        "update_order_details",
+    ):
+        slots["project_id"] = ui_context["viewing_project_id"]
+    if (
+        not slots.get("project_id")
+        and ui_context.get("viewing_project_id")
+        and item.operation_kind == "archive_record"
+        and slots.get("archive_entity_kind") == "order"
     ):
         slots["project_id"] = ui_context["viewing_project_id"]
 
@@ -579,6 +861,33 @@ async def _process_goal_intent_item(
     missing: list[str] = []
     if op == "new_lead" and not slots.get("customer_id"):
         missing = compute_missing_customer_onboarding_slots(slots)
+    elif op == "add_customer":
+        if not (slots.get("full_name") or slots.get("party_name")):
+            missing.append("full_name")
+    elif op == "add_person_or_vendor":
+        if not (slots.get("full_name") or slots.get("party_name")):
+            missing.append("full_name")
+    elif op == "update_customer":
+        if not slots.get("customer_id"):
+            missing.append("customer_id")
+    elif op == "update_vendor":
+        if not slots.get("vendor_id"):
+            missing.append("vendor_id")
+    elif op == "update_person":
+        if not slots.get("person_id"):
+            missing.append("person_id")
+    elif op == "update_order_details":
+        if not slots.get("project_id"):
+            missing.append("project_id")
+    elif op == "archive_record":
+        kind = slots.get("archive_entity_kind")
+        if kind not in ("customer", "vendor", "person", "order"):
+            missing.append("archive_entity_kind")
+        else:
+            id_map = {"customer": "customer_id", "vendor": "vendor_id", "person": "person_id", "order": "project_id"}
+            req_id = id_map[kind]
+            if not slots.get(req_id):
+                missing.append(req_id)
     elif op in ("pipeline_stage_move", "material_stage_move"):
         if not slots.get("project_id"):
             missing.append("project_id")
@@ -629,6 +938,7 @@ async def _process_goal_intent_item(
             repair_options=choices_serialized,
             project_id=slots.get("project_id"),
             customer_id=slots.get("customer_id"),
+            user_message=user_text or heard_transcript,
         )
         return {
             "goal_id": goal_row["id"],
@@ -637,20 +947,31 @@ async def _process_goal_intent_item(
             "prompt": prompt_q,
             "choices": choices_serialized,
             "missing_slots": missing,
+            "project_id": slots.get("project_id"),
+            "collected_slots": slots,
         }
 
-    # Case B: Unambiguous Production Lifecycle Update -> AUTO-COMMIT + 1-Tap [↩️ Undo]!
-    if op in ("pipeline_stage_move", "material_stage_move", "item_upsert_or_move"):
+    # Fetch existing row for Master Spine / Order updates so sensitivity & Before->After diff are exact
+    target_before_row = _fetch_target_row_for_slots(sb, op, slots)
+    is_low_risk_entity_edit = op in (
+        "update_customer",
+        "update_vendor",
+        "update_person",
+        "update_order_details",
+    ) and not is_high_sensitivity_master_mutation(op, slots, target_before_row)
+
+    # Case B: Unambiguous Production Lifecycle OR Low-Sensitivity Detail Edit -> AUTO-COMMIT + 1-Tap [↩️ Undo]!
+    if op in ("pipeline_stage_move", "material_stage_move", "item_upsert_or_move") or is_low_risk_entity_edit:
         steps = _build_steps_for_slots(op, slots)
         goal_row = _upsert_goal_row(
             sb,
             goal_id=existing_goal_id,
             owner_person_id=owner_person_id,
             source_channel=source_channel,
-            domain_scope="production",
+            domain_scope="production" if op in ("pipeline_stage_move", "material_stage_move", "item_upsert_or_move", "update_order_details") else domain_scope,
             telegram_chat_id=telegram_chat_id,
             ui_context=ui_context,
-            goal_type="stage_update",
+            goal_type=_map_op_to_db_goal_type(op),
             status="awaiting_confirmation",
             thinking_level=thinking_level,
             heard_transcript=heard_transcript,
@@ -662,6 +983,7 @@ async def _process_goal_intent_item(
             repair_options=[],
             project_id=slots.get("project_id"),
             customer_id=slots.get("customer_id"),
+            user_message=user_text or heard_transcript,
         )
         return await confirm_and_execute_goal(
             sb,
@@ -671,8 +993,8 @@ async def _process_goal_intent_item(
             source_channel=source_channel,
         )
 
-    # Case C: Money, Zoho Draft Bills, New Customers/Leads & Roster Additions -> MANDATORY CONFIRM!
-    confirm_card_text = _format_confirmation_summary(op, slots)
+    # Case C: Money, Zoho Draft Bills, New Entities, Soft-Archives & High-Sensitivity Edits -> MANDATORY CONFIRM!
+    confirm_card_text = _format_confirmation_summary(op, slots, target_before_row)
     steps = _build_steps_for_slots(op, slots)
     goal_row = _upsert_goal_row(
         sb,
@@ -694,6 +1016,7 @@ async def _process_goal_intent_item(
         repair_options=[],
         project_id=slots.get("project_id"),
         customer_id=slots.get("customer_id"),
+        user_message=user_text or heard_transcript,
     )
     return {
         "goal_id": goal_row["id"],
@@ -701,19 +1024,25 @@ async def _process_goal_intent_item(
         "summary_title": item.summary_title,
         "prompt": confirm_card_text,
         "choices": [],
+        "project_id": slots.get("project_id"),
+        "collected_slots": slots,
     }
 
 
 def _default_missing_question(op: str, missing: list[str]) -> str:
     labels = {
-        "full_name": "Customer Full Name",
+        "full_name": "Full Name",
         "area_landmark": "Site Area / Landmark (e.g. Civil Lines, Jaipur)",
         "rough_scope": "Rough Scope (items/rooms)",
         "payment_account_code": "Payment Account (Cash Galla / Axis / Float)",
         "to_payment_account_code": "Destination Account / Float",
         "amount_inr": "Amount (₹)",
         "party_name": "Customer / Vendor Name",
-        "project_id": "Customer Order",
+        "customer_id": "Which Customer",
+        "vendor_id": "Which Vendor",
+        "person_id": "Which Person / Mistri",
+        "project_id": "Which Customer Order",
+        "archive_entity_kind": "Record Type (Customer / Vendor / Person / Order)",
         "item_name": "Furniture Item Name (e.g. Kitchen, Bed)",
         "to_stage": "Target Stage",
     }
@@ -721,7 +1050,10 @@ def _default_missing_question(op: str, missing: list[str]) -> str:
     return f"Kripya yeh details batayein ({op.replace('_', ' ')}): *{nice}*"
 
 
-def _format_confirmation_summary(op: str, slots: dict[str, Any]) -> str:
+def _format_confirmation_summary(
+    op: str, slots: dict[str, Any], before_row: dict[str, Any] | None = None
+) -> str:
+    row = before_row or {}
     if op == "new_lead":
         q_str = f" · Est: {format_inr(slots['quoted_total'])}" if slots.get("quoted_total") else ""
         return (
@@ -729,6 +1061,63 @@ def _format_confirmation_summary(op: str, slots: dict[str, Any]) -> str:
             f"• Customer: *{slots.get('full_name')}* ({slots.get('area_landmark')})\n"
             f"• Scope: _{slots.get('rough_scope')}_{q_str}"
         )
+    if op == "add_customer":
+        cname = slots.get("full_name") or slots.get("party_name")
+        area = f" ({slots['area_landmark']})" if slots.get("area_landmark") else ""
+        ph = f"\n• Phone: `{slots['phone']}`" if slots.get("phone") else ""
+        return f"👤 *Confirm New Customer*\n• Name: *{cname}*{area}{ph}"
+    if op == "add_person_or_vendor":
+        name = slots.get("full_name") or slots.get("party_name")
+        kind = slots.get("person_or_vendor_kind") or "salaried_karigar"
+        ph = f"\n• Phone: `{slots['phone']}`" if slots.get("phone") else ""
+        gst = f"\n• GSTIN: `{slots['gstin']}`" if slots.get("gstin") else ""
+        spec = f"\n• Specialty: _{slots['specialty']}_" if slots.get("specialty") else ""
+        return f"🆕 *Confirm Directory Onboarding*\n• Name: *{name}* (`{kind}`){ph}{gst}{spec}"
+    if op == "archive_record":
+        kind = (slots.get("archive_entity_kind") or "record").title()
+        label = (
+            row.get("full_name")
+            or row.get("canonical_name")
+            or row.get("customer_name")
+            or slots.get("full_name")
+            or slots.get("party_name")
+            or kind
+        )
+        code = f" (`{row['project_code']}`)" if row.get("project_code") else ""
+        action_desc = "Mark Order *Lost / Closed*" if kind.lower() == "order" else "Soft-Archive (`is_active = false`, preserves history)"
+        return f"🗂️ *Confirm Archive {kind}*\n• Target: *{label}*{code}\n• Action: {action_desc}"
+    if op in ("update_customer", "update_vendor", "update_person", "update_order_details"):
+        label = (
+            row.get("full_name")
+            or row.get("canonical_name")
+            or row.get("customer_name")
+            or slots.get("summary_title")
+            or "Record"
+        )
+        diffs: list[str] = []
+        old_name = row.get("full_name") or row.get("canonical_name") or ""
+        if slots.get("new_name") and str(slots["new_name"]).strip().lower() != str(old_name).strip().lower():
+            diffs.append(f"• Name: _{old_name or '-'}_ → *{slots['new_name']}*")
+        if op == "update_order_details" and slots.get("quoted_total") is not None:
+            old_q = format_inr(float(row.get("quoted_total") or 0))
+            new_q = format_inr(float(slots["quoted_total"]))
+            diffs.append(f"• Deal Value: {old_q} → *{new_q}*")
+        if slots.get("gstin"):
+            diffs.append(f"• GSTIN: `{row.get('gstin') or '-'}` → *`{str(slots['gstin']).upper()}`*")
+        if slots.get("payout_aliases"):
+            old_pa = ", ".join(row.get("payout_aliases") or []) or "None"
+            diffs.append(f"• Bank Payout Proxy: _{old_pa}_ → + *{', '.join(slots['payout_aliases'])}*")
+        if slots.get("phone"):
+            diffs.append(f"• Phone: `{row.get('phone') or '-'}` → `{slots['phone']}`")
+        if slots.get("area_landmark"):
+            old_a = row.get("area_landmark") or row.get("site_area_landmark") or "-"
+            diffs.append(f"• Area: _{old_a}_ → *{slots['area_landmark']}*")
+        if slots.get("promised_delivery_date"):
+            diffs.append(f"• Delivery: `{row.get('promised_delivery_date') or '-'}` → *`{slots['promised_delivery_date']}`*")
+        if slots.get("rough_scope"):
+            diffs.append(f"• Scope: _{slots['rough_scope']}_")
+        diff_body = "\n".join(diffs) if diffs else f"• {slots.get('summary_title') or op}"
+        return f"✏️ *Confirm Update — {label}*\n{diff_body}"
     if op in ("customer_receipt", "vendor_payment", "expense", "float_transfer"):
         amt = format_inr(float(slots.get("amount_inr") or 0))
         acc = (slots.get("payment_account_code") or "").upper()
@@ -777,6 +1166,7 @@ def _upsert_goal_row(
     repair_options: list[dict[str, Any]],
     project_id: str | None,
     customer_id: str | None,
+    user_message: str | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "owner_person_id": owner_person_id,
@@ -797,6 +1187,8 @@ def _upsert_goal_row(
         "project_id": project_id,
         "customer_id": customer_id,
     }
+    if user_message and user_message.strip():
+        payload["turn_digest"] = [{"user": user_message.strip()[:400]}]
     if goal_id:
         res = sb.table("agent_goals").update(payload).eq("id", goal_id).execute().data
         return res[0]
@@ -871,25 +1263,70 @@ async def confirm_and_execute_goal(
         step["error_detail"] = res.get("error")
 
         if err_kind == "transient_5xx":
+            attempt = int(step.get("retry_count") or 1)
+            if attempt <= goal_intelligence.MAX_AUTO_ZOHO_RETRIES:
+                step["status"] = "failed_transient"
+                retry_info = goal_intelligence.enqueue_goal_retry_task(
+                    goal_id=goal_id,
+                    actor_person_id=actor_person_id,
+                    actor_label=actor_label,
+                    attempt=attempt,
+                )
+                meta_retry = {
+                    **(claimed.get("metadata") or {}),
+                    "auto_retry_attempt": attempt,
+                    "auto_retry_queued": bool(retry_info.get("queued")),
+                }
+                pending_msg = (
+                    f"⏳ Zoho/network busy — auto-retry {attempt}/"
+                    f"{goal_intelligence.MAX_AUTO_ZOHO_RETRIES} scheduled (idempotency protected)."
+                )
+                sb.table("agent_goals").update(
+                    {
+                        "status": "awaiting_confirmation",
+                        "steps": steps,
+                        "metadata": meta_retry,
+                        "pending_prompt": pending_msg,
+                    }
+                ).eq("id", goal_id).execute()
+                return {
+                    "goal_id": goal_id,
+                    "status": "transient_retry_pending",
+                    "auto_retry_attempt": attempt,
+                    "auto_retry_queued": bool(retry_info.get("queued")),
+                    "summary_title": claimed.get("summary_title"),
+                    "prompt": (
+                        f"⏳ Zoho momentarily busy — auto-retry {attempt}/"
+                        f"{goal_intelligence.MAX_AUTO_ZOHO_RETRIES} scheduled in background (safe & idempotent)."
+                    ),
+                    "choices": [],
+                }
+
             step["status"] = "failed_transient"
+            exhausted_msg = (
+                "⚠️ Zoho remained unreachable after 3 automatic retries — "
+                "tap Confirm later or park for Clerk."
+            )
             sb.table("agent_goals").update(
                 {
-                    "status": "awaiting_confirmation",
+                    "status": "needs_error_fix",
                     "steps": steps,
-                    "pending_prompt": "⏳ Zoho/network momentarily busy — safe to retry (idempotency protected).",
+                    "pending_prompt": exhausted_msg,
+                    "repair_options": [],
                 }
             ).eq("id", goal_id).execute()
             return {
                 "goal_id": goal_id,
-                "status": "transient_retry_pending",
+                "status": "needs_error_fix",
                 "summary_title": claimed.get("summary_title"),
-                "prompt": "⏳ Zoho momentarily busy — tap Confirm to retry safely (won't double-post).",
+                "prompt": exhausted_msg,
                 "choices": [],
+                "can_park_for_clerk": True,
             }
 
         # Validation 400 -> Invoke Hydrogen ('medium' thinking) Self-Healing!
         step["status"] = "failed_validation"
-        diagnosis = _diagnose_validation_error_with_hydrogen(
+        diagnosis = await _diagnose_validation_error_with_hydrogen(
             summary_title=claimed.get("summary_title") or op,
             slots=slots,
             error_obj=res.get("error") or {},
@@ -912,6 +1349,34 @@ async def confirm_and_execute_goal(
             "can_park_for_clerk": True,
         }
 
+    verification = goal_intelligence.verify_committed_goal_steps(
+        sb, steps=steps, slots=slots
+    )
+    if not verification.get("verified"):
+        msg = f"⚠️ Post-save verification caught a mismatch: {verification.get('mismatch')}"
+        sb.table("agent_goals").update(
+            {
+                "status": "needs_error_fix",
+                "steps": steps,
+                "collected_slots": slots,
+                "pending_prompt": msg,
+                "repair_options": [],
+            }
+        ).eq("id", goal_id).execute()
+        return {
+            "goal_id": goal_id,
+            "status": "needs_error_fix",
+            "summary_title": claimed.get("summary_title"),
+            "prompt": msg,
+            "choices": [],
+            "can_park_for_clerk": True,
+            "verification": verification,
+        }
+
+    meta_done = {
+        **(claimed.get("metadata") or {}),
+        "verified_checks": verification.get("checks_run", 0),
+    }
     sb.table("agent_goals").update(
         {
             "status": "completed",
@@ -920,18 +1385,23 @@ async def confirm_and_execute_goal(
             "undo_event_ids": undo_ids,
             "project_id": slots.get("project_id"),
             "customer_id": slots.get("customer_id"),
+            "metadata": meta_done,
             "resolved_at": datetime.now(timezone.utc).isoformat(),
         }
     ).eq("id", goal_id).execute()
 
+    has_entity_undo = any(bool((s.get("result") or {}).get("entity_undo")) for s in steps)
     return {
         "goal_id": goal_id,
         "status": "completed",
         "summary_title": claimed.get("summary_title"),
         "receipt": "\n".join(receipts),
-        "undo_available": len(undo_ids) > 0,
+        "undo_available": len(undo_ids) > 0 or has_entity_undo,
         "undo_event_ids": undo_ids,
         "heard_transcript": heard,
+        "verified": True,
+        "project_id": slots.get("project_id"),
+        "collected_slots": slots,
     }
 
 
@@ -998,6 +1468,81 @@ async def _run_single_step(
             existing_customer_id=slots.get("customer_id"),
             actor_person_id=actor_person_id,
         )
+    if op == "add_customer":
+        return step_executors.create_standalone_customer(
+            sb,
+            full_name=str(slots.get("full_name") or slots.get("party_name") or ""),
+            area_landmark=slots.get("area_landmark"),
+            phone=slots.get("phone"),
+            aliases=slots.get("aliases") or None,
+            notes=slots.get("notes"),
+        )
+    if op == "update_customer":
+        return await step_executors.update_customer_record(
+            sb,
+            customer_id=str(slots["customer_id"]),
+            full_name=slots.get("new_name"),
+            area_landmark=slots.get("area_landmark"),
+            phone=slots.get("phone"),
+            aliases=slots.get("aliases") or None,
+            notes=slots.get("notes"),
+        )
+    if op == "update_vendor":
+        v_kind = slots.get("person_or_vendor_kind")
+        return await step_executors.update_vendor_record(
+            sb,
+            vendor_id=str(slots["vendor_id"]),
+            canonical_name=slots.get("new_name"),
+            vendor_kind=v_kind if v_kind in ("supplier", "contractor") else None,
+            phone=slots.get("phone"),
+            gstin=slots.get("gstin"),
+            specialty=slots.get("specialty"),
+            aliases=slots.get("aliases") or None,
+            notes=slots.get("notes"),
+        )
+    if op == "update_person":
+        p_kind = slots.get("person_or_vendor_kind")
+        return step_executors.update_person_record(
+            sb,
+            person_id=str(slots["person_id"]),
+            full_name=slots.get("new_name"),
+            person_type=p_kind if p_kind in ("operator", "salaried_karigar", "contractor_mistri") else None,
+            role_tags=slots.get("role_tags") or None,
+            phone=slots.get("phone"),
+            aliases=slots.get("aliases") or None,
+            payout_aliases=slots.get("payout_aliases") or None,
+        )
+    if op == "update_order_details":
+        return step_executors.update_order_metadata(
+            sb,
+            project_id=str(slots["project_id"]),
+            quoted_total=float(slots["quoted_total"]) if slots.get("quoted_total") is not None else None,
+            promised_delivery_date=slots.get("promised_delivery_date"),
+            rough_scope=slots.get("rough_scope"),
+            site_area_landmark=slots.get("area_landmark"),
+            phone=slots.get("phone"),
+            boq_scope_changed=slots.get("boq_scope_changed"),
+            boq_scope_note=slots.get("boq_scope_note") or slots.get("notes"),
+        )
+    if op == "archive_record":
+        kind = str(slots.get("archive_entity_kind") or "")
+        rec_id_map = {
+            "customer": slots.get("customer_id"),
+            "vendor": slots.get("vendor_id"),
+            "person": slots.get("person_id"),
+            "order": slots.get("project_id"),
+        }
+        rec_id = rec_id_map.get(kind)
+        if not rec_id:
+            return {"ok": False, "error_kind": "validation_400", "error": {"message": f"Missing ID for {kind} archive."}}
+        return await step_executors.archive_master_or_order_record(
+            sb,
+            entity_kind=kind,
+            record_id=str(rec_id),
+            actor_person_id=actor_person_id,
+            source_channel=src,
+            note=slots.get("notes"),
+        )
     if op in ("customer_receipt", "vendor_payment", "expense", "float_transfer"):
         return await step_executors.execute_munim_financial_step(
             sb,
@@ -1037,6 +1582,14 @@ async def _run_single_step(
         if not line_items:
             line_items = [{"description": slots.get("notes") or "Workshop Material", "quantity": 1, "rate": amt, "amount": amt}]
         c_res = await zoho.resolve_or_create_contact(sb, vendor_name, "vendor")
+        if c_res.get("status") == "error" and goal_intelligence.is_transient_zoho_error_message(
+            str(c_res.get("error") or "")
+        ):
+            return {
+                "ok": False,
+                "error_kind": "transient_5xx",
+                "error": {"message": c_res.get("error")},
+            }
         draft_res = await zoho.create_draft_bill(
             supplier_name=c_res.get("contact_name") or vendor_name,
             invoice_no=inv_no,
@@ -1046,13 +1599,24 @@ async def _run_single_step(
             vendor_id=c_res.get("contact_id"),
         )
         if draft_res.get("error"):
+            err_msg = str(draft_res["error"])
             return {
                 "ok": False,
-                "error_kind": "validation_400",
-                "error": {"message": draft_res["error"]},
+                "error_kind": (
+                    "transient_5xx"
+                    if goal_intelligence.is_transient_zoho_error_message(err_msg)
+                    else "validation_400"
+                ),
+                "error": {"message": err_msg},
             }
+        draft_status = str(
+            draft_res.get("status")
+            or (draft_res.get("bill") or {}).get("status")
+            or "draft"
+        )
         return {
             "ok": True,
+            "draft_status": draft_status,
             "receipt": f"🧾 Zoho *Draft Bill* saved: *{vendor_name}* (`{inv_no or 'Draft'}`) · *{format_inr(amt)}*",
         }
     if op == "add_person_or_vendor":
@@ -1061,15 +1625,34 @@ async def _run_single_step(
         if not name:
             return {"ok": False, "error_kind": "validation_400", "error": {"message": "Name is required."}}
         if kind in ("supplier", "contractor"):
-            ins = sb.table("vendors").insert({"canonical_name": name, "vendor_kind": kind, "phone": slots.get("phone"), "notes": slots.get("notes")}).execute().data
-            return {"ok": True, "receipt": f"Added Vendor *{ins[0]['canonical_name']}* ({kind})"}
-        ins = sb.table("people").insert({"full_name": name, "person_type": "contractor_mistri" if kind == "contractor_mistri" else "salaried_karigar", "role_tags": ["mistri"], "phone": slots.get("phone")}).execute().data
-        return {"ok": True, "receipt": f"Added Mistri *{ins[0]['full_name']}* to Roster"}
+            ins = sb.table("vendors").insert(
+                {
+                    "canonical_name": name,
+                    "vendor_kind": kind,
+                    "phone": slots.get("phone"),
+                    "gstin": str(slots["gstin"]).strip().upper() if slots.get("gstin") else None,
+                    "specialty": slots.get("specialty"),
+                    "aliases": slots.get("aliases") or [],
+                    "notes": slots.get("notes"),
+                }
+            ).execute().data
+            return {"ok": True, "vendor_id": ins[0]["id"], "receipt": f"Added Vendor *{ins[0]['canonical_name']}* ({kind})"}
+        ins = sb.table("people").insert(
+            {
+                "full_name": name,
+                "person_type": "contractor_mistri" if kind == "contractor_mistri" else "salaried_karigar",
+                "role_tags": slots.get("role_tags") or ["mistri"],
+                "phone": slots.get("phone"),
+                "aliases": slots.get("aliases") or [],
+                "payout_aliases": slots.get("payout_aliases") or [],
+            }
+        ).execute().data
+        return {"ok": True, "person_id": ins[0]["id"], "receipt": f"Added Mistri *{ins[0]['full_name']}* to Roster"}
 
     return {"ok": False, "error_kind": "validation_400", "error": {"message": f"Unsupported step '{op}'."}}
 
 
-def _diagnose_validation_error_with_hydrogen(
+async def _diagnose_validation_error_with_hydrogen(
     *, summary_title: str, slots: dict[str, Any], error_obj: dict[str, Any]
 ) -> ErrorRepairProposal:
     """Use gemini-4-hydrogen ('medium' thinking) to turn a 400 error into plain Hinglish + 1-tap repairs."""
@@ -1081,7 +1664,8 @@ def _diagnose_validation_error_with_hydrogen(
         )
     try:
         client = _get_interactions_client()
-        interaction = client.interactions.create(
+        interaction = await asyncio.to_thread(
+            client.interactions.create,
             model=settings.gemini_live_model,
             system_instruction=(
                 "You diagnose Zoho Books India or Supabase data validation errors for a workshop owner. "
@@ -1092,7 +1676,9 @@ def _diagnose_validation_error_with_hydrogen(
             response_format={
                 "type": "text",
                 "mime_type": "application/json",
-                "schema": _inline_json_schema(ErrorRepairProposal),
+                "schema": _inline_json_schema(
+                    ErrorRepairProposal, force_required=("repair_options",)
+                ),
             },
         )
         return ErrorRepairProposal.model_validate_json(interaction.output_text or "")
@@ -1112,15 +1698,54 @@ async def apply_slot_patch_and_resume(
     actor_person_id: str | None,
     actor_label: str,
     source_channel: str = "web",
+    correction_note: str | None = None,
 ) -> dict[str, Any]:
     """Apply a 1-tap disambiguation or repair button patch and advance the goal."""
     rows = sb.table("agent_goals").select("*").eq("id", goal_id).limit(1).execute().data or []
     if not rows:
         return {"ok": False, "error": "Goal not found."}
     g = rows[0]
-    merged_slots = {**(g.get("collected_slots") or {}), **slot_patch}
+    prior_slots = dict(g.get("collected_slots") or {})
+    merged_slots = {**prior_slots, **slot_patch}
+    await asyncio.to_thread(
+        goal_intelligence.maybe_distill_procedural_memory,
+        sb,
+        prior_summary=str(g.get("summary_title") or ""),
+        prior_slots=prior_slots,
+        updated_slots=merged_slots,
+        user_correction_text=correction_note,
+    )
     op = str(merged_slots.get("operation_kind") or "stage_update")
     steps = _build_steps_for_slots(op, merged_slots)
+
+    # If resolving homonym disambiguation ('gathering_info') for a Confirm-Gated operation,
+    # pause cleanly at 'awaiting_confirmation' with a Before->After preview card!
+    target_before_row = _fetch_target_row_for_slots(sb, op, merged_slots)
+    is_auto_commit = op in ("pipeline_stage_move", "material_stage_move", "item_upsert_or_move") or (
+        op in ("update_customer", "update_vendor", "update_person", "update_order_details")
+        and not is_high_sensitivity_master_mutation(op, merged_slots, target_before_row)
+    )
+    if g.get("status") == "gathering_info" and not is_auto_commit:
+        confirm_card_text = _format_confirmation_summary(op, merged_slots, target_before_row)
+        sb.table("agent_goals").update(
+            {
+                "collected_slots": merged_slots,
+                "missing_slots": [],
+                "pending_prompt": confirm_card_text,
+                "repair_options": [],
+                "steps": steps,
+                "status": "awaiting_confirmation",
+            }
+        ).eq("id", goal_id).execute()
+        return {
+            "goal_id": goal_id,
+            "status": "awaiting_confirmation",
+            "summary_title": g.get("summary_title"),
+            "prompt": confirm_card_text,
+            "choices": [],
+            "project_id": merged_slots.get("project_id"),
+            "collected_slots": merged_slots,
+        }
 
     sb.table("agent_goals").update(
         {
@@ -1140,10 +1765,61 @@ async def apply_slot_patch_and_resume(
     )
 
 
+def edit_open_goal_slots(
+    sb: Any,
+    *,
+    goal_id: str,
+    slot_patch: dict[str, Any],
+    correction_note: str | None = None,
+) -> dict[str, Any]:
+    """Apply an operator [✏️ Edit] change on an open goal, distill memory, and refresh card."""
+    rows = sb.table("agent_goals").select("*").eq("id", goal_id).limit(1).execute().data or []
+    if not rows:
+        return {"ok": False, "error": "Goal not found."}
+    g = rows[0]
+    prior_slots = dict(g.get("collected_slots") or {})
+    merged_slots = {**prior_slots, **slot_patch}
+    memory_res = goal_intelligence.maybe_distill_procedural_memory(
+        sb,
+        prior_summary=str(g.get("summary_title") or ""),
+        prior_slots=prior_slots,
+        updated_slots=merged_slots,
+        user_correction_text=correction_note,
+    )
+
+    op = str(merged_slots.get("operation_kind") or g.get("goal_type") or "stage_update")
+    steps = _build_steps_for_slots(op, merged_slots)
+    target_before_row = _fetch_target_row_for_slots(sb, op, merged_slots)
+    confirm_card_text = _format_confirmation_summary(op, merged_slots, target_before_row)
+
+    sb.table("agent_goals").update(
+        {
+            "collected_slots": merged_slots,
+            "missing_slots": [],
+            "pending_prompt": confirm_card_text,
+            "repair_options": [],
+            "steps": steps,
+            "status": "awaiting_confirmation",
+        }
+    ).eq("id", goal_id).execute()
+
+    return {
+        "ok": True,
+        "goal_id": goal_id,
+        "status": "awaiting_confirmation",
+        "summary_title": g.get("summary_title"),
+        "prompt": confirm_card_text,
+        "choices": [],
+        "project_id": merged_slots.get("project_id"),
+        "collected_slots": merged_slots,
+        "memory_distilled": memory_res,
+    }
+
+
 def undo_completed_goal(
     sb: Any, *, goal_id: str, actor_person_id: str | None = None
 ) -> dict[str, Any]:
-    """1-tap [↩️ Undo] for auto-committed Production stage updates."""
+    """1-tap [↩️ Undo] for auto-committed Production stage moves AND low-risk Master/Order edits."""
     rows = sb.table("agent_goals").select("*").eq("id", goal_id).limit(1).execute().data or []
     if not rows:
         return {"ok": False, "error": "Goal not found."}
@@ -1152,6 +1828,38 @@ def undo_completed_goal(
         return {"ok": True, "already_undone": True, "reverted": []}
     event_ids = list(g.get("undo_event_ids") or [])
     reverted = step_executors.undo_stage_events(sb, event_ids, actor_person_id=actor_person_id)
+
+    entity_undos = [
+        (s.get("result") or {}).get("entity_undo")
+        for s in (g.get("steps") or [])
+        if (s.get("result") or {}).get("entity_undo")
+    ]
+    for item in reversed(entity_undos):
+        table = item.get("table")
+        rec_id = item.get("record_id")
+        snap = item.get("prior_snapshot") or {}
+        if table and rec_id and snap:
+            sb.table(table).update(snap).eq("id", rec_id).execute()
+            for prj_undo in item.get("cascaded_projects_before") or []:
+                if prj_undo.get("id") and prj_undo.get("patch"):
+                    sb.table("projects").update(prj_undo["patch"]).eq("id", prj_undo["id"]).execute()
+            z_cid = item.get("zoho_contact_id")
+            if z_cid and table in ("customers", "vendors"):
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(
+                        zoho.sync_existing_zoho_contact(
+                            z_cid,
+                            name=snap.get("full_name") or snap.get("canonical_name"),
+                            phone=snap.get("phone") or "",
+                            gstin=snap.get("gstin") if table == "vendors" else None,
+                            replace_notes=snap.get("notes") or "",
+                        )
+                    )
+                except RuntimeError:
+                    pass
+            reverted.append(f"Reverted {table[:-1] if table.endswith('s') else table} update")
+
     sb.table("agent_goals").update({"status": "undone"}).eq("id", goal_id).execute()
     return {"ok": True, "reverted": reverted}
 

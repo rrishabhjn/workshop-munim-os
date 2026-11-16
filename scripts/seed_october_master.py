@@ -923,6 +923,83 @@ ORDERS: list[dict[str, Any]] = [
             {"item_name": "Completed Interior Woodwork", "stage": "qc_done"},
         ],
     },
+    # 5 October Pre-Prod Estimate Tabs (`estimating` / `quoted_awaiting_advance`)
+    {
+        "project_code": "PRJ-OCT-016",
+        "customer_name": "Suresh Ji",
+        "site_area_landmark": "Beawar",
+        "rough_scope": "Modular Kitchen + Crockery / Serving Counter (₹4.50L Acrylic/Hafele vs ₹4.20L Laminate options)",
+        "pipeline_stage": "quoted_awaiting_advance",
+        "material_stage": "not_started",
+        "payment_stage": "advance_pending",
+        "quoted_total": 450000.00,
+        "paid_cache_inr": 0.00,
+        "metadata": {
+            "source": "October main (suresh ji estimate tab)",
+            "reconciliation_note": "Verify if 2-3 Nov material rows + ₹15,700 in Debtors mean converted to Execution.",
+        },
+        "items": [],
+    },
+    {
+        "project_code": "PRJ-OCT-017",
+        "customer_name": "Mahima",
+        "site_area_landmark": "Beawar",
+        "rough_scope": "Temple + Acrylic / Laminate Bedroom Furniture",
+        "pipeline_stage": "quoted_awaiting_advance",
+        "material_stage": "not_started",
+        "payment_stage": "advance_pending",
+        "quoted_total": 310000.00,
+        "paid_cache_inr": 0.00,
+        "metadata": {
+            "source": "October main (mahima estimate tab — ₹3.10L Acrylic option + ₹27.1K–₹36.7K Temple)"
+        },
+        "items": [],
+    },
+    {
+        "project_code": "PRJ-OCT-018",
+        "customer_name": "Mehta Garment",
+        "site_area_landmark": "Beawar",
+        "rough_scope": "Showroom / Counter & Kitchen Interior Work (Material BOM ₹2,43,850)",
+        "pipeline_stage": "estimating",
+        "material_stage": "not_started",
+        "payment_stage": "advance_pending",
+        "quoted_total": 0.00,
+        "paid_cache_inr": 0.00,
+        "metadata": {
+            "source": "October main (mehta garment estimate tab — ₹2,43,850 raw material BOM)"
+        },
+        "items": [],
+    },
+    {
+        "project_code": "PRJ-OCT-019",
+        "customer_name": "Praveen Mehta",
+        "site_area_landmark": "Beawar",
+        "rough_scope": "Custom Sofa — Upholstery Fabric & Sleepwell / Feather Foam Options",
+        "pipeline_stage": "quoted_awaiting_advance",
+        "material_stage": "not_started",
+        "payment_stage": "advance_pending",
+        "quoted_total": 44850.00,
+        "paid_cache_inr": 0.00,
+        "metadata": {
+            "source": "October main (mehta offset sofa tab — ₹44,850 foam quote + ₹14,327.50 fabric in Debtors)"
+        },
+        "items": [],
+    },
+    {
+        "project_code": "PRJ-OCT-020",
+        "customer_name": "College Estimate",
+        "site_area_landmark": "Beawar",
+        "rough_scope": "Institutional Furniture Batch (Tables & Storage)",
+        "pipeline_stage": "quoted_awaiting_advance",
+        "material_stage": "not_started",
+        "payment_stage": "advance_pending",
+        "quoted_total": 143925.00,
+        "paid_cache_inr": 0.00,
+        "metadata": {
+            "source": "October main (college estimate tab — ₹95,950 BOM -> ₹1,21,500 / ₹1,43,925 quoted)"
+        },
+        "items": [],
+    },
 ]
 
 
@@ -1064,7 +1141,8 @@ def main() -> None:
             "gst_flag": False,
             "quoted_total": float(o["quoted_total"]),
             "paid_cache_inr": float(o["paid_cache_inr"]),
-            "material_owner_id": ansh_id,
+            "material_owner_id": ansh_id if o["material_stage"] != "not_started" else None,
+            "estimator_ids": owner_ids if o["pipeline_stage"] == "estimating" else [],
             "current_owner_ids": owner_ids,
             "metadata": {
                 **((existing_projects.get(pcode) or {}).get("metadata") or {}),
@@ -1152,7 +1230,7 @@ def main() -> None:
     )
     print(f"  - Supervisor Floats Linked: {len(floats_linked)} / 4")
     print(f"  - Customers Directory: {len(customers_all)}")
-    print(f"  - Customer Orders: {len(orders_all)} (`PRJ-OCT-001` .. `PRJ-OCT-015`)")
+    print(f"  - Customer Orders: {len(orders_all)} (`PRJ-OCT-001` .. `PRJ-OCT-020`)")
     print(f"  - Flat Furniture Items: {len(items_all)}")
     print(f"  - Live `v_whos_doing_what` Queue Items: {len(wdw_all)}")
 

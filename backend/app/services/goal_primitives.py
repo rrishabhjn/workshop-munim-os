@@ -395,6 +395,77 @@ def build_stage_undo_snapshot(
     }
 
 
+def merge_unique_str_list(
+    existing: list[str] | None, additions: list[str] | None
+) -> list[str]:
+    """Append non-empty strings case-insensitively without wiping existing aliases."""
+    result = [str(x).strip() for x in (existing or []) if str(x).strip()]
+    seen_lower = {x.lower() for x in result}
+    for item in additions or []:
+        clean = str(item).strip()
+        if clean and clean.lower() not in seen_lower:
+            result.append(clean)
+            seen_lower.add(clean.lower())
+    return result
+
+
+def is_high_sensitivity_master_mutation(
+    operation_kind: str,
+    slots: dict[str, Any],
+    current_row: dict[str, Any] | None = None,
+) -> bool:
+    """Classify whether a Master Spine / Order mutation requires Before->After [Confirm]
+    vs Auto-Commit + 1-Tap [Undo]:
+      - Confirm-Gated: new records, soft-archiving, ₹ quoted_total changes, renames,
+        GSTIN changes, and worker bank payout_aliases changes.
+      - Auto-Commit + Undo: phone, area/landmark, specialty, notes, voice aliases,
+        promised_delivery_date, rough_scope, boq_scope_changed/note, role_tags.
+    """
+    if operation_kind in ("new_lead", "add_customer", "add_person_or_vendor", "archive_record"):
+        return True
+
+    row = current_row or {}
+
+    if operation_kind == "update_order_details":
+        if slots.get("quoted_total") is not None:
+            cur_q = round(float(row.get("quoted_total") or 0.0), 2)
+            new_q = round(float(slots["quoted_total"]), 2)
+            if new_q != cur_q:
+                return True
+        return False
+
+    # Check entity rename against existing DB name
+    cur_name = str(row.get("full_name") or row.get("canonical_name") or "").strip()
+    proposed_rename = str(slots.get("new_name") or "").strip()
+    if proposed_rename and proposed_rename.lower() != cur_name.lower():
+        return True
+
+    if operation_kind == "update_vendor":
+        if slots.get("gstin") and str(slots["gstin"]).strip().upper() != str(row.get("gstin") or "").strip().upper():
+            return True
+        if slots.get("person_or_vendor_kind") and slots["person_or_vendor_kind"] in ("supplier", "contractor"):
+            if slots["person_or_vendor_kind"] != row.get("vendor_kind"):
+                return True
+        return False
+
+    if operation_kind == "update_person":
+        if slots.get("payout_aliases"):
+            existing_pa = {str(x).strip().lower() for x in (row.get("payout_aliases") or [])}
+            incoming_pa = {str(x).strip().lower() for x in (slots.get("payout_aliases") or []) if str(x).strip()}
+            if incoming_pa - existing_pa:
+                return True
+        if slots.get("person_or_vendor_kind") and slots["person_or_vendor_kind"] in (
+            "operator",
+            "salaried_karigar",
+            "contractor_mistri",
+        ):
+            if slots["person_or_vendor_kind"] != row.get("person_type"):
+                return True
+        return False
+
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Domain 2 HR: Worker Photo Attendance Worked Minutes & >6:00 PM IST Overtime
 # ---------------------------------------------------------------------------

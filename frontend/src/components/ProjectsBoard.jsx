@@ -7,11 +7,8 @@ export default function ProjectsBoard({ projects, stages, onSelectProject, onRef
   const [filter, setFilter] = useState("active");
   const [showNew, setShowNew] = useState(false);
   const [form, setForm] = useState({
-    project_code: "",
     customer_name: "",
     phone: "",
-    quoted_total: "",
-    promised_delivery_date: "",
   });
   const [saving, setSaving] = useState(false);
 
@@ -38,20 +35,14 @@ export default function ProjectsBoard({ projects, stages, onSelectProject, onRef
       await apiFetch("/api/projects", {
         method: "POST",
         body: JSON.stringify({
-          project_code: form.project_code.trim(),
           customer_name: form.customer_name.trim(),
           phone: form.phone.trim() || null,
-          quoted_total: Number(form.quoted_total || 0),
-          promised_delivery_date: form.promised_delivery_date || null,
         }),
       });
       setShowNew(false);
       setForm({
-        project_code: "",
         customer_name: "",
         phone: "",
-        quoted_total: "",
-        promised_delivery_date: "",
       });
       onRefresh();
     } finally {
@@ -166,14 +157,7 @@ export default function ProjectsBoard({ projects, stages, onSelectProject, onRef
             onSubmit={handleCreate}
             className="bg-white w-full max-w-md rounded-2xl p-5 space-y-3 shadow-xl"
           >
-            <h3 className="text-lg font-bold">New Customer Project</h3>
-            <input
-              required
-              placeholder="Project Code (e.g. PRJ-2026-042)"
-              value={form.project_code}
-              onChange={(e) => setForm({ ...form, project_code: e.target.value })}
-              className="w-full border border-stone-300 rounded-xl px-3 py-2.5"
-            />
+            <h3 className="text-lg font-bold">New Customer Lead</h3>
             <input
               required
               placeholder="Customer Name (e.g. Sharma Ji)"
@@ -182,28 +166,14 @@ export default function ProjectsBoard({ projects, stages, onSelectProject, onRef
               className="w-full border border-stone-300 rounded-xl px-3 py-2.5"
             />
             <input
-              placeholder="Phone Number"
+              placeholder="Phone Number (optional)"
               value={form.phone}
               onChange={(e) => setForm({ ...form, phone: e.target.value })}
               className="w-full border border-stone-300 rounded-xl px-3 py-2.5"
             />
-            <div className="grid grid-cols-2 gap-2">
-              <input
-                type="number"
-                placeholder="Quoted Total (₹)"
-                value={form.quoted_total}
-                onChange={(e) => setForm({ ...form, quoted_total: e.target.value })}
-                className="w-full border border-stone-300 rounded-xl px-3 py-2.5"
-              />
-              <input
-                type="date"
-                value={form.promised_delivery_date}
-                onChange={(e) =>
-                  setForm({ ...form, promised_delivery_date: e.target.value })
-                }
-                className="w-full border border-stone-300 rounded-xl px-3 py-2.5"
-              />
-            </div>
+            <p className="text-xs text-stone-500">
+              Project code is generated automatically. Quote ₹ &amp; target delivery date can be set later once finalised.
+            </p>
             <div className="flex gap-2 pt-2">
               <button
                 type="button"

@@ -38,12 +38,16 @@ app.include_router(cron.router)
 # Serve built React PWA / Telegram Mini App (/production and /munim deep links supported)
 FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
 if FRONTEND_DIST.exists():
+    @app.get("/")
     @app.get("/production")
     @app.get("/production/{rest_of_path:path}")
     @app.get("/munim")
     @app.get("/munim/{rest_of_path:path}")
     async def spa_domain_routes(rest_of_path: str = "") -> FileResponse:
         _ = rest_of_path
-        return FileResponse(str(FRONTEND_DIST / "index.html"))
+        return FileResponse(
+            str(FRONTEND_DIST / "index.html"),
+            headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+        )
 
     app.mount("/", StaticFiles(directory=str(FRONTEND_DIST), html=True), name="frontend")

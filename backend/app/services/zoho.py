@@ -241,30 +241,62 @@ async def create_zoho_contact(
         return {"ok": False, "error": f"Zoho request failed: {exc}"}
 
 
-async def update_zoho_contact_notes(contact_id: str, new_notes: str) -> bool:
-    """Merge new_notes into an existing Zoho Books Contact's notes field (best-effort)."""
+async def sync_existing_zoho_contact(
+    contact_id: str | None,
+    *,
+    name: str | None = None,
+    phone: str | None = None,
+    gstin: str | None = None,
+    notes_to_merge: str | None = None,
+    replace_notes: str | None = None,
+) -> bool:
+    """Sync edits onto an ALREADY linked Zoho Books Contact (lazy creation preserved)."""
     settings = get_settings()
-    if not settings.zoho_enabled or not contact_id or not new_notes.strip():
+    if not settings.zoho_enabled or not contact_id:
         return False
+
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            get_resp = await _zoho_request(client, "GET", f"/contacts/{contact_id}")
-            existing_notes = ""
-            if get_resp.is_success:
-                existing_notes = (get_resp.json().get("contact") or {}).get("notes") or ""
-            merged = merge_notes_text(existing_notes, new_notes)
-            if not merged or merged == existing_notes.strip():
+            payload: dict[str, Any] = {}
+            if name and name.strip():
+                payload["contact_name"] = name.strip()
+            if phone is not None:
+                payload["phone"] = phone.strip()
+            if gstin is not None:
+                clean_gst = gstin.strip().upper()
+                payload["gst_no"] = clean_gst
+                if clean_gst:
+                    payload["gst_treatment"] = "business_gst"
+
+            if replace_notes is not None:
+                payload["notes"] = replace_notes.strip()[:500]
+            elif notes_to_merge and notes_to_merge.strip():
+                get_resp = await _zoho_request(client, "GET", f"/contacts/{contact_id}")
+                existing_notes = ""
+                if get_resp.is_success:
+                    existing_notes = (get_resp.json().get("contact") or {}).get("notes") or ""
+                merged = merge_notes_text(existing_notes, notes_to_merge)
+                if merged and merged != existing_notes.strip():
+                    payload["notes"] = merged[:500]
+
+            if not payload:
                 return True
+
             put_resp = await _zoho_request(
                 client,
                 "PUT",
                 f"/contacts/{contact_id}",
-                json_body={"notes": merged[:500]},
+                json_body=payload,
             )
             return put_resp.is_success
     except httpx.HTTPError as exc:
-        logger.warning("Zoho update_zoho_contact_notes failed: %s", exc)
+        logger.warning("Zoho sync_existing_zoho_contact failed for %s: %s", contact_id, exc)
         return False
+
+
+async def update_zoho_contact_notes(contact_id: str, new_notes: str) -> bool:
+    """Merge new_notes into an existing Zoho Books Contact's notes field (best-effort)."""
+    return await sync_existing_zoho_contact(contact_id, notes_to_merge=new_notes)
 
 
 async def resolve_or_create_contact(
