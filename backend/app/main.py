@@ -5,7 +5,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.config import get_settings
-from app.routers import cron, dashboard, domains, telegram
+from app.routers import cron, domains, telegram
 
 settings = get_settings()
 
@@ -42,7 +42,6 @@ async def public_config() -> dict[str, str]:
 
 app.include_router(telegram.router)
 app.include_router(domains.router)
-app.include_router(dashboard.router)
 app.include_router(cron.router)
 
 # Serve built React PWA / Telegram Mini App (/production and /munim deep links supported)

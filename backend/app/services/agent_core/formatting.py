@@ -1,0 +1,184 @@
+"""Prompt summaries, Before->After confirmation cards, step compilation, and goal persistence."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from app.services import goal_intelligence
+from app.services.goal_primitives import CheckpointedStep, format_inr, get_expense_category_label
+
+
+def _default_missing_question(op: str, missing: list[str]) -> str:
+    labels = {
+        "full_name": "Full Name",
+        "area_landmark": "Site Area / Landmark (e.g. Civil Lines, Jaipur)",
+        "rough_scope": "Rough Scope (items/rooms)",
+        "payment_account_code": "Payment Account (Cash Galla / Axis / Float)",
+        "to_payment_account_code": "Destination Account / Float",
+        "amount_inr": "Amount (₹)",
+        "party_name": "Customer / Vendor Name",
+        "customer_id": "Which Customer",
+        "vendor_id": "Which Vendor",
+        "person_id": "Which Person / Mistri",
+        "project_id": "Which Customer Order",
+        "archive_entity_kind": "Record Type (Customer / Vendor / Person / Order)",
+        "item_name": "Furniture Item Name (e.g. Kitchen, Bed)",
+        "material_lines_json": "Raw Material Name & Quantity (e.g. 8 sheets 18mm Ply)",
+        "to_stage": "Target Stage",
+    }
+    nice = ", ".join(labels.get(m, m) for m in missing)
+    return f"Kripya yeh details batayein ({op.replace('_', ' ')}): *{nice}*"
+
+
+def _format_confirmation_summary(
+    op: str, slots: dict[str, Any], before_row: dict[str, Any] | None = None
+) -> str:
+    row = before_row or {}
+    if op == "new_lead":
+        q_str = f" · Est: {format_inr(slots['quoted_total'])}" if slots.get("quoted_total") else ""
+        return (
+            f"🆕 *Confirm New Lead*\n"
+            f"• Customer: *{slots.get('full_name')}* ({slots.get('area_landmark')})\n"
+            f"• Scope: _{slots.get('rough_scope')}_{q_str}"
+        )
+    if op == "add_customer":
+        cname = slots.get("full_name") or slots.get("party_name")
+        area = f" ({slots['area_landmark']})" if slots.get("area_landmark") else ""
+        ph = f"\n• Phone: `{slots['phone']}`" if slots.get("phone") else ""
+        return f"👤 *Confirm New Customer*\n• Name: *{cname}*{area}{ph}"
+    if op == "add_person_or_vendor":
+        name = slots.get("full_name") or slots.get("party_name")
+        kind = slots.get("person_or_vendor_kind") or "salaried_karigar"
+        ph = f"\n• Phone: `{slots['phone']}`" if slots.get("phone") else ""
+        gst = f"\n• GSTIN: `{slots['gstin']}`" if slots.get("gstin") else ""
+        spec = f"\n• Specialty: _{slots['specialty']}_" if slots.get("specialty") else ""
+        return f"🆕 *Confirm Directory Onboarding*\n• Name: *{name}* (`{kind}`){ph}{gst}{spec}"
+    if op == "archive_record":
+        kind = (slots.get("archive_entity_kind") or "record").title()
+        label = (
+            row.get("full_name")
+            or row.get("canonical_name")
+            or row.get("customer_name")
+            or slots.get("full_name")
+            or slots.get("party_name")
+            or kind
+        )
+        code = f" (`{row['project_code']}`)" if row.get("project_code") else ""
+        action_desc = "Mark Order *Lost / Closed*" if kind.lower() == "order" else "Soft-Archive (`is_active = false`, preserves history)"
+        return f"🗂️ *Confirm Archive {kind}*\n• Target: *{label}*{code}\n• Action: {action_desc}"
+    if op in ("update_customer", "update_vendor", "update_person", "update_order_details"):
+        label = (
+            row.get("full_name")
+            or row.get("canonical_name")
+            or row.get("customer_name")
+            or slots.get("summary_title")
+            or "Record"
+        )
+        diffs: list[str] = []
+        old_name = row.get("full_name") or row.get("canonical_name") or ""
+        if slots.get("new_name") and str(slots["new_name"]).strip().lower() != str(old_name).strip().lower():
+            diffs.append(f"• Name: _{old_name or '-'}_ → *{slots['new_name']}*")
+        if op == "update_order_details" and slots.get("quoted_total") is not None:
+            old_q = format_inr(float(row.get("quoted_total") or 0))
+            new_q = format_inr(float(slots["quoted_total"]))
+            diffs.append(f"• Deal Value: {old_q} → *{new_q}*")
+        if slots.get("gstin"):
+            diffs.append(f"• GSTIN: `{row.get('gstin') or '-'}` → *`{str(slots['gstin']).upper()}`*")
+        if slots.get("payout_aliases"):
+            old_pa = ", ".join(row.get("payout_aliases") or []) or "None"
+            diffs.append(f"• Bank Payout Proxy: _{old_pa}_ → + *{', '.join(slots['payout_aliases'])}*")
+        if slots.get("phone"):
+            diffs.append(f"• Phone: `{row.get('phone') or '-'}` → `{slots['phone']}`")
+        if slots.get("area_landmark"):
+            old_a = row.get("area_landmark") or row.get("site_area_landmark") or "-"
+            diffs.append(f"• Area: _{old_a}_ → *{slots['area_landmark']}*")
+        if slots.get("promised_delivery_date"):
+            diffs.append(f"• Delivery: `{row.get('promised_delivery_date') or '-'}` → *`{slots['promised_delivery_date']}`*")
+        if slots.get("rough_scope"):
+            diffs.append(f"• Scope: _{slots['rough_scope']}_")
+        diff_body = "\n".join(diffs) if diffs else f"• {slots.get('summary_title') or op}"
+        return f"✏️ *Confirm Update — {label}*\n{diff_body}"
+    if op in ("customer_receipt", "vendor_payment", "expense", "float_transfer"):
+        amt = format_inr(float(slots.get("amount_inr") or 0))
+        acc = (slots.get("payment_account_code") or "").upper()
+        badge = "🟢 PAISA AAYA (IN)" if op == "customer_receipt" else ("🔄 TRANSFER" if op == "float_transfer" else "🔴 PAISA GAYA (OUT)")
+        party = slots.get("party_name") or slots.get("to_payment_account_code") or op
+        cat_line = (
+            f"\n• Category: *{get_expense_category_label(slots.get('expense_category'))}*"
+            if op == "expense"
+            else ""
+        )
+        return f"{badge}: *{amt}*\n• Party/To: *{party}*{cat_line}\n• Account: `{acc}`\n• Note: _{slots.get('notes') or slots.get('summary_title') or '-'}_"
+    if op == "supplier_draft_bill":
+        amt = format_inr(float(slots.get("amount_inr") or 0))
+        return (
+            f"🧾 *Confirm Zoho Draft Bill*\n"
+            f"• Vendor: *{slots.get('party_name')}*\n"
+            f"• Invoice: `{slots.get('invoice_no') or 'Auto'}` · Total: *{amt}*\n"
+            f"_(Strictly saved as Draft in Zoho Books for Clerk review)_"
+        )
+    return f"📝 *Confirm*: {slots.get('summary_title') or op}"
+
+
+def _build_steps_for_slots(op: str, slots: dict[str, Any]) -> list[dict[str, Any]]:
+    step = CheckpointedStep(
+        step_index=0,
+        target="zoho" if op in ("customer_receipt", "vendor_payment", "expense", "float_transfer", "supplier_draft_bill") else "supabase",
+        operation=op,
+        payload=slots,
+    )
+    return [step.model_dump()]
+
+
+def _upsert_goal_row(
+    sb: Any,
+    *,
+    goal_id: str | None,
+    owner_person_id: str | None,
+    source_channel: str,
+    domain_scope: str,
+    telegram_chat_id: int | None,
+    ui_context: dict[str, Any],
+    goal_type: str,
+    status: str,
+    thinking_level: str,
+    heard_transcript: str | None,
+    summary_title: str,
+    collected_slots: dict[str, Any],
+    missing_slots: list[str],
+    pending_prompt: str | None,
+    steps: list[dict[str, Any]],
+    repair_options: list[dict[str, Any]],
+    project_id: str | None,
+    customer_id: str | None,
+    user_message: str | None = None,
+) -> dict[str, Any]:
+    safe_owner = goal_intelligence._safe_uuid_for_db(sb, owner_person_id)
+    safe_proj = goal_intelligence._safe_uuid_for_db(sb, project_id, project_lookup=True)
+    safe_cust = goal_intelligence._safe_uuid_for_db(sb, customer_id)
+    payload: dict[str, Any] = {
+        "owner_person_id": safe_owner,
+        "source_channel": source_channel,
+        "domain_scope": domain_scope,
+        "telegram_chat_id": telegram_chat_id,
+        "ui_context": ui_context,
+        "goal_type": goal_type,
+        "status": status,
+        "thinking_level_used": thinking_level,
+        "heard_transcript": heard_transcript,
+        "summary_title": summary_title[:180],
+        "collected_slots": collected_slots,
+        "missing_slots": missing_slots,
+        "pending_prompt": pending_prompt,
+        "steps": steps,
+        "repair_options": repair_options,
+        "project_id": safe_proj,
+        "customer_id": safe_cust,
+    }
+    if user_message and user_message.strip():
+        payload["turn_digest"] = [{"user": user_message.strip()[:400]}]
+    if goal_id:
+        res = sb.table("agent_goals").update(payload).eq("id", goal_id).execute().data
+        return res[0]
+    res = sb.table("agent_goals").insert(payload).execute().data
+    return res[0]
