@@ -1082,3 +1082,38 @@ async def test_parked_hardening_schemas_callback_dedup_and_prompt_guard():
     finally:
         app.dependency_overrides.clear()
 
+
+def test_agent_envelope_sanitizes_literal_null_strings():
+    raw = json.dumps(
+        {
+            "heard_transcript": "null",
+            "intent_category": "goal_actions",
+            "direct_reply_text": "null",
+            "referenced_project_id": "null",
+            "referenced_customer_id": "None",
+            "goal_items": [
+                {
+                    "target_open_goal_id": "null",
+                    "operation_kind": "customer_receipt",
+                    "summary_title": "Praveen Mehta ₹20,000 Cash Advance",
+                    "project_id": "7923bc50-77dc-4779-9a73-61cf722c318e",
+                    "customer_id": "null",
+                    "estimator_ids": ["null", ""],
+                    "amount_inr": 20000,
+                    "payment_account_code": "cash_galla",
+                    "party_name": "Praveen Mehta",
+                }
+            ],
+        }
+    )
+    env = AgentTurnEnvelope.model_validate_json(raw)
+    assert env.heard_transcript is None
+    assert env.direct_reply_text is None
+    assert env.referenced_project_id is None
+    assert env.referenced_customer_id is None
+    item = env.goal_items[0]
+    assert item.target_open_goal_id is None
+    assert item.customer_id is None
+    assert item.estimator_ids == []
+    assert item.project_id == "7923bc50-77dc-4779-9a73-61cf722c318e"
+

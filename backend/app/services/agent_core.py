@@ -25,7 +25,7 @@ from typing import Any, Literal
 import uuid
 
 from google import genai
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from app.config import get_settings
 from app.services import agent_tools, decisions_triage, goal_intelligence, step_executors, storage, zoho
@@ -49,6 +49,28 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Structured Schemas Returned by Gemini 4 Hydrogen (JSON Schema Inline-Safe)
 # ---------------------------------------------------------------------------
+_NULL_STRINGS = {"", "null", "none", "nil", "n/a", "na", "undefined"}
+
+
+def _sanitize_gemini_nulls(raw: Any) -> Any:
+    """Convert literal 'null'/'none'/'undefined'/empty strings from LLM JSON into Python None."""
+    if not isinstance(raw, dict):
+        return raw
+    cleaned: dict[str, Any] = {}
+    for k, v in raw.items():
+        if isinstance(v, str) and v.strip().lower() in _NULL_STRINGS:
+            cleaned[k] = None
+        elif isinstance(v, list):
+            cleaned[k] = [
+                item
+                for item in v
+                if not (isinstance(item, str) and item.strip().lower() in _NULL_STRINGS)
+            ]
+        else:
+            cleaned[k] = v
+    return cleaned
+
+
 class DisambiguationChoice(BaseModel):
     choice_id: str
     label: str = Field(description="Short button label (<42 chars), e.g. 'Active: Vikas Sharma (Civil Lines)'")
@@ -152,6 +174,11 @@ class GoalIntentItem(BaseModel):
     )
     notes: str | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _clean_null_strings(cls, data: Any) -> Any:
+        return _sanitize_gemini_nulls(data)
+
 
 class AgentTurnEnvelope(BaseModel):
     heard_transcript: str | None = Field(
@@ -176,6 +203,11 @@ class AgentTurnEnvelope(BaseModel):
         description="If answering a question about a specific customer, populate their customer_id UUID.",
     )
     goal_items: list[GoalIntentItem] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _clean_null_strings(cls, data: Any) -> Any:
+        return _sanitize_gemini_nulls(data)
 
 
 class ErrorRepairProposal(BaseModel):
