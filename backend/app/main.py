@@ -30,6 +30,16 @@ async def health() -> dict[str, str]:
     return {"status": "ok", "env": settings.app_env}
 
 
+@app.get("/api/public-config")
+async def public_config() -> dict[str, str]:
+    """Return only public Supabase client config so browser OAuth works even if build args are omitted."""
+    s = get_settings()
+    return {
+        "supabase_url": s.supabase_url,
+        "supabase_publishable_key": s.supabase_publishable_key,
+    }
+
+
 app.include_router(telegram.router)
 app.include_router(domains.router)
 app.include_router(dashboard.router)

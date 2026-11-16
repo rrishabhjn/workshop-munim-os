@@ -6,7 +6,12 @@ import {
   LogOut,
   Users,
 } from "lucide-react";
-import { apiFetch, getTelegramInitData, supabase } from "./lib/api";
+import {
+  apiFetch,
+  getSupabaseClient,
+  getTelegramInitData,
+  initSupabaseClient,
+} from "./lib/api";
 import WhosDoingWhat from "./components/WhosDoingWhat";
 import AllOrdersBoard from "./components/AllOrdersBoard";
 import RosterDrawer from "./components/RosterDrawer";
@@ -22,6 +27,7 @@ function detectInitialDomain() {
 
 export default function App() {
   const [authChecked, setAuthChecked] = useState(false);
+  const [sbClient, setSbClient] = useState(() => getSupabaseClient());
   const [domain, setDomain] = useState(detectInitialDomain);
   const [prodTab, setProdTab] = useState("whos_doing_what");
   const [prodData, setProdData] = useState(null);
@@ -77,25 +83,38 @@ export default function App() {
       return;
     }
 
-    if (supabase) {
-      supabase.auth.getSession().then(({ data }) => {
+    let authSub = null;
+    let cancelled = false;
+
+    initSupabaseClient().then((sb) => {
+      if (cancelled) return;
+      setSbClient(sb);
+      if (!sb) {
+        setAuthChecked(true);
+        return;
+      }
+      sb.auth.getSession().then(({ data }) => {
+        if (cancelled) return;
         if (data?.session) {
           loadAllData();
         } else {
           setAuthChecked(true);
         }
       });
-      const { data: sub } = supabase.auth.onAuthStateChange((_ev, session) => {
+      const { data: sub } = sb.auth.onAuthStateChange((_ev, session) => {
         if (session) loadAllData();
         else {
           setProdData(null);
           setAuthChecked(true);
         }
       });
-      return () => sub.subscription.unsubscribe();
-    } else {
-      setAuthChecked(true);
-    }
+      authSub = sub?.subscription || null;
+    });
+
+    return () => {
+      cancelled = true;
+      if (authSub) authSub.unsubscribe();
+    };
   }, []);
 
   function switchDomain(nextDomain) {
@@ -107,15 +126,15 @@ export default function App() {
   }
 
   async function handleGoogleLogin() {
-    if (!supabase) return;
-    await supabase.auth.signInWithOAuth({
+    if (!sbClient) return;
+    await sbClient.auth.signInWithOAuth({
       provider: "google",
       options: { redirectTo: `${window.location.origin}${window.location.pathname}` },
     });
   }
 
   async function handleLogout() {
-    if (supabase) await supabase.auth.signOut();
+    if (sbClient) await sbClient.auth.signOut();
     setProdData(null);
   }
 
@@ -185,7 +204,7 @@ export default function App() {
               {error}
             </div>
           )}
-          {supabase ? (
+          {sbClient ? (
             <button
               onClick={handleGoogleLogin}
               className="w-full min-h-[48px] rounded-xl bg-amber-900 text-white font-semibold shadow-sm"

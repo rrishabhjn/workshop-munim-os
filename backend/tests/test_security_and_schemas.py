@@ -286,3 +286,27 @@ async def test_resolve_or_create_contact_ambiguous_and_create():
     assert created["status"] == "created"
     assert created["contact_id"] == "c99"
     mock_alias.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_public_config_exposes_only_publishable_supabase_fields():
+    from app.config import Settings
+    from app.main import app
+
+    fake_settings = Settings(
+        supabase_url="https://example.supabase.co",
+        supabase_publishable_key="sb_publishable_test_key",
+        supabase_secret_key="sb_secret_DO_NOT_LEAK",
+    )
+    with patch("app.main.get_settings", return_value=fake_settings):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            resp = await client.get("/api/public-config")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert set(body.keys()) == {"supabase_url", "supabase_publishable_key"}
+    assert body["supabase_url"] == "https://example.supabase.co"
+    assert body["supabase_publishable_key"] == "sb_publishable_test_key"
+    assert "sb_secret_DO_NOT_LEAK" not in resp.text

@@ -4,10 +4,35 @@ const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL || "";
 const SUPABASE_PUBLISHABLE_KEY =
   import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY || "";
 
-export const supabase =
+export let supabase =
   SUPABASE_URL && SUPABASE_PUBLISHABLE_KEY
     ? createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY)
     : null;
+
+let initPromise = null;
+
+export function getSupabaseClient() {
+  return supabase;
+}
+
+export async function initSupabaseClient() {
+  if (supabase) return supabase;
+  if (!initPromise) {
+    initPromise = fetch("/api/public-config")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((cfg) => {
+        if (cfg?.supabase_url && cfg?.supabase_publishable_key) {
+          supabase = createClient(
+            cfg.supabase_url,
+            cfg.supabase_publishable_key
+          );
+        }
+        return supabase;
+      })
+      .catch(() => null);
+  }
+  return initPromise;
+}
 
 export function getTelegramInitData() {
   return window.Telegram?.WebApp?.initData || "";
@@ -18,8 +43,9 @@ async function getAuthHeaders() {
   if (tgInit) {
     return { "X-Telegram-Init-Data": tgInit };
   }
-  if (supabase) {
-    const { data } = await supabase.auth.getSession();
+  const sb = supabase || (await initSupabaseClient());
+  if (sb) {
+    const { data } = await sb.auth.getSession();
     const token = data?.session?.access_token;
     if (token) {
       return { Authorization: `Bearer ${token}` };
