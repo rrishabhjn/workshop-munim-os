@@ -310,3 +310,91 @@ async def test_public_config_exposes_only_publishable_supabase_fields():
     assert body["supabase_url"] == "https://example.supabase.co"
     assert body["supabase_publishable_key"] == "sb_publishable_test_key"
     assert "sb_secret_DO_NOT_LEAK" not in resp.text
+
+
+def test_frontend_jsx_components_never_call_hooks_after_early_return():
+    """Prevent React error #310 (calling hooks conditionally or after an early return)."""
+    from pathlib import Path
+    import re
+
+    src_dir = Path(__file__).resolve().parents[2] / "frontend" / "src"
+    hook_re = re.compile(r"\b(useState|useEffect|useMemo|useCallback|useRef|useContext|useReducer)\s*\(")
+    comp_start_re = re.compile(r"export\s+default\s+function\s+([A-Z]\w*)\s*\(")
+
+    violations: list[str] = []
+    for jsx_path in sorted(src_dir.rglob("*.jsx")):
+        lines = jsx_path.read_text(encoding="utf-8").splitlines()
+        in_component = False
+        comp_name = ""
+        comp_depth = 0
+        seen_early_return = False
+        in_block_comment = False
+
+        for lineno, line in enumerate(lines, start=1):
+            stripped = line.strip()
+            if not in_component:
+                m = comp_start_re.search(line)
+                if not m:
+                    continue
+                in_component = True
+                comp_name = m.group(1)
+                comp_depth = 0
+                seen_early_return = False
+
+            depth_at_line_start = comp_depth
+            if in_component and depth_at_line_start == 1:
+                if re.match(r"^if\s*\(.*\)\s*return\b", stripped) or re.match(r"^if\s*\(", stripped):
+                    # Detect single-line or block early returns at component top level
+                    if "return" in stripped:
+                        seen_early_return = True
+                if re.match(r"^return\b", stripped) and stripped in ("return null;", "return;", "return ("):
+                    # Unconditional return reached -> anything below won't contain top-level hooks
+                    seen_early_return = True
+
+                m_hook = hook_re.search(line)
+                if m_hook and not stripped.startswith("//") and seen_early_return:
+                    violations.append(
+                        f"{jsx_path.relative_to(src_dir)}:{lineno} ({comp_name}) calls {m_hook.group(1)} after early return"
+                    )
+
+            # Update brace depth cleanly ignoring strings & comments
+            i = 0
+            in_str: str | None = None
+            while i < len(line):
+                ch = line[i]
+                nxt = line[i + 1] if i + 1 < len(line) else ""
+                if in_block_comment:
+                    if ch == "*" and nxt == "/":
+                        in_block_comment = False
+                        i += 2
+                        continue
+                    i += 1
+                    continue
+                if in_str:
+                    if ch == "\\":
+                        i += 2
+                        continue
+                    if ch == in_str:
+                        in_str = None
+                    i += 1
+                    continue
+                if ch == "/" and nxt == "/":
+                    break
+                if ch == "/" and nxt == "*":
+                    in_block_comment = True
+                    i += 2
+                    continue
+                if ch in ('"', "'", "`"):
+                    in_str = ch
+                    i += 1
+                    continue
+                if ch == "{":
+                    comp_depth += 1
+                elif ch == "}":
+                    comp_depth -= 1
+                    if in_component and comp_depth <= 0 and depth_at_line_start > 0:
+                        in_component = False
+                        break
+                i += 1
+
+    assert violations == [], "React Rules of Hooks violation(s):\n" + "\n".join(violations)

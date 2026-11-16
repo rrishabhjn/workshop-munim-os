@@ -461,14 +461,16 @@ export default function AllOrdersBoard({
       )}
 
       {/* Slide-Over Order Workspace Drawer */}
-      <OrderDetailDrawer
-        order={selectedOrder}
-        lookups={lookups}
-        people={people}
-        onClose={() => onSelectOrder(null)}
-        onMutated={onMutated}
-        onShowUndoToast={onShowUndoToast}
-      />
+      {selectedOrder && (
+        <OrderDetailDrawer
+          order={selectedOrder}
+          lookups={lookups}
+          people={people}
+          onClose={() => onSelectOrder(null)}
+          onMutated={onMutated}
+          onShowUndoToast={onShowUndoToast}
+        />
+      )}
     </div>
   );
 }

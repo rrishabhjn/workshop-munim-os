@@ -119,10 +119,8 @@ export default function OrderDetailDrawer({
     [materialCategories]
   );
 
-  if (!order) return null;
-
-  const items = order.items || [];
-  const allMaterials = order.item_materials || [];
+  const items = order?.items || [];
+  const allMaterials = order?.item_materials || [];
   const itemNameById = Object.fromEntries(items.map((it) => [it.id, it.item_name]));
   const toOrderTotal = allMaterials.filter((m) => m.status === "needed").length;
 
@@ -173,6 +171,8 @@ export default function OrderDetailDrawer({
     }
     return groups;
   }, [allMaterials, matFilter, materialCategories, order?.id]);
+
+  if (!order) return null;
 
   async function handlePipelineChange(toStage, extra = {}) {
     setBusyKey("order");
