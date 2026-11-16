@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   Archive,
   Building2,
@@ -42,6 +42,54 @@ export default function MunimPortal({ munimData, onRefresh }) {
 
   const [archiveQuery, setArchiveQuery] = useState("");
   const [archiveRows, setArchiveRows] = useState([]);
+
+  const [ledgerRows, setLedgerRows] = useState([]);
+  const [ledgerLoading, setLedgerLoading] = useState(false);
+  const [ledgerError, setLedgerError] = useState("");
+  const [ledgerSearch, setLedgerSearch] = useState("");
+  const [ledgerAppliedSearch, setLedgerAppliedSearch] = useState("");
+  const [ledgerAccount, setLedgerAccount] = useState("");
+  const [ledgerType, setLedgerType] = useState("");
+
+  async function loadLedger({
+    account = ledgerAccount,
+    q = ledgerAppliedSearch,
+    entryType = ledgerType,
+  } = {}) {
+    setLedgerLoading(true);
+    setLedgerError("");
+    try {
+      const qs = new URLSearchParams({ limit: "80" });
+      if (account) qs.set("account", account);
+      if (q && q.trim()) qs.set("q", q.trim());
+      if (entryType) qs.set("entry_type", entryType);
+      const res = await apiFetch(`/api/munim/ledger?${qs.toString()}`);
+      setLedgerRows(res?.transactions || []);
+    } catch (err) {
+      setLedgerError(err?.message || "Failed to load ledger");
+    } finally {
+      setLedgerLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (subTab === "ledger") {
+      loadLedger({
+        account: ledgerAccount,
+        q: ledgerAppliedSearch,
+        entryType: ledgerType,
+      });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [subTab, ledgerAccount, ledgerType, ledgerAppliedSearch]);
+
+  function openLedgerForAccount(accDisplayName) {
+    setLedgerAccount(accDisplayName || "");
+    setLedgerType("");
+    setLedgerSearch("");
+    setLedgerAppliedSearch("");
+    setSubTab("ledger");
+  }
 
   const accounts = munimData?.payment_accounts || [];
   const pnlRows = munimData?.project_pnl || [];
@@ -256,10 +304,10 @@ export default function MunimPortal({ munimData, onRefresh }) {
     <div className="space-y-5 pb-28">
       {/* Sub-navigation */}
       <div className="flex items-center justify-between gap-2 flex-wrap">
-        <div className="flex items-center gap-1.5">
+        <div className="flex items-center gap-1.5 flex-wrap">
           <button
             onClick={() => setSubTab("pulse")}
-            className={`min-h-[42px] px-4 rounded-full text-xs font-bold ${
+            className={`min-h-[44px] px-4 rounded-full text-xs font-bold ${
               subTab === "pulse"
                 ? "bg-amber-900 text-white"
                 : "bg-white border border-stone-200 text-stone-700"
@@ -268,8 +316,18 @@ export default function MunimPortal({ munimData, onRefresh }) {
             Owner Pulse (Zoho Mirror)
           </button>
           <button
+            onClick={() => setSubTab("ledger")}
+            className={`min-h-[44px] px-4 rounded-full text-xs font-bold ${
+              subTab === "ledger"
+                ? "bg-amber-900 text-white"
+                : "bg-white border border-stone-200 text-stone-700"
+            }`}
+          >
+            Ledger / Passbook
+          </button>
+          <button
             onClick={() => setSubTab("directory")}
-            className={`min-h-[42px] px-4 rounded-full text-xs font-bold ${
+            className={`min-h-[44px] px-4 rounded-full text-xs font-bold ${
               subTab === "directory"
                 ? "bg-amber-900 text-white"
                 : "bg-white border border-stone-200 text-stone-700"
@@ -299,14 +357,20 @@ export default function MunimPortal({ munimData, onRefresh }) {
                 <span>Shop Cash Galla</span>
               </div>
               {cashGalla.map((c) => (
-                <div key={c.id} className="flex items-baseline justify-between">
-                  <span className="text-sm font-semibold text-stone-700">
+                <button
+                  key={c.id}
+                  type="button"
+                  onClick={() => openLedgerForAccount(c.display_name)}
+                  className="w-full min-h-[44px] text-left flex items-baseline justify-between rounded-xl px-2 py-1 hover:bg-amber-50/70 transition cursor-pointer"
+                  title={`View ${c.display_name} passbook`}
+                >
+                  <span className="text-sm font-semibold text-stone-700 underline decoration-amber-200 underline-offset-4">
                     {c.display_name}
                   </span>
                   <span className="text-2xl font-extrabold text-stone-900">
                     {formatINR(c.cached_balance_inr)}
                   </span>
-                </div>
+                </button>
               ))}
             </div>
 
@@ -316,9 +380,11 @@ export default function MunimPortal({ munimData, onRefresh }) {
               </div>
               <div className="grid grid-cols-2 gap-2">
                 {floats.map((f) => (
-                  <div
+                  <button
                     key={f.id}
-                    className="p-2.5 rounded-xl bg-stone-50 border border-stone-200"
+                    type="button"
+                    onClick={() => openLedgerForAccount(f.display_name)}
+                    className="w-full min-h-[48px] text-left p-2.5 rounded-xl bg-stone-50 border border-stone-200 hover:border-amber-300 hover:bg-amber-50/60 transition cursor-pointer"
                   >
                     <div className="text-xs text-stone-600 truncate">
                       {f.display_name}
@@ -326,7 +392,7 @@ export default function MunimPortal({ munimData, onRefresh }) {
                     <div className="text-sm font-bold text-stone-900">
                       {formatINR(f.cached_balance_inr)}
                     </div>
-                  </div>
+                  </button>
                 ))}
               </div>
             </div>
@@ -336,13 +402,15 @@ export default function MunimPortal({ munimData, onRefresh }) {
           <div className="bg-white rounded-2xl border border-stone-200 p-4 space-y-3 shadow-sm">
             <div className="flex items-center gap-2 text-xs font-bold uppercase text-stone-600">
               <Building2 className="w-4 h-4" />
-              <span>Bank, OD &amp; UPI Accounts (Zoho Standard Management Book)</span>
+              <span>Bank, OD &amp; UPI Accounts (Tap any account for Passbook)</span>
             </div>
             <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2.5">
               {banks.map((b) => (
-                <div
+                <button
                   key={b.id}
-                  className="p-3 rounded-xl bg-stone-50 border border-stone-200"
+                  type="button"
+                  onClick={() => openLedgerForAccount(b.display_name)}
+                  className="w-full min-h-[52px] text-left p-3 rounded-xl bg-stone-50 border border-stone-200 hover:border-amber-300 hover:bg-amber-50/60 transition cursor-pointer"
                 >
                   <div className="text-xs font-medium text-stone-600 truncate">
                     {b.display_name}
@@ -350,7 +418,7 @@ export default function MunimPortal({ munimData, onRefresh }) {
                   <div className="text-sm font-bold text-stone-900 mt-0.5">
                     {formatINR(b.cached_balance_inr)}
                   </div>
-                </div>
+                </button>
               ))}
             </div>
           </div>
@@ -393,6 +461,196 @@ export default function MunimPortal({ munimData, onRefresh }) {
                   </div>
                 ))}
               </div>
+            )}
+          </div>
+        </div>
+      ) : subTab === "ledger" ? (
+        <div className="space-y-4">
+          {/* Ledger Filter Bar */}
+          <div className="bg-white rounded-2xl border border-stone-200 p-4 space-y-3 shadow-sm">
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                setLedgerAppliedSearch(ledgerSearch.trim());
+              }}
+              className="flex flex-col sm:flex-row gap-2"
+            >
+              <div className="relative flex-1">
+                <Search className="w-4 h-4 text-stone-400 absolute left-3.5 top-3.5" />
+                <input
+                  value={ledgerSearch}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    setLedgerSearch(v);
+                    if (!v.trim()) setLedgerAppliedSearch("");
+                  }}
+                  placeholder="Search Party / Worker / Note / Ref #..."
+                  className="w-full min-h-[44px] pl-10 pr-3 rounded-xl border border-stone-300 text-sm"
+                />
+              </div>
+              <select
+                value={ledgerAccount}
+                onChange={(e) => setLedgerAccount(e.target.value)}
+                className="min-h-[44px] px-3 rounded-xl border border-stone-300 text-sm bg-white"
+              >
+                <option value="">All Accounts</option>
+                {accounts.map((a) => (
+                  <option key={a.id} value={a.display_name}>
+                    {a.display_name}
+                  </option>
+                ))}
+              </select>
+              <button
+                type="submit"
+                className="min-h-[44px] px-4 rounded-xl bg-stone-900 text-white text-xs font-bold"
+              >
+                Filter
+              </button>
+              <button
+                type="button"
+                disabled={ledgerLoading}
+                onClick={() => loadLedger()}
+                className="min-h-[44px] px-3.5 rounded-xl border border-stone-300 bg-white text-xs font-semibold text-stone-700 flex items-center justify-center gap-1.5"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${ledgerLoading ? "animate-spin" : ""}`} />
+                <span>Refresh</span>
+              </button>
+            </form>
+
+            {/* Entry Type Filter Pills */}
+            <div className="flex items-center gap-1.5 flex-wrap">
+              {[
+                ["", "All"],
+                ["customer_receipt", "Money In"],
+                ["expense", "Expenses & Salary"],
+                ["vendor_payment", "Vendor Payments"],
+                ["float_transfer", "Transfers"],
+                ["bill", "Bills"],
+              ].map(([val, label]) => (
+                <button
+                  key={label}
+                  type="button"
+                  onClick={() => setLedgerType(val)}
+                  className={`min-h-[44px] px-3.5 rounded-full text-xs font-semibold ${
+                    ledgerType === val
+                      ? "bg-amber-900 text-white"
+                      : "bg-stone-100 text-stone-700 hover:bg-stone-200"
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Summary Strip */}
+          {(() => {
+            const totalIn = ledgerRows
+              .filter((r) => r.direction === "in")
+              .reduce((sum, r) => sum + Number(r.amount_inr || 0), 0);
+            const totalOut = ledgerRows
+              .filter((r) => r.direction === "out")
+              .reduce((sum, r) => sum + Number(r.amount_inr || 0), 0);
+            return (
+              <div className="flex items-center justify-between gap-2 flex-wrap px-4 py-3 rounded-2xl bg-amber-50/70 border border-amber-200 text-xs">
+                <span className="font-semibold text-stone-700">
+                  Showing <b>{ledgerRows.length}</b> entries
+                  {ledgerAccount ? ` • ${ledgerAccount}` : ""}
+                </span>
+                <div className="flex items-center gap-4">
+                  <span className="font-bold text-emerald-800">
+                    Total In: {formatINR(totalIn)}
+                  </span>
+                  <span className="font-bold text-rose-800">
+                    Total Out: {formatINR(totalOut)}
+                  </span>
+                </div>
+              </div>
+            );
+          })()}
+
+          {ledgerError && (
+            <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-xs text-rose-800">
+              {ledgerError}
+            </div>
+          )}
+
+          {/* Transaction List */}
+          <div className="bg-white rounded-2xl border border-stone-200 p-4 space-y-2 shadow-sm">
+            {ledgerLoading && ledgerRows.length === 0 ? (
+              <p className="text-xs text-stone-500 py-4 text-center">
+                Loading Zoho passbook entries...
+              </p>
+            ) : ledgerRows.length === 0 ? (
+              <p className="text-xs text-stone-500 py-4 text-center">
+                No ledger entries match the current filters.
+              </p>
+            ) : (
+              ledgerRows.map((tx) => {
+                const badgeMap = {
+                  in: "🟢 IN",
+                  out: "🔴 OUT",
+                  transfer: "🔄 Transfer",
+                  bill: "🧾 Bill",
+                };
+                const amtColorMap = {
+                  in: "text-emerald-700",
+                  out: "text-rose-700",
+                  transfer: "text-sky-700",
+                  bill: "text-amber-900",
+                };
+                return (
+                  <div
+                    key={`${tx.entry_type}-${tx.id}-${tx.reference_number}`}
+                    className="p-3 rounded-xl bg-stone-50 border border-stone-200 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs"
+                  >
+                    <div className="space-y-1 min-w-0">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="font-semibold text-stone-500">
+                          {formatDate(tx.date)}
+                        </span>
+                        <span className="px-2 py-0.5 rounded-full bg-white border border-stone-200 font-bold text-[11px]">
+                          {badgeMap[tx.direction] || tx.entry_type}
+                        </span>
+                        <span className="text-stone-600 font-medium">
+                          {tx.category_or_offset}
+                        </span>
+                        {tx.entry_type === "expense" && tx.customer_name && (
+                          <span className="px-2 py-0.5 rounded-full bg-amber-100 text-amber-900 font-semibold text-[11px]">
+                            Customer: {tx.customer_name}
+                          </span>
+                        )}
+                      </div>
+                      <div className="text-sm font-bold text-stone-900 truncate">
+                        {tx.party_name || tx.category_or_offset || "Workshop Entry"}
+                      </div>
+                      {tx.description && (
+                        <div className="text-stone-600 break-words">
+                          {tx.description}
+                        </div>
+                      )}
+                      <div className="flex items-center gap-3 text-[11px] text-stone-500 flex-wrap">
+                        {tx.account_name && (
+                          <span>
+                            Account: <b>{tx.account_name}</b>
+                          </span>
+                        )}
+                        {tx.reference_number && (
+                          <span className="font-mono">{tx.reference_number}</span>
+                        )}
+                      </div>
+                    </div>
+                    <div
+                      className={`text-base font-extrabold shrink-0 sm:text-right ${
+                        amtColorMap[tx.direction] || "text-stone-900"
+                      }`}
+                    >
+                      {tx.direction === "in" ? "+" : tx.direction === "out" ? "-" : ""}
+                      {formatINR(tx.amount_inr)}
+                    </div>
+                  </div>
+                );
+              })
             )}
           </div>
         </div>

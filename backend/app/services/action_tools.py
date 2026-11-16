@@ -248,21 +248,28 @@ def is_action_tool(name: str) -> bool:
     return name in _ACTION_TOOL_NAMES
 
 
-def goal_item_dedup_key(it: Any) -> str:
+def goal_item_dedup_key(it: Any, slots: dict[str, Any] | None = None) -> str:
     """Stable deduplication key matching staged action-tool items with envelope items."""
+    def _v(attr: str) -> Any:
+        if slots and slots.get(attr) not in (None, "", []):
+            return slots[attr]
+        return getattr(it, attr, None)
+
     if getattr(it, "target_open_goal_id", None):
         return f"open:{it.target_open_goal_id}"
-    op = str(getattr(it, "operation_kind", "") or "")
-    if getattr(it, "item_name", None):
-        return f"{op}:{getattr(it, 'project_id', None) or ''}:{str(it.item_name).strip().lower()}"
-    if op == "new_lead" and (getattr(it, "full_name", None) or getattr(it, "party_name", None)):
-        who = str(getattr(it, "full_name", None) or getattr(it, "party_name", None) or "").strip().lower()
+    op = str(_v("operation_kind") or "")
+    if _v("item_name"):
+        return f"{op}:{_v('project_id') or ''}:{str(_v('item_name')).strip().lower()}"
+    if op == "new_lead" and (_v("full_name") or _v("party_name")):
+        who = str(_v("full_name") or _v("party_name") or "").strip().lower()
         return f"new_lead:{who}"
-    if op in ("pipeline_stage_move", "material_stage_move", "update_order_details") and getattr(it, "project_id", None):
-        return f"{op}:{it.project_id}:{getattr(it, 'to_stage', None) or ''}"
+    if op in ("pipeline_stage_move", "material_stage_move", "update_order_details") and _v("project_id"):
+        return f"{op}:{_v('project_id')}:{_v('to_stage') or ''}"
     if op in ("customer_receipt", "vendor_payment", "expense", "float_transfer", "supplier_draft_bill"):
-        who = str(getattr(it, "party_name", None) or "").strip().lower()
-        return f"{op}:{who}:{getattr(it, 'amount_inr', None) or ''}:{getattr(it, 'invoice_no', None) or ''}"
+        who = str(_v("party_name") or "").strip().lower()
+        amt = _v("amount_inr")
+        amt_s = f"{float(amt):g}" if amt not in (None, "") else ""
+        return f"{op}:{who}:{amt_s}:{_v('invoice_no') or ''}"
     return f"{op}:{str(getattr(it, 'summary_title', '') or '').strip().lower()}"
 
 
@@ -528,7 +535,7 @@ async def execute_action_tool(
     allow_clarify = bool(arguments.get("allow_missing_clarification"))
     missing_report: list[dict[str, Any]] = []
     for idx, cand in enumerate(candidates):
-        missing, _ = preflight_goal_item_missing_slots(
+        missing, resolved_slots = preflight_goal_item_missing_slots(
             sb,
             cand,
             acc_code_to_id=acc_code_to_id,
@@ -538,6 +545,8 @@ async def execute_action_tool(
             reply_to_bot_msg_id=reply_to_bot_msg_id,
             telegram_chat_id=telegram_chat_id,
         )
+        if not getattr(cand, "party_name", None) and resolved_slots.get("party_name"):
+            cand.party_name = str(resolved_slots["party_name"])
         if missing and not cand.is_ambiguous:
             missing_report.append(
                 {

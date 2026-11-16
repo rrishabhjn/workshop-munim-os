@@ -33,6 +33,7 @@ def test_fastapi_route_inventory_and_wave0_removal():
         "/api/production/undo",
         "/api/production/orders/{project_id}/timeline",
         "/api/munim/overview",
+        "/api/munim/ledger",
         "/api/munim/sync-zoho",
         "/api/munim/people",
         "/api/munim/people/{person_id}",

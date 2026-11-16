@@ -517,22 +517,22 @@ async def _run_single_step(
                 line_items = []
         if not line_items:
             line_items = [{"description": slots.get("notes") or "Workshop Material", "quantity": 1, "rate": amt, "amount": amt}]
-        c_res = await zoho.resolve_or_create_contact(sb, vendor_name, "vendor")
-        if c_res.get("status") == "error" and goal_intelligence.is_transient_zoho_error_message(
-            str(c_res.get("error") or "")
+        payee = await zoho.resolve_payee_zoho_vendor(sb, vendor_name, allow_adhoc_create=True)
+        if payee.get("error") and not payee.get("contact_id") and goal_intelligence.is_transient_zoho_error_message(
+            str(payee.get("error") or "")
         ):
             return {
                 "ok": False,
                 "error_kind": "transient_5xx",
-                "error": {"message": c_res.get("error")},
+                "error": {"message": payee.get("error")},
             }
         draft_res = await zoho.create_draft_bill(
-            supplier_name=c_res.get("contact_name") or vendor_name,
+            supplier_name=payee.get("canonical_name") or vendor_name,
             invoice_no=inv_no,
             bill_date=slots.get("txn_date"),
             line_items=line_items,
             notes=str(slots.get("notes") or ""),
-            vendor_id=c_res.get("contact_id"),
+            vendor_id=payee.get("contact_id"),
             reference_number=make_zoho_reference_number(goal_id, step_index),
             project_id=slots.get("project_id"),
             sb=sb,

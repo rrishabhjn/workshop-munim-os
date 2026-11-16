@@ -10,6 +10,43 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+NON_PAYEE_WORDS: frozenset[str] = frozenset(
+    {
+        "expense",
+        "other_expense",
+        "vendor_payment",
+        "customer_receipt",
+        "float_transfer",
+        "cash",
+        "cash galla",
+        "nakad",
+        "chai",
+        "tea",
+        "nasta",
+        "chai nasta",
+        "petrol",
+        "diesel",
+        "auto",
+        "tempo",
+        "tempo bhada",
+        "bhada",
+        "freight",
+        "rent",
+        "kiraya",
+        "bijli",
+        "electricity",
+        "water",
+        "internet",
+        "misc",
+        "random",
+        "workshop",
+        "shop",
+        "the furniture company",
+        "the work app",
+        "shreyansh jain",
+    }
+)
+
 
 def _pkg() -> Any:
     return sys.modules[__package__]
@@ -250,3 +287,105 @@ async def resolve_or_create_contact(
     cname = c.get("contact_name") or name
     pkg._upsert_entity_alias(sb, name, cname, contact_type, cid, phone, notes=notes)
     return {"status": "created", "contact_id": cid, "contact_name": cname}
+
+
+async def resolve_payee_zoho_vendor(
+    sb: Any,
+    party_name: str | None,
+    *,
+    zoho_contact_id: str | None = None,
+    allow_adhoc_create: bool = True,
+) -> dict[str, Any]:
+    """Resolve a payee (Vendor, Person/Karigar, or Payout Proxy Alias) to a Zoho Vendor Contact."""
+    raw = (party_name or "").strip()
+    if not zoho_contact_id and (not raw or raw.lower() in NON_PAYEE_WORDS):
+        return {"contact_id": None, "canonical_name": "", "via_alias": None, "source": "none"}
+
+    raw_low = raw.lower()
+    matched_vendor: dict[str, Any] | None = None
+    matched_person: dict[str, Any] | None = None
+    source = "adhoc" if raw else "none"
+    canonical_name = raw
+    phone: str | None = None
+    gstin: str | None = None
+    cached_id: str | None = None
+
+    if sb is not None and raw_low:
+        vendors = (
+            sb.table("vendors")
+            .select("id,canonical_name,aliases,phone,gstin,zoho_contact_id,is_active")
+            .eq("is_active", True)
+            .execute()
+            .data
+            or []
+        )
+        for v in vendors:
+            names = [str(v.get("canonical_name") or ""), *(v.get("aliases") or [])]
+            if any(str(n).strip().lower() == raw_low for n in names if str(n).strip()):
+                matched_vendor = v
+                source = "vendor"
+                canonical_name = str(v.get("canonical_name") or raw).strip()
+                phone = v.get("phone")
+                gstin = v.get("gstin")
+                cached_id = v.get("zoho_contact_id")
+                break
+
+        if not matched_vendor:
+            people = (
+                sb.table("people")
+                .select("id,full_name,aliases,payout_aliases,phone,metadata,is_active")
+                .eq("is_active", True)
+                .execute()
+                .data
+                or []
+            )
+            for p in people:
+                names = [
+                    str(p.get("full_name") or ""),
+                    *(p.get("aliases") or []),
+                    *(p.get("payout_aliases") or []),
+                ]
+                if any(str(n).strip().lower() == raw_low for n in names if str(n).strip()):
+                    matched_person = p
+                    source = "person"
+                    canonical_name = str(p.get("full_name") or raw).strip()
+                    phone = p.get("phone")
+                    cached_id = (p.get("metadata") or {}).get("zoho_contact_id")
+                    break
+
+    via_alias = raw if (raw and canonical_name and raw_low != canonical_name.lower()) else None
+    cid = zoho_contact_id or cached_id
+    err_msg: str | None = None
+
+    if not cid and canonical_name and (source in ("vendor", "person") or allow_adhoc_create):
+        c_res = await _pkg().resolve_or_create_contact(
+            sb,
+            canonical_name,
+            "vendor",
+            phone=phone,
+            gstin=gstin,
+        )
+        cid = c_res.get("contact_id")
+        if c_res.get("contact_name") and source == "adhoc":
+            canonical_name = str(c_res["contact_name"])
+        if c_res.get("status") == "error":
+            err_msg = str(c_res.get("error") or "Failed resolving Zoho vendor contact")
+
+    if cid and sb is not None:
+        if matched_vendor and matched_vendor.get("zoho_contact_id") != cid:
+            sb.table("vendors").update({"zoho_contact_id": cid}).eq("id", matched_vendor["id"]).execute()
+        elif matched_person:
+            meta = dict(matched_person.get("metadata") or {})
+            if meta.get("zoho_contact_id") != cid:
+                meta["zoho_contact_id"] = cid
+                sb.table("people").update({"metadata": meta}).eq("id", matched_person["id"]).execute()
+
+    out: dict[str, Any] = {
+        "contact_id": cid,
+        "canonical_name": canonical_name,
+        "via_alias": via_alias,
+        "source": source,
+    }
+    if err_msg:
+        out["error"] = err_msg
+    return out

@@ -16,10 +16,12 @@ from app.services.zoho.client import (
     _zoho_request,
 )
 from app.services.zoho.contacts import (
+    NON_PAYEE_WORDS,
     _upsert_entity_alias,
     create_zoho_contact,
     merge_notes_text,
     resolve_or_create_contact,
+    resolve_payee_zoho_vendor,
     search_zoho_contacts,
     sync_existing_zoho_contact,
     update_zoho_contact_notes,
@@ -31,11 +33,16 @@ from app.services.zoho.ledger import (
     _resolve_zoho_paid_account_id,
     push_management_entry_to_zoho,
 )
-from app.services.zoho.sync import sync_owner_pulse_snapshot, sync_project_financial_caches
+from app.services.zoho.sync import (
+    list_recent_ledger_transactions,
+    sync_owner_pulse_snapshot,
+    sync_project_financial_caches,
+)
 
 __all__ = [
     "_COA_CACHE",
     "_TOKEN_CACHE",
+    "NON_PAYEE_WORDS",
     "_extract_zoho_doc_project_keys",
     "_find_existing_by_reference",
     "_get_access_token",
@@ -52,9 +59,11 @@ __all__ = [
     "create_zoho_contact",
     "ensure_project_zoho_bridge",
     "get_settings",
+    "list_recent_ledger_transactions",
     "merge_notes_text",
     "push_management_entry_to_zoho",
     "resolve_or_create_contact",
+    "resolve_payee_zoho_vendor",
     "search_zoho_contacts",
     "sync_existing_zoho_contact",
     "sync_owner_pulse_snapshot",

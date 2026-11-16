@@ -70,18 +70,40 @@ _READ_TOOLS_SCHEMA: list[dict[str, Any]] = [
         "name": "query_workshop_pulse",
         "description": (
             "Answer live operational or financial questions: who's doing what / stuck items, "
-            "Ansh's pending material orders, account/float balances, or project P&L / customer dues."
+            "Ansh's pending material orders, account/float balances, project P&L / customer dues, "
+            "or recent ledger transactions."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "topic": {
                     "type": "string",
-                    "enum": ["whos_doing_what", "account_balances", "project_pnl", "needs_info"],
+                    "enum": ["whos_doing_what", "account_balances", "project_pnl", "needs_info", "recent_transactions"],
                 },
-                "filter_query": {"type": "string", "description": "Optional person or customer filter"},
+                "filter_query": {"type": "string", "description": "Optional person, customer, or account filter"},
             },
             "required": ["topic"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "list_recent_transactions",
+        "description": (
+            "List recent money inflows, expenses, salary advances, vendor payments, float transfers, "
+            "and supplier bills directly from live Zoho Books (or ledger), with optional worker/party, "
+            "account (e.g. 'Cash Galla', 'Axis'), entry_type, or limit filter."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "party_or_search": {"type": "string", "description": "Optional worker, vendor, customer, proxy alias, or keyword"},
+                "account": {"type": "string", "description": "Optional account name or code (e.g. 'Cash Galla', 'axis', 'rgb')"},
+                "entry_type": {
+                    "type": "string",
+                    "enum": ["all", "customer_receipt", "expense", "vendor_payment", "float_transfer", "bill"],
+                },
+                "limit": {"type": "integer", "description": "Number of transactions to return (default 15, max 50)"},
+            },
         },
     },
 ]
@@ -109,8 +131,17 @@ async def execute_read_tool(sb: Any, name: str, arguments: dict[str, Any]) -> st
         res = await _tool_search_people_and_vendors(
             sb, query=str(arguments.get("query") or "")
         )
+    elif name == "list_recent_transactions":
+        txns = await zoho.list_recent_ledger_transactions(
+            sb,
+            limit=max(1, min(int(arguments.get("limit") or 15), 50)),
+            account_query=str(arguments.get("account") or ""),
+            party_query=str(arguments.get("party_or_search") or ""),
+            entry_type=str(arguments.get("entry_type") or ""),
+        )
+        res = {"transactions": txns}
     elif name == "query_workshop_pulse":
-        res = _tool_query_workshop_pulse(
+        res = await _tool_query_workshop_pulse(
             sb,
             topic=str(arguments.get("topic") or "whos_doing_what"),
             filter_query=str(arguments.get("filter_query") or ""),
@@ -297,10 +328,13 @@ async def _tool_search_people_and_vendors(sb: Any, query: str) -> dict[str, Any]
     }
 
 
-def _tool_query_workshop_pulse(
+async def _tool_query_workshop_pulse(
     sb: Any, topic: str, filter_query: str = ""
 ) -> dict[str, Any]:
     fq = filter_query.strip().lower()
+    if topic == "recent_transactions":
+        txns = await zoho.list_recent_ledger_transactions(sb, limit=20, party_query=filter_query)
+        return {"transactions": txns}
     if topic == "account_balances":
         accs = (
             sb.table("payment_accounts")

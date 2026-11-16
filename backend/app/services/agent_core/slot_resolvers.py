@@ -238,6 +238,13 @@ def _backfill_financial_slots_from_text(
         )
         if p_rows and p_rows[0].get("customer_name"):
             slots["party_name"] = p_rows[0]["customer_name"]
+    if not slots.get("party_name"):
+        for col, tbl, ncol in (("person_id", "people", "full_name"), ("vendor_id", "vendors", "canonical_name"), ("customer_id", "customers", "full_name")):
+            if slots.get(col) and _accept_id(sb, slots[col], tbl):
+                r = sb.table(tbl).select(ncol).eq("id", slots[col]).limit(1).execute().data or []
+                if r and r[0].get(ncol):
+                    slots["party_name"] = r[0][ncol]
+                    break
 
     matched_person_kind = _match_person_kind_for_party(sb, slots.get("party_name"))
     combined_cues = " ".join(

@@ -47,6 +47,31 @@ async def get_munim_overview(
     }
 
 
+@router.get("/munim/ledger")
+async def get_munim_ledger(
+    limit: int = Query(default=50, ge=1, le=200),
+    account: str = Query(default=""),
+    q: str = Query(default=""),
+    entry_type: str = Query(default=""),
+    date_from: str = Query(default=""),
+    date_to: str = Query(default=""),
+    user: CurrentUser = Depends(get_current_user),
+) -> dict[str, Any]:
+    pkg = _pkg()
+    sb = pkg.get_supabase_admin()
+    _require_munim_access(sb, user)
+    rows = await pkg.zoho.list_recent_ledger_transactions(
+        sb,
+        limit=limit,
+        account_query=account,
+        party_query=q,
+        entry_type=entry_type,
+        date_from=date_from,
+        date_to=date_to,
+    )
+    return {"transactions": rows, "zoho_enabled": pkg.zoho.get_settings().zoho_enabled}
+
+
 @router.post("/munim/sync-zoho")
 async def trigger_zoho_pulse_sync(
     user: CurrentUser = Depends(get_current_user),

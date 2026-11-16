@@ -411,9 +411,14 @@ async def push_management_entry_to_zoho(
                         "zoho_id": existing_id,
                         "deduped": True,
                     }
+                vp_desc = desc
                 if not zoho_contact_id and party_name:
-                    c_res = await pkg.resolve_or_create_contact(sb, party_name, "vendor")
-                    zoho_contact_id = c_res.get("contact_id")
+                    payee = await pkg.resolve_payee_zoho_vendor(
+                        sb, party_name, zoho_contact_id=zoho_contact_id, allow_adhoc_create=True
+                    )
+                    zoho_contact_id = payee.get("contact_id")
+                    if payee.get("canonical_name") and payee.get("via_alias"):
+                        vp_desc = f"[{actor_label}] {proj_prefix}{payee['canonical_name']} (via {payee['via_alias']}) {notes}".strip()[:250]
                 if not zoho_contact_id:
                     return {
                         "ok": False,
@@ -426,7 +431,7 @@ async def push_management_entry_to_zoho(
                     "paid_through_account_id": from_zoho_acc,
                     "amount": round(float(amount_inr), 2),
                     "reference_number": reference_number,
-                    "description": desc,
+                    "description": vp_desc,
                     **({"date": txn_date} if txn_date else {}),
                     **order_tags,
                 }
@@ -473,13 +478,26 @@ async def push_management_entry_to_zoho(
                     "error_kind": "validation_400",
                     "error": {"message": "No active Expense account found in Zoho Chart of Accounts."},
                 }
+            payee = await pkg.resolve_payee_zoho_vendor(
+                sb, party_name, zoho_contact_id=zoho_contact_id, allow_adhoc_create=True
+            )
+            exp_desc = desc
+            if payee.get("canonical_name") and payee.get("via_alias"):
+                exp_desc = (
+                    f"[{actor_label}] {proj_prefix}{payee['canonical_name']} "
+                    f"(via {payee['via_alias']}) {notes}"
+                ).strip()[:250]
+            vendor_zoho_id = payee.get("contact_id")
+            customer_zoho_id = bridge.get("zoho_contact_id") if project_id else None
             exp_payload = {
                 "account_id": matched_coa["account_id"],
                 "paid_through_account_id": from_zoho_acc,
                 "amount": round(float(amount_inr), 2),
                 "reference_number": reference_number,
-                "description": desc,
+                "description": exp_desc,
                 "is_inclusive_tax": False,
+                **({"vendor_id": vendor_zoho_id} if vendor_zoho_id else {}),
+                **({"customer_id": customer_zoho_id} if customer_zoho_id else {}),
                 **({"date": txn_date} if txn_date else {}),
                 **order_tags,
             }

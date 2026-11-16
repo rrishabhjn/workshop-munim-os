@@ -252,3 +252,74 @@ async def test_silent_internal_self_repair_fixes_sloppy_envelope_before_promptin
     assert repair_kwargs["generation_config"] == {"thinking_level": "medium"}
     assert out["goals"][0]["status"] == "awaiting_confirmation"
     assert out["goals"][0]["collected_slots"]["area_landmark"] == "Civil Lines Jaipur"
+
+
+@pytest.mark.asyncio
+async def test_financial_dedup_collapses_staged_party_name_and_envelope_person_id():
+    sb = seed_goal_intelligence_sb()
+    sb.store["people"].append(
+        {
+            "id": "p-rajesh",
+            "full_name": "Rajesh Ji",
+            "person_type": "salaried_karigar",
+            "role_tags": ["karigar"],
+            "is_active": True,
+        }
+    )
+
+    turn1 = SimpleNamespace(
+        id="int_raj_1",
+        steps=[
+            SimpleNamespace(
+                type="function_call",
+                id="call_raj_1",
+                name="stage_financial_entry",
+                arguments={
+                    "entry_kind": "expense",
+                    "amount_inr": 1000,
+                    "party_name": "Rajesh Ji",
+                    "payment_account_code": "cash_galla",
+                    "expense_category": "salary_wages",
+                    "notes": "Salary advance",
+                },
+            )
+        ],
+        output_text=None,
+    )
+    turn2 = SimpleNamespace(
+        id="int_raj_2",
+        steps=[],
+        output_text=AgentTurnEnvelope(
+            intent_category="goal_actions",
+            goal_items=[
+                agent_core.GoalIntentItem(
+                    operation_kind="expense",
+                    summary_title="₹1,000 salary advance to Rajesh Ji",
+                    amount_inr=1000,
+                    person_id="p-rajesh",
+                    payment_account_code="cash_galla",
+                    expense_category="salary_wages",
+                )
+            ],
+        ).model_dump_json(),
+    )
+
+    fake_client = MagicMock()
+    fake_client.interactions.create.side_effect = [turn1, turn2]
+
+    with (
+        patch("app.services.agent_core.get_settings", return_value=Settings(gemini_api_key="test-key")),
+        patch("app.services.agent_core._get_interactions_client", return_value=fake_client),
+    ):
+        out = await agent_core.run_agent_turn(
+            sb,
+            owner_person_id="p-shreyansh",
+            actor_label="Shreyansh",
+            source_channel="web_command_bar",
+            domain_scope="munim",
+            text="1000 paid to rajesh in cash salary advance",
+        )
+
+    assert len(out["goals"]) == 1
+    assert out["goals"][0]["collected_slots"]["party_name"] == "Rajesh Ji"
+    assert "Rajesh Ji" in out["goals"][0]["prompt"]

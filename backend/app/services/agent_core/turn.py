@@ -279,8 +279,7 @@ async def run_agent_turn(
         order: list[str] = []
         for idx_src, (src_list, is_staged) in enumerate(((cur_staged, True), (cur_env, False))):
             for cand in src_list:
-                key = action_tools.goal_item_dedup_key(cand)
-                missing, _ = action_tools.preflight_goal_item_missing_slots(
+                missing, resolved_slots = action_tools.preflight_goal_item_missing_slots(
                     sb,
                     cand,
                     acc_code_to_id=acc_code_to_id,
@@ -290,6 +289,9 @@ async def run_agent_turn(
                     reply_to_bot_msg_id=reply_to_bot_msg_id,
                     telegram_chat_id=telegram_chat_id,
                 )
+                if not cand.party_name and resolved_slots.get("party_name"):
+                    cand.party_name = str(resolved_slots["party_name"])
+                key = action_tools.goal_item_dedup_key(cand, resolved_slots)
                 miss_cnt = len(missing)
                 if key not in by_key:
                     by_key[key] = (cand, miss_cnt, is_staged)

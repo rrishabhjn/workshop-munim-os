@@ -114,7 +114,7 @@ def test_gemini_response_schemas_accepted_by_google_genai():
 
     dummy_client = Client(api_key="test-key")._api_client
     t.t_schema(dummy_client, SupplierBillExtraction)
-    assert len(INTERACTION_TOOLS_SCHEMA) == 11
+    assert len(INTERACTION_TOOLS_SCHEMA) == 12
     for tool in INTERACTION_TOOLS_SCHEMA:
         t.t_schema(dummy_client, tool["parameters"])
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import json
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -534,6 +535,25 @@ async def test_expense_categorization_salary_routing_and_zoho_coa_selection():
 
     # 4. Zoho push selects exact Chart of Accounts account_id (never blindly index 0)
     assert goal_primitives.normalize_or_infer_expense_category("cogs", "") == "raw_materials"
+    sb.store["customers"] = [
+        {"id": "c-arjun", "full_name": "Arjun", "zoho_contact_id": "zc-arjun", "is_active": True}
+    ]
+    sb.store["projects"] = [
+        {
+            "id": "prj-arjun",
+            "project_code": "PRJ-ARJUN",
+            "cf_project_code": "PRJ-ARJUN",
+            "customer_id": "c-arjun",
+            "customer_name": "Arjun",
+            "zoho_contact_id": "zc-arjun",
+            "zoho_tag_id": "tag-prj",
+            "zoho_tag_option_id": "opt-arjun",
+            "status": "active",
+            "project_type": "customer",
+        }
+    ]
+    sb.store["entity_dictionary"] = []
+
     fake_coa = [
         {"account_id": "coa-it", "account_name": "IT and Internet Expenses", "account_type": "expense", "is_active": True},
         {"account_id": "coa-raw-exp", "account_name": "Raw Materials And Consumables", "account_type": "expense", "is_active": True},
@@ -548,16 +568,22 @@ async def test_expense_categorization_salary_routing_and_zoho_coa_selection():
         zoho_refresh_token="rtok",
         zoho_org_id="org1",
     )
-    posted_account_ids: list[str] = []
+    posted_expenses: list[dict[str, Any]] = []
+    contact_calls: list[dict[str, Any]] = []
 
     async def fake_zoho_req(client, method, path, *, params=None, json_body=None):
         if method == "GET" and path == "/expenses":
             return httpx.Response(200, json={"expenses": []})
         if method == "GET" and path == "/chartofaccounts":
             return httpx.Response(200, json={"chartofaccounts": fake_coa})
+        if method == "GET" and path == "/contacts":
+            contact_calls.append(dict(params or {}))
+            if "lala" in str((params or {}).get("contact_name_contains") or "").lower():
+                return httpx.Response(200, json={"contacts": [{"contact_id": "zv-lala", "contact_name": "Lala Ji"}]})
+            return httpx.Response(200, json={"contacts": []})
         if method == "POST" and path == "/expenses":
-            posted_account_ids.append(str(json_body["account_id"]))
-            return httpx.Response(200, json={"expense": {"expense_id": f"ze-{len(posted_account_ids)}"}})
+            posted_expenses.append(dict(json_body or {}))
+            return httpx.Response(200, json={"expense": {"expense_id": f"ze-{len(posted_expenses)}"}})
         raise AssertionError(f"Unexpected Zoho call: {method} {path}")
 
     with (
@@ -574,12 +600,26 @@ async def test_expense_categorization_salary_routing_and_zoho_coa_selection():
             notes="October salary",
             expense_category="salary_wages",
         )
+        # Proxy alias 'Ruksar Bano' uses cached Lala Ji vendor_id and traces via-alias in description
+        res_proxy = await zoho.push_management_entry_to_zoho(
+            sb,
+            entry_kind="expense",
+            amount_inr=8000,
+            payment_account_id="acc-axis",
+            reference_number="MUNIM-SAL-2",
+            party_name="Ruksar Bano",
+            notes="Salary advance",
+            expense_category="salary_wages",
+        )
+        # Project-linked expense attaches Zoho customer_id; generic payee skips /contacts
         res_trn = await zoho.push_management_entry_to_zoho(
             sb,
             entry_kind="expense",
             amount_inr=650,
             payment_account_id="acc-axis",
             reference_number="MUNIM-TRN-1",
+            party_name="tempo bhada",
+            project_id="prj-arjun",
             notes="tempo bhada",
             expense_category="transport_freight",
         )
@@ -602,8 +642,180 @@ async def test_expense_categorization_salary_routing_and_zoho_coa_selection():
             expense_category="raw_materials",
         )
 
-    assert posted_account_ids == ["coa-sal", "coa-trn", "coa-oth", "coa-mat-cogs"]
+    assert [e["account_id"] for e in posted_expenses] == ["coa-sal", "coa-sal", "coa-trn", "coa-oth", "coa-mat-cogs"]
+    assert posted_expenses[0]["vendor_id"] == "zv-lala"
+    assert posted_expenses[1]["vendor_id"] == "zv-lala"
+    assert "(via Ruksar Bano)" in posted_expenses[1]["description"]
+    assert "vendor_id" not in posted_expenses[2]
+    assert posted_expenses[2]["customer_id"] == "zc-arjun"
+    assert "vendor_id" not in posted_expenses[3]
+    assert "vendor_id" not in posted_expenses[4]
+    assert len(contact_calls) == 1  # cached on Lala Ji's metadata; generic words skipped!
+    assert sb.store["people"][0]["metadata"]["zoho_contact_id"] == "zv-lala"
     assert res_sal["expense_account_name"] == "Salaries and Employee Wages"
+    assert res_proxy["expense_account_name"] == "Salaries and Employee Wages"
     assert res_trn["expense_account_name"] == "Transportation Expense"
     assert res_oth["expense_account_name"] == "Other Expenses"
     assert res_mat["expense_account_name"] == "Materials"
+
+
+@pytest.mark.asyncio
+async def test_zoho_ledger_reader_endpoint_and_ai_tool():
+    from app.auth import CurrentUser, get_current_user
+    from app.main import app
+    from app.services import agent_tools
+
+    sb = FakeSupabase(
+        {
+            "people": [
+                {
+                    "id": "p-shr",
+                    "full_name": "Shreyansh",
+                    "person_type": "operator",
+                    "email": "shr@example.com",
+                    "can_login_munim": True,
+                    "is_active": True,
+                },
+                {
+                    "id": "p-lala",
+                    "full_name": "Lala Ji",
+                    "person_type": "salaried_karigar",
+                    "aliases": [],
+                    "payout_aliases": ["Ruksar Bano"],
+                    "is_active": True,
+                },
+            ],
+            "payment_accounts": [
+                {
+                    "id": "acc-galla",
+                    "code": "cash_galla",
+                    "display_name": "Cash Galla",
+                    "aliases": ["cash", "galla"],
+                    "zoho_account_id": "za-galla",
+                    "is_active": True,
+                }
+            ],
+            "vendors": [],
+            "customers": [],
+        }
+    )
+    fake_settings = Settings(zoho_client_id="cid", zoho_client_secret="csec", zoho_refresh_token="rtok", zoho_org_id="org1")
+
+    async def fake_zoho_req(client, method, path, *, params=None, json_body=None):
+        assert method == "GET"
+        if path == "/expenses":
+            return httpx.Response(
+                200,
+                json={
+                    "expenses": [
+                        {
+                            "expense_id": "ze-1",
+                            "date": "2026-11-17",
+                            "created_time": "2026-11-17T02:35:00+0530",
+                            "total": 1000.0,
+                            "paid_through_account_name": "Cash Galla",
+                            "paid_through_account_id": "za-galla",
+                            "account_name": "Salaries and Employee Wages",
+                            "vendor_name": "Lala Ji",
+                            "customer_name": "",
+                            "description": "[Rishabh] Lala Ji Salary advance",
+                            "reference_number": "MUNIM-1-S0",
+                            "status": "nonbillable",
+                        }
+                    ]
+                },
+            )
+        if path == "/customerpayments":
+            return httpx.Response(
+                200,
+                json={
+                    "customerpayments": [
+                        {
+                            "payment_id": "zp-in-1",
+                            "date": "2026-11-16",
+                            "created_time": "2026-11-16T18:00:00+0530",
+                            "amount": 50000.0,
+                            "account_name": "Axis Bank",
+                            "account_id": "za-axis",
+                            "customer_name": "Arjun (Jaipur)",
+                            "description": "Booking advance",
+                            "reference_number": "MUNIM-2-S0",
+                            "status": "paid",
+                        }
+                    ]
+                },
+            )
+        if path == "/vendorpayments":
+            return httpx.Response(200, json={"vendorpayments": []})
+        if path == "/banktransactions":
+            return httpx.Response(
+                200,
+                json={
+                    "banktransactions": [
+                        # Mirrored expense (same id ze-1) MUST be deduped!
+                        {
+                            "transaction_id": "ze-1",
+                            "transaction_type": "expense",
+                            "date": "2026-11-17",
+                            "amount": 1000.0,
+                            "account_name": "Cash Galla",
+                            "account_id": "za-galla",
+                        },
+                        # Paired transfer_fund legs MUST collapse to 1 row
+                        {
+                            "transaction_id": "zt-1",
+                            "transaction_type": "transfer_fund",
+                            "date": "2026-11-15",
+                            "created_time": "2026-11-15T10:00:00+0530",
+                            "amount": 5000.0,
+                            "account_name": "Cash Galla",
+                            "offset_account_name": "Ansh Wallet",
+                            "description": "Shop float",
+                            "reference_number": "MUNIM-XFER-1",
+                        },
+                        {
+                            "transaction_id": "zt-2",
+                            "transaction_type": "transfer_fund",
+                            "date": "2026-11-15",
+                            "created_time": "2026-11-15T10:00:00+0530",
+                            "amount": 5000.0,
+                            "account_name": "Ansh Wallet",
+                            "offset_account_name": "Cash Galla",
+                            "description": "Shop float",
+                            "reference_number": "MUNIM-XFER-1",
+                        },
+                    ]
+                },
+            )
+        if path == "/bills":
+            return httpx.Response(200, json={"bills": []})
+        raise AssertionError(f"Unexpected path: {path}")
+
+    app.dependency_overrides[get_current_user] = lambda: CurrentUser(
+        auth_type="google", identifier="shr@example.com", display_name="Shreyansh"
+    )
+    try:
+        with (
+            patch("app.services.zoho.get_settings", return_value=fake_settings),
+            patch("app.services.zoho._zoho_request", side_effect=fake_zoho_req),
+            patch("app.routers.domains.get_supabase_admin", return_value=sb),
+        ):
+            all_rows = await zoho.list_recent_ledger_transactions(sb, limit=20)
+            assert len(all_rows) == 3  # ze-1 (not duplicated!), zp-in-1, 1 float_transfer
+            assert [r["id"] for r in all_rows] == ["ze-1", "zp-in-1", "zt-1"]
+
+            tool_json = await agent_tools.execute_read_tool(
+                sb, "list_recent_transactions", {"party_or_search": "Ruksar Bano"}
+            )
+            tool_data = json.loads(tool_json)
+            assert len(tool_data["transactions"]) == 1
+            assert tool_data["transactions"][0]["party_name"] == "Lala Ji"
+
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                r = await client.get("/api/munim/ledger?account=Cash+Galla")
+                assert r.status_code == 200
+                txns = r.json()["transactions"]
+                assert [t["id"] for t in txns] == ["ze-1", "zt-1"]
+    finally:
+        app.dependency_overrides.clear()
