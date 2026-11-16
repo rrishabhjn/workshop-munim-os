@@ -2008,4 +2008,140 @@ async def test_pass1_telegram_stale_claim_recovery_and_multi_voice_burst():
     assert all(r["status"] == "processed" for r in sb.store["telegram_inbox_buffer"])
 
 
+@pytest.mark.asyncio
+async def test_four_cash_wallets_natural_shorthand_and_zoho_safe_matching():
+    from app.services import zoho
+
+    sb = FakeSupabase(
+        {
+            "payment_accounts": [
+                {
+                    "id": "acc-galla",
+                    "code": "cash_galla",
+                    "display_name": "Cash Galla",
+                    "account_kind": "cash_galla",
+                    "aliases": ["cash", "galla", "shop cash", "nakad"],
+                    "sort_order": 1,
+                    "is_active": True,
+                },
+                {
+                    "id": "acc-axis",
+                    "code": "axis",
+                    "display_name": "Axis Bank",
+                    "account_kind": "bank",
+                    "aliases": ["axis", "axis bank"],
+                    "sort_order": 2,
+                    "is_active": True,
+                },
+                {
+                    "id": "acc-rgb",
+                    "code": "rgb",
+                    "display_name": "RGB (Gramin Bank)",
+                    "account_kind": "bank",
+                    "aliases": ["rgb", "rajasthan gramin bank"],
+                    "sort_order": 3,
+                    "is_active": True,
+                },
+                {
+                    "id": "acc-ccrgb",
+                    "code": "ccrgb",
+                    "display_name": "CCRGB (OD / CC)",
+                    "account_kind": "od_cc",
+                    "aliases": ["ccrgb", "cc rgb", "od"],
+                    "sort_order": 4,
+                    "is_active": True,
+                },
+                {
+                    "id": "acc-ansh",
+                    "code": "float_ansh",
+                    "display_name": "Ansh Wallet",
+                    "account_kind": "supervisor_float",
+                    "aliases": ["ansh", "ansh wallet", "ansh float", "ansh cash", "ansh ji", "ansh bhaiya"],
+                    "sort_order": 10,
+                    "is_active": True,
+                },
+                {
+                    "id": "acc-kamlesh",
+                    "code": "float_kamlesh",
+                    "display_name": "Kamlesh Wallet",
+                    "account_kind": "supervisor_float",
+                    "aliases": ["kamlesh", "kamlesh wallet", "kamlesh float", "kamlesh cash", "kamlesh bhaiya", "kamlesh ji"],
+                    "sort_order": 11,
+                    "is_active": True,
+                },
+                {
+                    "id": "acc-rohit",
+                    "code": "float_rohit",
+                    "display_name": "Rohit Wallet",
+                    "account_kind": "supervisor_float",
+                    "aliases": ["rohit", "rohit wallet", "rohit float", "rohit cash", "rohit ji", "rohit bhaiya"],
+                    "sort_order": 12,
+                    "is_active": True,
+                },
+                {
+                    "id": "acc-shreyansh",
+                    "code": "float_shreyansh",
+                    "display_name": "Shreyansh Wallet",
+                    "account_kind": "supervisor_float",
+                    "aliases": ["shreyansh", "shreyansh wallet", "shreyansh float", "shreyansh cash", "shreyansh ji", "owner wallet"],
+                    "sort_order": 13,
+                    "is_active": True,
+                },
+            ]
+        }
+    )
+
+    # 3-tier priority natural shorthand checks
+    assert agent_core._extract_payment_account_code_from_text(sb, "Ansh paid 500 for screws") == "float_ansh"
+    assert agent_core._extract_payment_account_code_from_text(sb, "Rohit paid 300 cash for auto") == "float_rohit"
+    assert agent_core._extract_payment_account_code_from_text(sb, "Ansh paid 500 from galla") == "cash_galla"
+    assert agent_core._extract_payment_account_code_from_text(sb, "Shreyansh paid 5,000 from Axis") == "axis"
+    assert agent_core._extract_payment_account_code_from_text(sb, "Praveen Mehta advance 20,000 cash") == "cash_galla"
+
+    # Word-bounded & account-type-safe Zoho /bankaccounts sync (note CCRGB before RGB, and SBI - Shreyansh distractor)
+    fake_zoho_accs = [
+        {"account_id": "z-undep", "account_name": "Undeposited Funds", "account_type": "cash", "is_active": True, "balance": -6000},
+        {"account_id": "z-petty", "account_name": "Petty Cash", "account_type": "cash", "is_active": True, "balance": 100},
+        {"account_id": "z-galla", "account_name": "Cash Galla", "account_type": "cash", "is_active": True, "balance": 12500},
+        {"account_id": "z-ccrgb", "account_name": "CCRGB", "account_type": "bank", "is_active": True, "balance": -50000},
+        {"account_id": "z-rgb", "account_name": "RGB", "account_type": "bank", "is_active": True, "balance": 42000},
+        {"account_id": "z-axis", "account_name": "Axis Bank", "account_type": "bank", "is_active": True, "balance": 85000},
+        {"account_id": "z-sbi-shr", "account_name": "SBI - Shreyansh", "account_type": "bank", "is_active": True, "balance": 99999},
+        {"account_id": "z-ansh", "account_name": "Ansh Wallet", "account_type": "cash", "is_active": True, "balance": 4500},
+        {"account_id": "z-kam", "account_name": "Kamlesh Wallet", "account_type": "cash", "is_active": True, "balance": 3000},
+        {"account_id": "z-roh", "account_name": "Rohit Wallet", "account_type": "cash", "is_active": True, "balance": 2000},
+        {"account_id": "z-shr", "account_name": "Shreyansh Wallet", "account_type": "cash", "is_active": True, "balance": 15000},
+    ]
+
+    fake_settings = Settings(
+        zoho_client_id="cid",
+        zoho_client_secret="csec",
+        zoho_refresh_token="rtok",
+        zoho_org_id="org1",
+    )
+
+    async def fake_zoho_req(client, method, path, *, params=None, json_body=None):
+        assert method == "GET" and path == "/bankaccounts"
+        return httpx.Response(200, json={"bankaccounts": fake_zoho_accs})
+
+    with (
+        patch("app.services.zoho.get_settings", return_value=fake_settings),
+        patch("app.services.zoho._zoho_request", side_effect=fake_zoho_req),
+    ):
+        sync_out = await zoho.sync_owner_pulse_snapshot(sb)
+
+    assert sync_out["ok"] is True
+    assert sync_out["accounts_synced"] == 8
+    by_code = {a["code"]: a for a in sb.store["payment_accounts"]}
+    assert by_code["cash_galla"]["zoho_account_id"] == "z-galla"
+    assert by_code["axis"]["zoho_account_id"] == "z-axis"
+    assert by_code["rgb"]["zoho_account_id"] == "z-rgb"
+    assert by_code["ccrgb"]["zoho_account_id"] == "z-ccrgb"
+    assert by_code["float_ansh"]["zoho_account_id"] == "z-ansh"
+    assert by_code["float_kamlesh"]["zoho_account_id"] == "z-kam"
+    assert by_code["float_rohit"]["zoho_account_id"] == "z-roh"
+    assert by_code["float_shreyansh"]["zoho_account_id"] == "z-shr"
+
+
+
 

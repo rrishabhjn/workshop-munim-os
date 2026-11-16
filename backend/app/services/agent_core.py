@@ -269,7 +269,7 @@ class GoalIntentItem(BaseModel):
     )
     payment_account_code: str | None = Field(
         default=None,
-        description="REQUIRED for money entries: exact account code from PAYMENT_ACCOUNTS (e.g. 'cash_galla' for cash/galla, 'axis', 'rgb', 'paytm', 'float_ansh').",
+        description="REQUIRED for money entries: exact account code from PAYMENT_ACCOUNTS (e.g. 'cash_galla', 'axis', 'rgb', 'ccrgb', 'paytm', 'float_ansh', 'float_kamlesh', 'float_rohit', 'float_shreyansh').",
     )
     to_payment_account_code: str | None = None
     party_name: str | None = Field(
@@ -967,32 +967,48 @@ def _extract_inr_amount_from_text(*texts: str | None) -> float | None:
 
 
 def _extract_payment_account_code_from_text(sb: Any, *texts: str | None) -> str | None:
-    """Deterministic fallback to match payment_accounts aliases when LLM omitted payment_account_code."""
+    """Deterministic 3-tier priority fallback to resolve payment_accounts without requiring 'wallet'."""
     combined = " ".join((t or "").strip().lower() for t in texts if t and t.strip())
     if not combined:
         return None
     accounts = (
         sb.table("payment_accounts")
-        .select("code,display_name,aliases")
+        .select("code,display_name,account_kind,aliases")
         .eq("is_active", True)
         .execute()
         .data
         or []
     )
-    candidates: list[tuple[str, str]] = []
+    tier1: list[tuple[str, str]] = []  # Explicit banks / OD / UPI / galla / multi-word float phrases
+    tier2: list[tuple[str, str]] = []  # Bare supervisor first-name shorthand (e.g. 'ansh', 'rohit')
+    tier3: list[tuple[str, str]] = []  # Generic 'cash' / 'nakad' fallback -> cash_galla
+
     for a in accounts:
         code = str(a.get("code") or "").strip()
+        kind = str(a.get("account_kind") or "").strip()
         if not code:
             continue
-        tokens = [code.replace("_", " "), str(a.get("display_name") or ""), *(a.get("aliases") or [])]
+        tokens = [
+            code.replace("_", " "),
+            str(a.get("display_name") or ""),
+            *(a.get("aliases") or []),
+        ]
         for tok in tokens:
             t_low = str(tok).strip().lower()
-            if len(t_low) >= 2:
-                candidates.append((t_low, code))
-    candidates.sort(key=lambda pair: len(pair[0]), reverse=True)
-    for tok, code in candidates:
-        if re.search(rf"\b{re.escape(tok)}\b", combined):
-            return code
+            if len(t_low) < 2:
+                continue
+            if kind == "cash_galla" and t_low in ("cash", "nakad"):
+                tier3.append((t_low, code))
+            elif kind == "supervisor_float" and " " not in t_low:
+                tier2.append((t_low, code))
+            else:
+                tier1.append((t_low, code))
+
+    for bucket in (tier1, tier2, tier3):
+        bucket.sort(key=lambda pair: len(pair[0]), reverse=True)
+        for tok, code in bucket:
+            if re.search(rf"\b{re.escape(tok)}\b", combined):
+                return code
     return None
 
 

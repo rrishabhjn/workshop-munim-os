@@ -1,4 +1,5 @@
 import logging
+import re
 import time
 from typing import Any
 import httpx
@@ -380,6 +381,7 @@ async def create_draft_bill(
         }
 
     order_tags: dict[str, Any] = {}
+    bridge: dict[str, Any] = {}
     if project_id and sb is not None:
         bridge = await ensure_project_zoho_bridge(sb, project_id)
         order_tags = build_zoho_standard_order_tags(
@@ -431,11 +433,12 @@ async def create_draft_bill(
                 vendor_id = contacts[0]["contact_id"]
 
             line_tags = {"tags": order_tags["tags"]} if order_tags.get("tags") else {}
+            proj_prefix = f"[{bridge['cf_project_code']}] " if bridge.get("cf_project_code") else ""
             payload: dict[str, Any] = {
                 "vendor_id": vendor_id,
                 "status": "draft",  # HARDCODED DRAFT-ONLY BOUNDARY
                 "bill_number": invoice_no or f"DRAFT-{int(time.time())}",
-                "notes": f"[Workshop Munim Bot Draft] {notes}".strip(),
+                "notes": f"[Workshop Munim Bot Draft] {proj_prefix}{notes}".strip(),
                 "line_items": [
                     {
                         "name": li.get("description", "Material"),
@@ -452,7 +455,9 @@ async def create_draft_bill(
             if bill_date:
                 payload["date"] = bill_date
 
-            b_resp = await _zoho_request(client, "POST", "/bills", json_body=payload)
+            b_resp = await _post_zoho_with_order_tag_fallback(
+                client, "/bills", payload, has_order_tags=bool(order_tags)
+            )
             if not b_resp.is_success:
                 return {
                     "stubbed": False,
@@ -959,29 +964,120 @@ async def ensure_project_zoho_bridge(sb: Any, project_id: str) -> dict[str, Any]
     }
 
 
+def _pick_matching_zoho_bank_account(
+    local_acc: dict[str, Any],
+    zoho_accs: list[dict[str, Any]],
+    claimed_zoho_ids: set[str],
+) -> dict[str, Any] | None:
+    """Safely match a local payment_account to a live Zoho bank/cash account.
+
+    Prevents word-overlap bugs ('RGB' matching 'CCRGB') and protects Cash Wallets
+    (supervisor_float) from binding to firm bank accounts or 'Cash Galla'/'Petty Cash'.
+    """
+    code = str(local_acc.get("code") or "").strip().lower()
+    kind = str(local_acc.get("account_kind") or "").strip().lower()
+
+    eligible: list[dict[str, Any]] = []
+    for ba in zoho_accs:
+        zid = str(ba.get("account_id") or "").strip()
+        aname = (ba.get("account_name") or "").strip().lower()
+        atype = (ba.get("account_type") or "").strip().lower()
+        if not zid or zid in claimed_zoho_ids or ba.get("is_active") is False:
+            continue
+        if aname == "undeposited funds":
+            continue
+        if kind == "supervisor_float":
+            if aname in ("petty cash", "cash galla", "cash"):
+                continue
+            if atype and atype != "cash" and ("wallet" not in aname and "float" not in aname):
+                continue
+        eligible.append(ba)
+
+    if code == "cash_galla":
+        for preferred in ("cash galla", "petty cash"):
+            hit = next(
+                (z for z in eligible if (z.get("account_name") or "").strip().lower() == preferred),
+                None,
+            )
+            if hit:
+                return hit
+
+    candidates_raw = [
+        str(local_acc.get("display_name") or ""),
+        code,
+        code.replace("_", " "),
+        *[str(a) for a in (local_acc.get("aliases") or [])],
+    ]
+    candidates = [
+        c.strip().lower()
+        for c in candidates_raw
+        if c and c.strip() and c.strip().lower() not in ("cash", "nakad")
+    ]
+
+    for cand in candidates:
+        for ba in eligible:
+            aname = (ba.get("account_name") or "").strip().lower()
+            if aname == cand:
+                return ba
+
+    for cand in candidates:
+        pat = re.compile(rf"\b{re.escape(cand)}\b")
+        for ba in eligible:
+            aname = (ba.get("account_name") or "").strip().lower()
+            if pat.search(aname):
+                return ba
+    return None
+
+
+async def _post_zoho_with_order_tag_fallback(
+    client: httpx.AsyncClient,
+    path: str,
+    payload: dict[str, Any],
+    *,
+    has_order_tags: bool,
+) -> httpx.Response:
+    """POST to Zoho Books and retry once without custom_fields/tags on field-config 400."""
+    resp = await _zoho_request(client, "POST", path, json_body=payload)
+    if not resp.is_success and resp.status_code == 400 and has_order_tags:
+        err_low = resp.text.lower()
+        if any(k in err_low for k in ("custom", "field", "tag")):
+            fallback_payload = {
+                k: v for k, v in payload.items() if k not in ("custom_fields", "tags")
+            }
+            if isinstance(fallback_payload.get("line_items"), list):
+                fallback_payload["line_items"] = [
+                    {lk: lv for lk, lv in li.items() if lk != "tags"}
+                    if isinstance(li, dict)
+                    else li
+                    for li in fallback_payload["line_items"]
+                ]
+            resp = await _zoho_request(client, "POST", path, json_body=fallback_payload)
+    return resp
+
+
 async def _resolve_zoho_paid_account_id(
     client: httpx.AsyncClient, sb: Any, payment_account_row: dict[str, Any]
 ) -> str | None:
-    """Resolve Zoho Books account_id for one of the 13 canonical payment_accounts."""
+    """Resolve Zoho Books account_id for one of the canonical payment_accounts."""
     if payment_account_row.get("zoho_account_id"):
         return str(payment_account_row["zoho_account_id"])
 
     resp = await _zoho_request(client, "GET", "/bankaccounts")
     if resp.is_success:
         b_accs = resp.json().get("bankaccounts") or []
-        names_to_try = [
-            payment_account_row["display_name"].lower(),
-            payment_account_row["code"].lower(),
-            *[a.lower() for a in (payment_account_row.get("aliases") or [])],
-        ]
-        for ba in b_accs:
-            aname = (ba.get("account_name") or "").strip().lower()
-            if any(n in aname or aname in n for n in names_to_try if n):
-                zid = str(ba["account_id"])
-                sb.table("payment_accounts").update({"zoho_account_id": zid}).eq(
-                    "id", payment_account_row["id"]
-                ).execute()
-                return zid
+        all_local = sb.table("payment_accounts").select("id,zoho_account_id").eq("is_active", True).execute().data or []
+        claimed_ids = {
+            str(r["zoho_account_id"])
+            for r in all_local
+            if r.get("zoho_account_id") and str(r.get("id")) != str(payment_account_row.get("id"))
+        }
+        match = _pick_matching_zoho_bank_account(payment_account_row, b_accs, claimed_ids)
+        if match:
+            zid = str(match["account_id"])
+            sb.table("payment_accounts").update({"zoho_account_id": zid}).eq(
+                "id", payment_account_row["id"]
+            ).execute()
+            return zid
     return None
 
 
@@ -1045,7 +1141,8 @@ async def push_management_entry_to_zoho(
         zoho_tag_option_id=bridge.get("zoho_tag_option_id"),
         custom_field_api_name=settings.zoho_project_custom_field,
     )
-    desc = f"[{actor_label}] {party_name} {notes}".strip()[:250]
+    proj_prefix = f"[{bridge['cf_project_code']}] " if bridge.get("cf_project_code") else ""
+    desc = f"[{actor_label}] {proj_prefix}{party_name} {notes}".strip()[:250]
 
     try:
         async with httpx.AsyncClient(timeout=12.0) as client:
@@ -1160,7 +1257,9 @@ async def push_management_entry_to_zoho(
                     **({"date": txn_date} if txn_date else {}),
                     **order_tags,
                 }
-                resp = await _zoho_request(client, "POST", "/customerpayments", json_body=payload)
+                resp = await _post_zoho_with_order_tag_fallback(
+                    client, "/customerpayments", payload, has_order_tags=bool(order_tags)
+                )
                 if resp.is_success:
                     pid = (resp.json().get("payment") or {}).get("payment_id")
                     return {
@@ -1209,7 +1308,9 @@ async def push_management_entry_to_zoho(
                     **({"date": txn_date} if txn_date else {}),
                     **order_tags,
                 }
-                resp = await _zoho_request(client, "POST", "/vendorpayments", json_body=payload)
+                resp = await _post_zoho_with_order_tag_fallback(
+                    client, "/vendorpayments", payload, has_order_tags=bool(order_tags)
+                )
                 if resp.is_success:
                     vpid = (resp.json().get("vendorpayment") or {}).get("payment_id")
                     return {
@@ -1262,7 +1363,9 @@ async def push_management_entry_to_zoho(
                 **({"date": txn_date} if txn_date else {}),
                 **order_tags,
             }
-            resp = await _zoho_request(client, "POST", "/expenses", json_body=exp_payload)
+            resp = await _post_zoho_with_order_tag_fallback(
+                client, "/expenses", exp_payload, has_order_tags=bool(order_tags)
+            )
             if resp.is_success:
                 eid = (resp.json().get("expense") or {}).get("expense_id")
                 return {
@@ -1308,24 +1411,29 @@ async def sync_owner_pulse_snapshot(sb: Any) -> dict[str, Any]:
                 return {"ok": False, "error": f"Zoho /bankaccounts HTTP {resp.status_code}"}
             zoho_accs = resp.json().get("bankaccounts") or []
             local_accs = sb.table("payment_accounts").select("*").eq("is_active", True).execute().data or []
+            local_accs.sort(key=lambda a: int(a.get("sort_order") or 0))
+            zoho_by_id = {
+                str(z.get("account_id")): z
+                for z in zoho_accs
+                if z.get("account_id") and z.get("is_active") is not False
+            }
+            claimed_zoho_ids = {
+                str(la["zoho_account_id"])
+                for la in local_accs
+                if la.get("zoho_account_id") and str(la["zoho_account_id"]) in zoho_by_id
+            }
             for la in local_accs:
                 match = None
                 if la.get("zoho_account_id"):
-                    match = next((z for z in zoho_accs if str(z.get("account_id")) == str(la["zoho_account_id"])), None)
+                    match = zoho_by_id.get(str(la["zoho_account_id"]))
                 if not match:
-                    candidates = [la["display_name"].lower(), la["code"].lower(), *[a.lower() for a in (la.get("aliases") or [])]]
-                    match = next(
-                        (
-                            z
-                            for z in zoho_accs
-                            if any(c in (z.get("account_name") or "").lower() for c in candidates if c)
-                        ),
-                        None,
-                    )
+                    match = _pick_matching_zoho_bank_account(la, zoho_accs, claimed_zoho_ids)
                 if match:
+                    zid = str(match["account_id"])
+                    claimed_zoho_ids.add(zid)
                     sb.table("payment_accounts").update(
                         {
-                            "zoho_account_id": str(match["account_id"]),
+                            "zoho_account_id": zid,
                             "cached_balance_inr": round(float(match.get("balance") or 0), 2),
                             "balance_synced_at": "now()",
                         }
