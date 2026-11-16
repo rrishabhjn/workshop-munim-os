@@ -1,0 +1,418 @@
+"""Phase 1 Core Domain & AI-Systems Hardening Primitives.
+
+Implements the canonical state-machine models and deterministic helpers for:
+  1. Surgical Decisions API routing criteria + compound active-goal tray snapshots
+  2. Canonical cross-channel AgentGoal checklist (O(1) context, zero silent expiry)
+  3. 2.5s Telegram burst inbox batching + atomic compare-and-swap goal execution claim
+  4. Quiet Personal-Assistant contract (consolidated missing slots, never auto-expires)
+  5. Deterministic Zoho Standard Plan idempotency keys (reference_number) + transient vs 400 split
+  6. Mandatory '🎙️ Heard: "..."' transcript echo on voice inputs
+  7. Reversible 1-tap [↩️ Undo] snapshots for Production lifecycle moves
+  8. IST Worker Attendance worked-minutes & >6:00 PM overtime math
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, time as dt_time, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
+from typing import Any, Literal
+import uuid
+
+from pydantic import BaseModel, Field
+
+IST = timezone(timedelta(hours=5, minutes=30))
+
+# Locked Phase 1 Stage Constants
+PROJECT_PIPELINE_STAGES: tuple[str, ...] = (
+    "lead",
+    "design",
+    "estimating",
+    "quoted_awaiting_advance",
+    "site_sizing_boq",
+    "execution",
+    "completed",
+    "on_hold",
+    "lost",
+)
+
+MATERIAL_TRACK_STAGES: tuple[str, ...] = (
+    "not_started",
+    "check_stock",
+    "ordered_pending",
+    "all_in_shop",
+)
+
+PAYMENT_TRACK_STAGES: tuple[str, ...] = (
+    "advance_pending",
+    "advance_in",
+    "partial_paid",
+    "payment_complete",
+)
+
+ITEM_EXECUTION_STAGES: tuple[str, ...] = (
+    "in_shop",
+    "packed_ready",
+    "at_site",
+    "qc_done",
+)
+
+NEW_CUSTOMER_REQUIRED_SLOTS: tuple[str, ...] = (
+    "full_name",
+    "area_landmark",
+    "rough_scope",
+)
+
+GoalStatus = Literal[
+    "gathering_info",
+    "awaiting_confirmation",
+    "executing",
+    "needs_error_fix",
+    "parked_for_clerk",
+    "completed",
+    "undone",
+    "discarded",
+]
+
+GoalType = Literal[
+    "new_lead",
+    "stage_update",
+    "assign_owner",
+    "financial_txn",
+    "supplier_bill",
+    "float_transfer",
+    "salary_advance",
+    "entity_onboarding",
+    "query",
+    "repair",
+]
+
+StepTarget = Literal["supabase", "zoho", "gcs"]
+StepStatus = Literal["pending", "succeeded", "failed_transient", "failed_validation"]
+StepErrorKind = Literal["none", "transient_5xx", "validation_400"]
+ThinkingLevel = Literal["minimal", "low", "medium", "high", "xhigh"]
+
+
+class CheckpointedStep(BaseModel):
+    """Single idempotent execution step inside an AgentGoal (Hardening #2 & #5)."""
+
+    step_uuid: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    step_index: int = Field(ge=0)
+    target: StepTarget
+    operation: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+    status: StepStatus = "pending"
+    zoho_reference_number: str | None = None
+    retry_count: int = Field(default=0, ge=0)
+    error_kind: StepErrorKind = "none"
+    error_detail: dict[str, Any] | None = None
+    result: dict[str, Any] | None = None
+
+
+class RepairOption(BaseModel):
+    """1-tap repair button payload proposed by Gemini on 400 validation errors."""
+
+    option_id: str
+    label: str = Field(max_length=64)
+    slot_patch: dict[str, Any] = Field(default_factory=dict)
+    park_for_clerk: bool = False
+
+
+class AgentGoalChecklist(BaseModel):
+    """Canonical cross-channel AI goal state (Hardening #1..#6 — never silently expires)."""
+
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    owner_person_id: str | None = None
+    source_channel: Literal["telegram", "web_command_bar", "system"] = "telegram"
+    domain_scope: Literal["production", "munim", "attendance", "shared"] = "production"
+    goal_type: GoalType
+    status: GoalStatus = "gathering_info"
+    thinking_level_used: ThinkingLevel = "low"
+    heard_transcript: str | None = None
+    summary_title: str = ""
+    collected_slots: dict[str, Any] = Field(default_factory=dict)
+    missing_slots: list[str] = Field(default_factory=list)
+    pending_prompt: str | None = None
+    steps: list[CheckpointedStep] = Field(default_factory=list)
+    repair_options: list[RepairOption] = Field(default_factory=list)
+    undo_event_ids: list[str] = Field(default_factory=list)
+    project_id: str | None = None
+    customer_id: str | None = None
+    lock_version: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Hardening #1: Surgical Decisions API Gate Helper + Active-Goal Tray Builder
+# ---------------------------------------------------------------------------
+def should_run_decisions_front_door(
+    *,
+    is_group_chat: bool,
+    is_bot_mentioned_or_reply: bool,
+    has_photo_or_pdf: bool,
+    domain_channel: str,
+) -> bool:
+    """Run gemini-decision-1 ONLY when it prevents waking Hydrogen or triages raw media."""
+    if domain_channel == "attendance":
+        return has_photo_or_pdf
+    if has_photo_or_pdf:
+        return True
+    if is_group_chat and not is_bot_mentioned_or_reply:
+        return True
+    return False
+
+
+def select_hydrogen_thinking_level(
+    *,
+    ocr_difficulty_score: float | None = None,
+    is_error_diagnosis: bool = False,
+    is_multi_item_dump: bool = False,
+) -> ThinkingLevel:
+    """Explicitly choose thinking_level so gemini-4-hydrogen never defaults to 'high'."""
+    if ocr_difficulty_score is not None and ocr_difficulty_score >= 1.5:
+        return "high"
+    if is_error_diagnosis or is_multi_item_dump or (
+        ocr_difficulty_score is not None and ocr_difficulty_score >= 0.7
+    ):
+        return "medium"
+    return "low"
+
+
+def build_compact_open_goals_tray(
+    open_goal_rows: list[dict[str, Any]], max_goals: int = 3
+) -> list[dict[str, Any]]:
+    """Build an O(1) ~150-token active-goal tray so Hydrogen handles compound replies + new tasks."""
+    tray: list[dict[str, Any]] = []
+    for row in open_goal_rows[:max_goals]:
+        tray.append(
+            {
+                "goal_id": str(row.get("id", "")),
+                "goal_type": row.get("goal_type"),
+                "status": row.get("status"),
+                "summary": (row.get("summary_title") or "")[:100],
+                "missing_slots": list(row.get("missing_slots") or []),
+                "pending_prompt": (row.get("pending_prompt") or "")[:140],
+                "collected_slots": row.get("collected_slots") or {},
+            }
+        )
+    return tray
+
+
+# ---------------------------------------------------------------------------
+# Hardening #3: Atomic Compare-and-Swap & 2.5s Burst Merging
+# ---------------------------------------------------------------------------
+def claim_goal_for_execution(
+    sb: Any,
+    goal_id: str,
+    allowed_prior_statuses: tuple[str, ...] = (
+        "awaiting_confirmation",
+        "gathering_info",
+        "needs_error_fix",
+        "parked_for_clerk",
+    ),
+) -> dict[str, Any] | None:
+    """Atomically transition goal -> 'executing' so double-taps on 4G never double-post."""
+    res = (
+        sb.table("agent_goals")
+        .update({"status": "executing"})
+        .eq("id", goal_id)
+        .in_("status", list(allowed_prior_statuses))
+        .execute()
+    )
+    rows = res.data or []
+    return rows[0] if rows else None
+
+
+def merge_buffered_telegram_burst(
+    buffered_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Combine rapid-fire consecutive messages from (chat_id, user_id) into one turn."""
+    texts: list[str] = []
+    photo_file_ids: list[str] = []
+    voice_file_ids: list[str] = []
+    document_file_ids: list[str] = []
+    reply_to_message_id: int | None = None
+    latest_message_id: int | None = None
+
+    for row in sorted(buffered_rows, key=lambda r: int(r.get("telegram_update_id", 0))):
+        payload = row.get("raw_payload") or {}
+        msg = payload.get("message") or payload.get("edited_message") or {}
+        if msg.get("message_id"):
+            latest_message_id = int(msg["message_id"])
+        reply_mid = (msg.get("reply_to_message") or {}).get("message_id")
+        if reply_mid and reply_to_message_id is None:
+            reply_to_message_id = int(reply_mid)
+
+        txt = (msg.get("text") or msg.get("caption") or "").strip()
+        if txt:
+            texts.append(txt)
+        if msg.get("photo"):
+            photo_file_ids.append(msg["photo"][-1]["file_id"])
+        voice = msg.get("voice") or msg.get("audio")
+        if voice and voice.get("file_id"):
+            voice_file_ids.append(voice["file_id"])
+        doc = msg.get("document")
+        if doc and doc.get("file_id"):
+            document_file_ids.append(doc["file_id"])
+
+    return {
+        "combined_text": "\n".join(texts).strip(),
+        "photo_file_ids": photo_file_ids,
+        "voice_file_ids": voice_file_ids,
+        "document_file_ids": document_file_ids,
+        "reply_to_message_id": reply_to_message_id,
+        "latest_message_id": latest_message_id,
+        "update_count": len(buffered_rows),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Hardening #4: Missing-Slot Checker for New Customer Onboarding (X, Y, Z)
+# ---------------------------------------------------------------------------
+def compute_missing_customer_onboarding_slots(slots: dict[str, Any]) -> list[str]:
+    """Require strictly Full Name + Site Area/Landmark + Rough Scope for new customers."""
+    missing: list[str] = []
+    for key in NEW_CUSTOMER_REQUIRED_SLOTS:
+        val = slots.get(key)
+        if val is None or not str(val).strip():
+            missing.append(key)
+    return missing
+
+
+# ---------------------------------------------------------------------------
+# Hardening #5: Zoho Standard Plan Idempotency Key & Error Classifier
+# ---------------------------------------------------------------------------
+def make_zoho_reference_number(goal_id: str, step_index: int) -> str:
+    """Deterministic <=36-char Zoho reference_number so retries never double-post."""
+    compact = goal_id.replace("-", "")[:16].upper()
+    return f"MUNIM-{compact}-S{step_index}"
+
+
+def build_zoho_standard_order_tags(
+    *,
+    project_code: str | None,
+    zoho_tag_id: str | None,
+    zoho_tag_option_id: str | None,
+    custom_field_api_name: str = "cf_project_code",
+) -> dict[str, Any]:
+    """Build Zoho Books Standard Plan (~₹749/mo) Reporting Tag + Custom Field payload."""
+    extra: dict[str, Any] = {}
+    if zoho_tag_id and zoho_tag_option_id:
+        extra["tags"] = [{"tag_id": zoho_tag_id, "tag_option_id": zoho_tag_option_id}]
+    if project_code and custom_field_api_name:
+        extra["custom_fields"] = [
+            {"api_name": custom_field_api_name, "value": project_code}
+        ]
+    return extra
+
+
+def classify_external_error(
+    status_code: int | None, is_timeout: bool = False
+) -> StepErrorKind:
+    """Split transient infra errors (silent Cloud Tasks backoff) vs 400 data errors (LLM repair)."""
+    if is_timeout or status_code is None:
+        return "transient_5xx"
+    if status_code == 429 or status_code >= 500:
+        return "transient_5xx"
+    if 400 <= status_code < 500:
+        return "validation_400"
+    return "none"
+
+
+# ---------------------------------------------------------------------------
+# Hardening #6: Mandatory Voice Transcript Echo + Indian Rupee Formatter
+# ---------------------------------------------------------------------------
+def format_voice_receipt_header(heard_transcript: str | None) -> str:
+    """Always echo the recognized Hinglish voice line at the top of voice replies."""
+    clean = (heard_transcript or "").strip()
+    if not clean:
+        return ""
+    return f'🎙️ Heard: _"{clean}"_\n'
+
+
+def format_inr(amount: float | Decimal | int) -> str:
+    """Format monetary values using Indian en-IN grouping (e.g., ₹23,00,000 or ₹1,15,000.50)."""
+    quant = Decimal(str(amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    sign = "-" if quant < 0 else ""
+    abs_val = abs(quant)
+    int_part = int(abs_val)
+    frac_part = abs_val - Decimal(int_part)
+
+    s = str(int_part)
+    if len(s) > 3:
+        last3 = s[-3:]
+        rest = s[:-3]
+        groups: list[str] = []
+        while len(rest) > 2:
+            groups.insert(0, rest[-2:])
+            rest = rest[:-2]
+        if rest:
+            groups.insert(0, rest)
+        grouped = ",".join(groups) + "," + last3
+    else:
+        grouped = s
+
+    if frac_part > 0:
+        frac_str = f"{frac_part:.2f}"[1:]
+        return f"{sign}₹{grouped}{frac_str}"
+    return f"{sign}₹{grouped}"
+
+
+# ---------------------------------------------------------------------------
+# Reversible 1-Tap [↩️ Undo] Snapshot Builder for Production Stage Moves
+# ---------------------------------------------------------------------------
+def build_stage_undo_snapshot(
+    *,
+    track: Literal["pipeline", "material", "payment", "item"],
+    row_before: dict[str, Any],
+) -> dict[str, Any]:
+    """Capture exact pre-mutation columns so 1-tap [Undo] restores cleanly."""
+    if track == "pipeline":
+        return {
+            "pipeline_stage": row_before.get("pipeline_stage"),
+            "pipeline_stage_at": row_before.get("pipeline_stage_at"),
+            "current_owner_ids": list(row_before.get("current_owner_ids") or []),
+            "estimator_ids": list(row_before.get("estimator_ids") or []),
+            "sizing_mistri_id": row_before.get("sizing_mistri_id"),
+            "boq_scope_changed": bool(row_before.get("boq_scope_changed", False)),
+        }
+    if track == "material":
+        return {
+            "material_stage": row_before.get("material_stage"),
+            "material_stage_at": row_before.get("material_stage_at"),
+            "material_owner_id": row_before.get("material_owner_id"),
+        }
+    if track == "payment":
+        return {
+            "payment_stage": row_before.get("payment_stage"),
+            "payment_stage_at": row_before.get("payment_stage_at"),
+        }
+    return {
+        "stage": row_before.get("stage"),
+        "stage_entered_at": row_before.get("stage_entered_at"),
+        "production_mistri_id": row_before.get("production_mistri_id"),
+        "assembly_mistri_id": row_before.get("assembly_mistri_id"),
+        "qc_passed_by_id": row_before.get("qc_passed_by_id"),
+        "qc_passed_at": row_before.get("qc_passed_at"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Domain 2 HR: Worker Photo Attendance Worked Minutes & >6:00 PM IST Overtime
+# ---------------------------------------------------------------------------
+def compute_ist_attendance_minutes(
+    check_in_at: datetime,
+    check_out_at: datetime,
+    shift_end_ist: dt_time = dt_time(18, 0),
+) -> tuple[int, int]:
+    """Return (worked_minutes, overtime_minutes_past_6pm_ist) from check-in/out timestamps."""
+    in_ist = check_in_at.astimezone(IST)
+    out_ist = check_out_at.astimezone(IST)
+    if out_ist <= in_ist:
+        return 0, 0
+
+    worked_minutes = int((out_ist - in_ist).total_seconds() // 60)
+    cutoff_ist = datetime.combine(in_ist.date(), shift_end_ist, tzinfo=IST)
+    ot_start = max(in_ist, cutoff_ist)
+    overtime_minutes = (
+        int((out_ist - ot_start).total_seconds() // 60) if out_ist > ot_start else 0
+    )
+    return worked_minutes, overtime_minutes

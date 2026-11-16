@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, status
 from app.config import Settings, get_settings
 from app.db import get_supabase_admin
 from app.services import sheets_backup, telegram_api, zoho
+from app.services.goal_primitives import format_inr
 
 router = APIRouter(prefix="/cron", tags=["cron"])
 
@@ -24,7 +25,7 @@ async def morning_brief(
     x_cron_secret: str | None = Header(default=None),
     settings: Settings = Depends(get_settings),
 ) -> dict[str, Any]:
-    """08:30 IST Daily Morning Brief split into Floor Brief (price-free) & Accounts Brief."""
+    """08:30 IST Anti-Spam Daily Brief for Production + Munim (including Needs Info footer)."""
     _verify_cron_secret(x_cron_secret, settings.cron_auth_secret)
     sb = get_supabase_admin()
 
@@ -33,7 +34,7 @@ async def morning_brief(
 
     upcoming_projects = (
         sb.table("projects")
-        .select("project_code,customer_name,promised_delivery_date")
+        .select("project_code,customer_name,promised_delivery_date,pipeline_stage")
         .eq("status", "active")
         .eq("project_type", "customer")
         .lte("promised_delivery_date", three_days)
@@ -42,39 +43,12 @@ async def morning_brief(
         .data
         or []
     )
-    mat_pending = (
-        sb.table("project_items")
-        .select("id")
-        .eq("stage", "material_pending")
-        .execute()
-        .data
-        or []
-    )
-    purchase_items = (
-        sb.table("v_master_purchase_list")
-        .select("material_name")
-        .execute()
-        .data
-        or []
-    )
-    open_followups = (
-        sb.table("followups")
-        .select("name,due_date,action_note")
-        .eq("status", "open")
-        .lte("due_date", today.isoformat())
-        .limit(5)
-        .execute()
-        .data
-        or []
-    )
-    unverified_cash = (
-        sb.table("cash_ledger")
-        .select("id")
-        .eq("verified_by_staff", False)
-        .execute()
-        .data
-        or []
-    )
+    wdw = sb.table("v_whos_doing_what").select("*").execute().data or []
+    stale_items = [w for w in wdw if int(w.get("days_in_stage") or 0) >= 3]
+    ansh_pending = [w for w in wdw if w.get("work_kind") == "material_track"]
+    packed_gate = [w for w in wdw if w.get("stage_code") == "packed_ready"]
+
+    needs_info = sb.table("v_needs_info_queue").select("goal_id,summary_title,status").limit(5).execute().data or []
     pnl_rows = (
         sb.table("v_project_pnl")
         .select("customer_name,balance_pending")
@@ -89,71 +63,63 @@ async def morning_brief(
     )
 
     due_summary = (
-        ", ".join(
-            f"{p['customer_name']} ({p['promised_delivery_date']})"
-            for p in upcoming_projects[:4]
-        )
-        or "None due in next 3 days"
+        ", ".join(f"{p['customer_name']} ({p['promised_delivery_date']})" for p in upcoming_projects[:4])
+        or "None due ≤3d"
     )
-    followup_summary = (
-        ", ".join(f"{f['name']}: {f['action_note']}" for f in open_followups[:3])
-        or "No overdue follow-ups"
+    stale_summary = (
+        ", ".join(f"{s['customer_name']} [{s['stage_label']} · {s['days_in_stage']}d]" for s in stale_items[:4])
+        or "Nothing stuck ≥3d"
     )
     receivables_summary = (
-        ", ".join(
-            f"{r['customer_name']} (₹{float(r.get('balance_pending') or 0):,.0f})"
-            for r in pnl_rows
-        )
+        ", ".join(f"{r['customer_name']} ({format_inr(float(r.get('balance_pending') or 0))})" for r in pnl_rows)
         or "All caught up"
     )
-
-    floor_brief = (
-        f"☀️ *Workshop Floor — Morning Brief ({today.strftime('%d %b')})*\n\n"
-        f"• *Deliveries Due (≤3d):* {due_summary}\n"
-        f"• *Material Blocked:* {len(mat_pending)} piece(s) waiting | {len(purchase_items)} line(s) on Purchase List\n"
-        f"• *Follow-Ups Due:* {followup_summary}"
+    needs_footer = (
+        f"\n\n📌 *Needs Info / Clerk Queue ({len(needs_info)}):* "
+        + "; ".join(n.get("summary_title") or n["status"] for n in needs_info[:3])
+        if needs_info
+        else ""
     )
-    accounts_brief = (
-        f"📒 *Munim & Accounts — Morning Brief ({today.strftime('%d %b')})*\n\n"
-        f"• *Unverified Cash Entries:* {len(unverified_cash)} awaiting staff check\n"
+
+    prod_brief = (
+        f"☀️ *Production Morning Brief ({today.strftime('%d %b')})*\n\n"
+        f"• *Deliveries Due (≤3d):* {due_summary}\n"
+        f"• *Stuck ≥3 Days:* {stale_summary}\n"
+        f"• *Ansh Material Queue:* {len(ansh_pending)} order(s) | *Packed / Ready Gate:* {len(packed_gate)} piece(s)"
+        f"{needs_footer}"
+    )
+    munim_brief = (
+        f"📒 *Munim Morning Brief ({today.strftime('%d %b')})*\n\n"
         f"• *Top Pending Receivables:* {receivables_summary}\n"
         f"• *Deliveries Due (≤3d):* {due_summary}"
+        f"{needs_footer}"
     )
 
-    kb = {
-        "inline_keyboard": [[
-            {"text": "📊 Open Dashboard", "url": settings.app_base_url}
-        ]]
-    }
+    prod_kb = {"inline_keyboard": [[{"text": "🏭 Open Production", "url": f"{settings.app_base_url.rstrip('/')}/production"}]]}
+    munim_kb = {"inline_keyboard": [[{"text": "📒 Open Munim", "url": f"{settings.app_base_url.rstrip('/')}/munim"}]]}
 
     sent_targets: list[str] = []
     if settings.telegram_bot_token:
-        floor_target = settings.telegram_floor_chat_id.strip()
-        accounts_target = settings.telegram_accounts_chat_id.strip()
+        prod_target = settings.effective_production_chat_id
+        munim_target = settings.effective_munim_chat_id
 
-        if floor_target:
-            await telegram_api.send_message(
-                chat_id=floor_target, text=floor_brief, reply_markup=kb
-            )
-            sent_targets.append(f"floor:{floor_target}")
+        if prod_target:
+            await telegram_api.send_message(chat_id=prod_target, text=prod_brief, reply_markup=prod_kb)
+            sent_targets.append(f"production:{prod_target}")
 
-        if accounts_target:
-            await telegram_api.send_message(
-                chat_id=accounts_target, text=accounts_brief, reply_markup=kb
-            )
-            sent_targets.append(f"accounts:{accounts_target}")
+        if munim_target:
+            await telegram_api.send_message(chat_id=munim_target, text=munim_brief, reply_markup=munim_kb)
+            sent_targets.append(f"munim:{munim_target}")
 
-        if not floor_target and not accounts_target:
+        if not prod_target and not munim_target:
             fallback = settings.telegram_morning_brief_chat_id.strip() or (
-                str(next(iter(settings.allowed_telegram_id_set)))
-                if settings.allowed_telegram_id_set
-                else ""
+                str(next(iter(settings.allowed_telegram_id_set))) if settings.allowed_telegram_id_set else ""
             )
             if fallback:
                 await telegram_api.send_message(
                     chat_id=fallback,
-                    text=f"{floor_brief}\n• *Staff Review:* {len(unverified_cash)} unverified cash entry/entries",
-                    reply_markup=kb,
+                    text=f"{prod_brief}\n• *Receivables:* {receivables_summary}",
+                    reply_markup=prod_kb,
                 )
                 sent_targets.append(f"fallback:{fallback}")
 
@@ -165,11 +131,12 @@ async def nightly_sync(
     x_cron_secret: str | None = Header(default=None),
     settings: Settings = Depends(get_settings),
 ) -> dict[str, Any]:
-    """02:00 IST Zoho financial cache refresh + one-way read-only Google Sheet backup."""
+    """02:00 IST Zoho Owner Pulse balance sync + read-only Google Sheet backup."""
     _verify_cron_secret(x_cron_secret, settings.cron_auth_secret)
     sb = get_supabase_admin()
-    zoho_res = await zoho.sync_project_financial_caches(sb)
+    pulse_res = await zoho.sync_owner_pulse_snapshot(sb)
     sheet_res = sheets_backup.export_readonly_sheet_snapshot(sb)
     cutoff = (date.today() - timedelta(days=30)).isoformat()
-    sb.table("telegram_state").delete().lt("created_at", f"{cutoff}T00:00:00Z").execute()
-    return {"ok": True, "zoho": zoho_res, "sheets": sheet_res}
+    sb.table("telegram_webhook_dedup").delete().lt("received_at", f"{cutoff}T00:00:00Z").execute()
+    sb.table("telegram_inbox_buffer").delete().eq("status", "processed").lt("created_at", f"{cutoff}T00:00:00Z").execute()
+    return {"ok": True, "zoho_pulse": pulse_res, "sheets": sheet_res}

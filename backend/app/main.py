@@ -1,16 +1,17 @@
 from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.config import get_settings
-from app.routers import cron, dashboard, telegram
+from app.routers import cron, dashboard, domains, telegram
 
 settings = get_settings()
 
 app = FastAPI(
     title="Workshop Munim OS API",
-    version="0.1.0",
+    version="0.2.0",
     docs_url="/docs" if settings.app_env != "production" else None,
     redoc_url=None,
 )
@@ -30,10 +31,19 @@ async def health() -> dict[str, str]:
 
 
 app.include_router(telegram.router)
+app.include_router(domains.router)
 app.include_router(dashboard.router)
 app.include_router(cron.router)
 
-# Serve built React PWA / Telegram Mini App when running in single-container Cloud Run
+# Serve built React PWA / Telegram Mini App (/production and /munim deep links supported)
 FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
 if FRONTEND_DIST.exists():
+    @app.get("/production")
+    @app.get("/production/{rest_of_path:path}")
+    @app.get("/munim")
+    @app.get("/munim/{rest_of_path:path}")
+    async def spa_domain_routes(rest_of_path: str = "") -> FileResponse:
+        _ = rest_of_path
+        return FileResponse(str(FRONTEND_DIST / "index.html"))
+
     app.mount("/", StaticFiles(directory=str(FRONTEND_DIST), html=True), name="frontend")

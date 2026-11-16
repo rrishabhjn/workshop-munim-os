@@ -562,3 +562,542 @@ async def sync_cash_entry_to_zoho(
     except httpx.HTTPError as exc:
         logger.warning("Zoho sync_cash_entry_to_zoho failed: %s", exc)
         return {"synced": False, "error": f"Zoho request timed out or failed: {exc}"}
+
+
+# ===========================================================================
+# Phase 2: Zoho Books Standard Plan (~₹749/mo, GST-Off Management Ledger)
+#   - 1:1 Reporting Tag Option + Custom Field Order Auto-Bridge
+#   - Deterministic reference_number Idempotency Lookup before Retry
+#   - Multi-Account Instant Push (Banks, Cash Galla, Supervisor Floats)
+#   - Draft-Only Supplier Bills & Owner Pulse Sync
+# ===========================================================================
+from app.services.goal_primitives import (
+    build_zoho_standard_order_tags,
+    classify_external_error,
+)
+
+
+async def _find_existing_by_reference(
+    client: httpx.AsyncClient,
+    list_path: str,
+    list_key: str,
+    id_field: str,
+    reference_number: str,
+) -> str | None:
+    """Query Zoho by reference_number before retrying so timeouts never double-post."""
+    if not reference_number:
+        return None
+    try:
+        resp = await _zoho_request(
+            client, "GET", list_path, params={"reference_number": reference_number}
+        )
+        if not resp.is_success:
+            return None
+        rows = resp.json().get(list_key, []) or []
+        for row in rows:
+            if (row.get("reference_number") or "").strip() == reference_number:
+                return str(row.get(id_field) or "")
+    except httpx.HTTPError:
+        return None
+    return None
+
+
+async def ensure_project_zoho_bridge(sb: Any, project_id: str) -> dict[str, Any]:
+    """Smart Auto-Bridge on Zoho Standard Plan:
+    Ensures Zoho Customer Contact + 1:1 Zoho 'Project' Reporting Tag option exist
+    when an order converts (Advance In / Site Sizing / first financial entry).
+    """
+    prj_rows = (
+        sb.table("projects")
+        .select("id,project_code,customer_id,customer_name,phone,zoho_contact_id,zoho_tag_id,zoho_tag_option_id,cf_project_code")
+        .eq("id", project_id)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    if not prj_rows:
+        return {"ok": False, "error": "Project not found in Supabase."}
+    prj = prj_rows[0]
+
+    settings = get_settings()
+    if not settings.zoho_enabled:
+        return {
+            "ok": True,
+            "stubbed": True,
+            "zoho_contact_id": prj.get("zoho_contact_id"),
+            "zoho_tag_id": prj.get("zoho_tag_id"),
+            "zoho_tag_option_id": prj.get("zoho_tag_option_id"),
+            "cf_project_code": prj.get("cf_project_code") or prj["project_code"],
+        }
+
+    zoho_contact_id = prj.get("zoho_contact_id")
+    cust_row: dict[str, Any] | None = None
+    if prj.get("customer_id"):
+        c_data = (
+            sb.table("customers")
+            .select("id,full_name,area_landmark,phone,zoho_contact_id")
+            .eq("id", prj["customer_id"])
+            .limit(1)
+            .execute()
+            .data
+        )
+        cust_row = c_data[0] if c_data else None
+        if cust_row and cust_row.get("zoho_contact_id"):
+            zoho_contact_id = cust_row["zoho_contact_id"]
+
+    # 1. Ensure Zoho Customer Contact
+    if not zoho_contact_id:
+        display_name = prj["customer_name"]
+        if cust_row and cust_row.get("area_landmark"):
+            display_name = f"{cust_row['full_name']} ({cust_row['area_landmark']})"
+        c_res = await resolve_or_create_contact(
+            sb,
+            display_name,
+            "customer",
+            phone=(cust_row or {}).get("phone") or prj.get("phone"),
+        )
+        if c_res.get("contact_id"):
+            zoho_contact_id = c_res["contact_id"]
+            if cust_row:
+                sb.table("customers").update({"zoho_contact_id": zoho_contact_id}).eq(
+                    "id", cust_row["id"]
+                ).execute()
+
+    # 2. Ensure Zoho Reporting Tag Option (Standard Plan replacement for Zoho Projects)
+    tag_id = prj.get("zoho_tag_id") or settings.zoho_project_tag_id or None
+    tag_option_id = prj.get("zoho_tag_option_id")
+    option_label = f"{prj['project_code']} - {prj['customer_name']}"[:95]
+
+    if tag_id and not tag_option_id:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                tag_resp = await _zoho_request(client, "GET", f"/settings/tags/{tag_id}")
+                if tag_resp.is_success:
+                    tag_obj = tag_resp.json().get("reporting_tag") or tag_resp.json().get("tag") or {}
+                    opts = tag_obj.get("tag_options") or []
+                    existing_opt = next(
+                        (
+                            o
+                            for o in opts
+                            if prj["project_code"].lower() in (o.get("tag_option_name") or "").lower()
+                        ),
+                        None,
+                    )
+                    if existing_opt:
+                        tag_option_id = str(existing_opt.get("tag_option_id"))
+                    else:
+                        add_resp = await _zoho_request(
+                            client,
+                            "POST",
+                            f"/settings/tags/{tag_id}/options",
+                            json_body={"tag_option_name": option_label},
+                        )
+                        if add_resp.is_success:
+                            created_opt = (
+                                add_resp.json().get("tag_option")
+                                or (add_resp.json().get("tag_options") or [{}])[0]
+                            )
+                            tag_option_id = str(created_opt.get("tag_option_id") or "") or None
+        except httpx.HTTPError as exc:
+            logger.warning("Zoho Reporting Tag option auto-create skipped: %s", exc)
+
+    patch: dict[str, Any] = {
+        "cf_project_code": prj.get("cf_project_code") or prj["project_code"],
+    }
+    if zoho_contact_id:
+        patch["zoho_contact_id"] = zoho_contact_id
+    if tag_id:
+        patch["zoho_tag_id"] = tag_id
+    if tag_option_id:
+        patch["zoho_tag_option_id"] = tag_option_id
+    sb.table("projects").update(patch).eq("id", project_id).execute()
+
+    return {
+        "ok": True,
+        "stubbed": False,
+        "zoho_contact_id": zoho_contact_id,
+        "zoho_tag_id": tag_id,
+        "zoho_tag_option_id": tag_option_id,
+        "cf_project_code": patch["cf_project_code"],
+    }
+
+
+async def _resolve_zoho_paid_account_id(
+    client: httpx.AsyncClient, sb: Any, payment_account_row: dict[str, Any]
+) -> str | None:
+    """Resolve Zoho Books account_id for one of the 13 canonical payment_accounts."""
+    if payment_account_row.get("zoho_account_id"):
+        return str(payment_account_row["zoho_account_id"])
+
+    resp = await _zoho_request(client, "GET", "/bankaccounts")
+    if resp.is_success:
+        b_accs = resp.json().get("bankaccounts") or []
+        names_to_try = [
+            payment_account_row["display_name"].lower(),
+            payment_account_row["code"].lower(),
+            *[a.lower() for a in (payment_account_row.get("aliases") or [])],
+        ]
+        for ba in b_accs:
+            aname = (ba.get("account_name") or "").strip().lower()
+            if any(n in aname or aname in n for n in names_to_try if n):
+                zid = str(ba["account_id"])
+                sb.table("payment_accounts").update({"zoho_account_id": zid}).eq(
+                    "id", payment_account_row["id"]
+                ).execute()
+                return zid
+    return None
+
+
+async def push_management_entry_to_zoho(
+    sb: Any,
+    *,
+    entry_kind: str,  # 'customer_receipt' | 'vendor_payment' | 'expense' | 'float_transfer'
+    amount_inr: float,
+    payment_account_id: str,
+    to_payment_account_id: str | None = None,
+    reference_number: str,
+    txn_date: str | None = None,
+    party_name: str = "",
+    zoho_contact_id: str | None = None,
+    project_id: str | None = None,
+    notes: str = "",
+    actor_label: str = "Munim",
+) -> dict[str, Any]:
+    """Push a confirmed management ledger transaction to Zoho Books India (GST-off Standard Plan)
+    with reference_number idempotency and 1:1 Project Reporting Tag linking.
+    """
+    settings = get_settings()
+    acc_rows = (
+        sb.table("payment_accounts")
+        .select("*")
+        .eq("id", payment_account_id)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    if not acc_rows:
+        return {
+            "ok": False,
+            "status_code": 400,
+            "error_kind": "validation_400",
+            "error": {"message": "Payment account is required (e.g., Cash Galla, Axis, Float)."},
+        }
+    from_acc = acc_rows[0]
+
+    bridge: dict[str, Any] = {}
+    if project_id:
+        bridge = await ensure_project_zoho_bridge(sb, project_id)
+        if not zoho_contact_id and entry_kind == "customer_receipt":
+            zoho_contact_id = bridge.get("zoho_contact_id")
+
+    if not settings.zoho_enabled:
+        return {
+            "ok": True,
+            "stubbed": True,
+            "status_code": 200,
+            "error_kind": "none",
+            "zoho_type": entry_kind,
+            "zoho_id": f"STUB-{reference_number}",
+            "account_name": from_acc["display_name"],
+        }
+
+    order_tags = build_zoho_standard_order_tags(
+        project_code=bridge.get("cf_project_code"),
+        zoho_tag_id=bridge.get("zoho_tag_id") or settings.zoho_project_tag_id,
+        zoho_tag_option_id=bridge.get("zoho_tag_option_id"),
+        custom_field_api_name=settings.zoho_project_custom_field,
+    )
+    desc = f"[{actor_label}] {party_name} {notes}".strip()[:250]
+
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            from_zoho_acc = await _resolve_zoho_paid_account_id(client, sb, from_acc)
+            if not from_zoho_acc:
+                return {
+                    "ok": False,
+                    "status_code": 400,
+                    "error_kind": "validation_400",
+                    "error": {
+                        "message": f"Account '{from_acc['display_name']}' is not yet mapped to a Zoho Books Bank/Cash/Petty-Cash account."
+                    },
+                }
+
+            if entry_kind == "float_transfer":
+                if not to_payment_account_id:
+                    return {
+                        "ok": False,
+                        "status_code": 400,
+                        "error_kind": "validation_400",
+                        "error": {"message": "Destination account/float is required for a transfer."},
+                    }
+                to_rows = (
+                    sb.table("payment_accounts")
+                    .select("*")
+                    .eq("id", to_payment_account_id)
+                    .limit(1)
+                    .execute()
+                    .data
+                    or []
+                )
+                to_zoho_acc = (
+                    await _resolve_zoho_paid_account_id(client, sb, to_rows[0])
+                    if to_rows
+                    else None
+                )
+                if not to_zoho_acc:
+                    return {
+                        "ok": False,
+                        "status_code": 400,
+                        "error_kind": "validation_400",
+                        "error": {"message": "Destination Zoho account is not mapped yet."},
+                    }
+                existing_id = await _find_existing_by_reference(
+                    client, "/banktransactions", "banktransactions", "transaction_id", reference_number
+                )
+                if existing_id:
+                    return {
+                        "ok": True,
+                        "status_code": 200,
+                        "error_kind": "none",
+                        "zoho_type": "transfer_fund",
+                        "zoho_id": existing_id,
+                        "deduped": True,
+                    }
+                payload = {
+                    "transaction_type": "transfer_fund",
+                    "from_account_id": from_zoho_acc,
+                    "to_account_id": to_zoho_acc,
+                    "amount": round(float(amount_inr), 2),
+                    "reference_number": reference_number,
+                    "description": desc,
+                    **({"date": txn_date} if txn_date else {}),
+                }
+                resp = await _zoho_request(client, "POST", "/banktransactions", json_body=payload)
+                if resp.is_success:
+                    tid = (resp.json().get("banktransaction") or {}).get("transaction_id")
+                    return {
+                        "ok": True,
+                        "status_code": resp.status_code,
+                        "error_kind": "none",
+                        "zoho_type": "transfer_fund",
+                        "zoho_id": tid,
+                    }
+                return {
+                    "ok": False,
+                    "status_code": resp.status_code,
+                    "error_kind": classify_external_error(resp.status_code),
+                    "error": resp.json() if "json" in resp.headers.get("content-type", "") else {"message": resp.text[:240]},
+                }
+
+            if entry_kind == "customer_receipt":
+                existing_id = await _find_existing_by_reference(
+                    client, "/customerpayments", "customerpayments", "payment_id", reference_number
+                )
+                if existing_id:
+                    return {
+                        "ok": True,
+                        "status_code": 200,
+                        "error_kind": "none",
+                        "zoho_type": "customer_payment",
+                        "zoho_id": existing_id,
+                        "deduped": True,
+                    }
+                if not zoho_contact_id and party_name:
+                    c_res = await resolve_or_create_contact(sb, party_name, "customer")
+                    zoho_contact_id = c_res.get("contact_id")
+                if not zoho_contact_id:
+                    return {
+                        "ok": False,
+                        "status_code": 400,
+                        "error_kind": "validation_400",
+                        "error": {"message": f"Customer '{party_name}' could not be resolved in Zoho Books."},
+                    }
+                payload = {
+                    "customer_id": zoho_contact_id,
+                    "account_id": from_zoho_acc,
+                    "payment_mode": "cash" if from_acc["account_kind"] in ("cash_galla", "supervisor_float") else "banktransfer",
+                    "amount": round(float(amount_inr), 2),
+                    "reference_number": reference_number,
+                    "description": desc,
+                    **({"date": txn_date} if txn_date else {}),
+                    **order_tags,
+                }
+                resp = await _zoho_request(client, "POST", "/customerpayments", json_body=payload)
+                if resp.is_success:
+                    pid = (resp.json().get("payment") or {}).get("payment_id")
+                    return {
+                        "ok": True,
+                        "status_code": resp.status_code,
+                        "error_kind": "none",
+                        "zoho_type": "customer_payment",
+                        "zoho_id": pid,
+                    }
+                return {
+                    "ok": False,
+                    "status_code": resp.status_code,
+                    "error_kind": classify_external_error(resp.status_code),
+                    "error": resp.json() if "json" in resp.headers.get("content-type", "") else {"message": resp.text[:240]},
+                }
+
+            if entry_kind == "vendor_payment":
+                existing_id = await _find_existing_by_reference(
+                    client, "/vendorpayments", "vendorpayments", "payment_id", reference_number
+                )
+                if existing_id:
+                    return {
+                        "ok": True,
+                        "status_code": 200,
+                        "error_kind": "none",
+                        "zoho_type": "vendor_payment",
+                        "zoho_id": existing_id,
+                        "deduped": True,
+                    }
+                if not zoho_contact_id and party_name:
+                    c_res = await resolve_or_create_contact(sb, party_name, "vendor")
+                    zoho_contact_id = c_res.get("contact_id")
+                if not zoho_contact_id:
+                    return {
+                        "ok": False,
+                        "status_code": 400,
+                        "error_kind": "validation_400",
+                        "error": {"message": f"Vendor '{party_name}' could not be resolved in Zoho Books."},
+                    }
+                payload = {
+                    "vendor_id": zoho_contact_id,
+                    "paid_through_account_id": from_zoho_acc,
+                    "amount": round(float(amount_inr), 2),
+                    "reference_number": reference_number,
+                    "description": desc,
+                    **({"date": txn_date} if txn_date else {}),
+                    **order_tags,
+                }
+                resp = await _zoho_request(client, "POST", "/vendorpayments", json_body=payload)
+                if resp.is_success:
+                    vpid = (resp.json().get("vendorpayment") or {}).get("payment_id")
+                    return {
+                        "ok": True,
+                        "status_code": resp.status_code,
+                        "error_kind": "none",
+                        "zoho_type": "vendor_payment",
+                        "zoho_id": vpid,
+                    }
+                return {
+                    "ok": False,
+                    "status_code": resp.status_code,
+                    "error_kind": classify_external_error(resp.status_code),
+                    "error": resp.json() if "json" in resp.headers.get("content-type", "") else {"message": resp.text[:240]},
+                }
+
+            # Default: non-GST Management Expense
+            existing_id = await _find_existing_by_reference(
+                client, "/expenses", "expenses", "expense_id", reference_number
+            )
+            if existing_id:
+                return {
+                    "ok": True,
+                    "status_code": 200,
+                    "error_kind": "none",
+                    "zoho_type": "expense",
+                    "zoho_id": existing_id,
+                    "deduped": True,
+                }
+            coa_resp = await _zoho_request(client, "GET", "/chartofaccounts")
+            accounts = coa_resp.json().get("chartofaccounts", []) if coa_resp.is_success else []
+            expense_acc = next(
+                (a["account_id"] for a in accounts if a.get("account_type") in ("expense", "cost_of_goods_sold") and a.get("is_active")),
+                None,
+            )
+            if not expense_acc:
+                return {
+                    "ok": False,
+                    "status_code": 400,
+                    "error_kind": "validation_400",
+                    "error": {"message": "No active Expense account found in Zoho Chart of Accounts."},
+                }
+            exp_payload = {
+                "account_id": expense_acc,
+                "paid_through_account_id": from_zoho_acc,
+                "amount": round(float(amount_inr), 2),
+                "reference_number": reference_number,
+                "description": desc,
+                "is_inclusive_tax": False,
+                **({"date": txn_date} if txn_date else {}),
+                **order_tags,
+            }
+            resp = await _zoho_request(client, "POST", "/expenses", json_body=exp_payload)
+            if resp.is_success:
+                eid = (resp.json().get("expense") or {}).get("expense_id")
+                return {
+                    "ok": True,
+                    "status_code": resp.status_code,
+                    "error_kind": "none",
+                    "zoho_type": "expense",
+                    "zoho_id": eid,
+                }
+            return {
+                "ok": False,
+                "status_code": resp.status_code,
+                "error_kind": classify_external_error(resp.status_code),
+                "error": resp.json() if "json" in resp.headers.get("content-type", "") else {"message": resp.text[:240]},
+            }
+    except httpx.TimeoutException as exc:
+        return {
+            "ok": False,
+            "status_code": None,
+            "error_kind": "transient_5xx",
+            "error": {"message": f"Zoho timeout: {exc}"},
+        }
+    except httpx.HTTPError as exc:
+        return {
+            "ok": False,
+            "status_code": 503,
+            "error_kind": "transient_5xx",
+            "error": {"message": f"Zoho network error: {exc}"},
+        }
+
+
+async def sync_owner_pulse_snapshot(sb: Any) -> dict[str, Any]:
+    """Refresh Zoho Bank/Cash/Float balances into payment_accounts.cached_balance_inr."""
+    settings = get_settings()
+    if not settings.zoho_enabled:
+        return {"ok": True, "stubbed": True, "accounts_synced": 0}
+
+    synced = 0
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await _zoho_request(client, "GET", "/bankaccounts")
+            if not resp.is_success:
+                return {"ok": False, "error": f"Zoho /bankaccounts HTTP {resp.status_code}"}
+            zoho_accs = resp.json().get("bankaccounts") or []
+            local_accs = sb.table("payment_accounts").select("*").eq("is_active", True).execute().data or []
+            for la in local_accs:
+                match = None
+                if la.get("zoho_account_id"):
+                    match = next((z for z in zoho_accs if str(z.get("account_id")) == str(la["zoho_account_id"])), None)
+                if not match:
+                    candidates = [la["display_name"].lower(), la["code"].lower(), *[a.lower() for a in (la.get("aliases") or [])]]
+                    match = next(
+                        (
+                            z
+                            for z in zoho_accs
+                            if any(c in (z.get("account_name") or "").lower() for c in candidates if c)
+                        ),
+                        None,
+                    )
+                if match:
+                    sb.table("payment_accounts").update(
+                        {
+                            "zoho_account_id": str(match["account_id"]),
+                            "cached_balance_inr": round(float(match.get("balance") or 0), 2),
+                            "balance_synced_at": "now()",
+                        }
+                    ).eq("id", la["id"]).execute()
+                    synced += 1
+    except httpx.HTTPError as exc:
+        logger.warning("sync_owner_pulse_snapshot failed: %s", exc)
+        return {"ok": False, "error": str(exc)}
+
+    return {"ok": True, "stubbed": False, "accounts_synced": synced}
+

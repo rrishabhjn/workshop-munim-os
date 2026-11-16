@@ -93,12 +93,15 @@ def test_voice_capture_schema_parses_hinglish_actions():
 
 @pytest.mark.asyncio
 async def test_zoho_create_draft_bill_stubbed_without_creds():
-    res = await create_draft_bill(
-        supplier_name="Patel Plywood",
-        invoice_no="INV-101",
-        bill_date="2026-11-15",
-        line_items=[],
-    )
+    from app.config import Settings
+
+    with patch("app.services.zoho.get_settings", return_value=Settings(_env_file=None)):
+        res = await create_draft_bill(
+            supplier_name="Patel Plywood",
+            invoice_no="INV-101",
+            bill_date="2026-11-15",
+            line_items=[],
+        )
     assert res["stubbed"] is True
     assert res["status"] == "draft"
 
