@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field, model_validator
 _NULL_STRINGS = {"", "null", "none", "nil", "n/a", "na", "undefined", "unknown", "tbd"}
 _LIST_FIELDS = {"aliases", "payout_aliases", "role_tags", "estimator_ids", "choices", "repair_options", "goal_items"}
 _FLOAT_FIELDS = {"amount_inr", "quoted_total"}
-_JSON_STRING_FIELDS = {"material_lines_json", "bill_line_items_json", "slot_patch_json"}
+_JSON_STRING_FIELDS = {"material_lines_json", "bill_line_items_json", "slot_patch_json", "initial_items_json"}
 
 
 def _strip_json_fences(raw_text: str) -> str:
@@ -214,14 +214,39 @@ class GoalIntentItem(BaseModel):
     promised_delivery_date: str | None = None
     quoted_total: float | None = None
     to_stage: str | None = None
+    material_stage: str | None = Field(
+        default=None,
+        description="Optional material track stage for new_lead ('check_stock' = material needed/to order, 'ordered_pending' = ordered, 'all_in_shop' = in shop).",
+    )
     estimator_ids: list[str] = Field(default_factory=list)
     sizing_mistri_id: str | None = None
     boq_scope_changed: bool | None = None
     boq_scope_note: str | None = None
     item_id: str | None = None
-    item_name: str | None = None
-    dimensions: str | None = None
-    specs_notes: str | None = None
+    item_name: str | None = Field(
+        default=None,
+        description=(
+            "REQUIRED for item_upsert_or_move (and optional filter for item_material_upsert): exact furniture item name "
+            "(e.g. 'Mom Room (1) - 10ft Bed', 'Kitchen', 'Master Wardrobe'). CRITICAL: Always populate item_name directly — "
+            "never put the furniture name only inside summary_title."
+        ),
+    )
+    dimensions: str | None = Field(
+        default=None,
+        description="Furniture item dimensions/sizes when known (e.g. '42\"x89\"', 'Mattress 6ft x 6\\'6\", Back 10ft').",
+    )
+    specs_notes: str | None = Field(
+        default=None,
+        description="Production/material/laminate/fabric/hardware specifications from text or PDF (e.g. '19mm 15-layer ply, Hafele hinges, Sainik LS 5134').",
+    )
+    initial_items_json: str | None = Field(
+        default=None,
+        description=(
+            'For new_lead or update_order_details when a production PDF/photo or multi-item list specifies concrete furniture items: '
+            'JSON array string of [{"item_name":"Mom Room (1) - 10ft Bed","dimensions":"Mattress 6ft x 6\'6\\", Back 10ft","specs_notes":"32mm 15-layer ply, Shade 133/230, Sleepwell foam"}] '
+            'so every furniture item is auto-created under project_items.'
+        ),
+    )
     production_mistri_id: str | None = None
     assembly_mistri_id: str | None = None
     material_lines_json: str | None = Field(

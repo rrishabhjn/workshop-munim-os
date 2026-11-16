@@ -10,6 +10,7 @@ import uuid
 from app.services import step_executors
 from app.services.agent_core.schemas import _NULL_STRINGS
 from app.services.goal_primitives import (
+    MATERIAL_TRACK_STAGES,
     compute_missing_customer_onboarding_slots,
     normalize_or_infer_expense_category,
 )
@@ -460,6 +461,12 @@ def _sanitize_and_resolve_slot_ids(sb: Any, slots: dict[str, Any]) -> None:
         norm_st = step_executors.normalize_stage_code_for_op(op, str(slots["to_stage"]))
         if norm_st:
             slots["to_stage"] = norm_st
+    if slots.get("material_stage"):
+        norm_mat = step_executors.normalize_stage_code_for_op("material_stage_move", str(slots["material_stage"]))
+        if norm_mat in MATERIAL_TRACK_STAGES:
+            slots["material_stage"] = norm_mat
+        else:
+            slots.pop("material_stage", None)
     if slots.get("material_status"):
         slots["material_status"] = step_executors.normalize_material_status(str(slots["material_status"]))
     for dcol in ("promised_delivery_date", "txn_date"):
@@ -542,6 +549,102 @@ def _backfill_material_slots_from_text(
             slots["material_status"] = "needed"
 
 
+_ADD_ITEM_TITLE_RE = re.compile(
+    r"^(?:add|create|insert|new|include)\s+(?:furniture\s+item\s+|item\s+)?(.+?)\s+(?:to|on|in|for|under)\s+.+$",
+    re.IGNORECASE,
+)
+_INLINE_DIM_RE = re.compile(
+    r"(?<!\w)(\d+(?:\.\d+)?(?:\s*(?:ft|in|cm|mm|['\"]))?\s*[x×]\s*\d+(?:\.\d+)?(?:\s*(?:ft|in|cm|mm|['\"]))?)(?!\w)",
+    re.IGNORECASE,
+)
+
+
+def parse_initial_items_slot(slots: dict[str, Any]) -> list[dict[str, Any]]:
+    """Parse structured `initial_items_json`, falling back to semicolon/plus `rough_scope` blocks on `new_lead`."""
+    raw = slots.get("initial_items_json")
+    parsed: list[dict[str, Any]] = []
+    if raw:
+        loaded: Any = raw
+        if isinstance(raw, str):
+            try:
+                loaded = json.loads(raw)
+            except (TypeError, ValueError):
+                loaded = []
+        if isinstance(loaded, list):
+            for entry in loaded:
+                if isinstance(entry, dict):
+                    iname = str(entry.get("item_name") or entry.get("name") or "").strip()
+                    if not iname:
+                        continue
+                    dims = str(entry.get("dimensions") or "").strip() or None
+                    specs = str(entry.get("specs_notes") or entry.get("specs") or entry.get("notes") or "").strip() or None
+                    parsed.append({"item_name": iname, "dimensions": dims, "specs_notes": specs})
+                elif isinstance(entry, str) and entry.strip():
+                    parsed.append({"item_name": entry.strip(), "dimensions": None, "specs_notes": None})
+
+    if not parsed and str(slots.get("operation_kind") or "") == "new_lead":
+        scope = str(slots.get("rough_scope") or "").strip()
+        if ";" in scope and (":" in scope or "+" in scope):
+            for block in (b.strip() for b in scope.split(";") if b.strip()):
+                prefix = ""
+                rest = block
+                if ":" in block:
+                    head, tail = block.split(":", 1)
+                    if head.strip() and len(head.strip()) <= 32:
+                        prefix, rest = head.strip(), tail.strip()
+                parts = [p.strip() for p in rest.split("+") if p.strip()]
+                for part in parts:
+                    iname = f"{prefix} - {part}" if prefix else part
+                    m_dim = _INLINE_DIM_RE.search(part)
+                    parsed.append(
+                        {
+                            "item_name": iname,
+                            "dimensions": m_dim.group(1).strip() if m_dim else None,
+                            "specs_notes": None,
+                        }
+                    )
+            if parsed and not slots.get("initial_items_json"):
+                slots["initial_items_json"] = json.dumps(parsed, ensure_ascii=False)
+
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for it in parsed:
+        key = it["item_name"].lower()
+        if key not in seen:
+            seen.add(key)
+            deduped.append(it)
+    return deduped
+
+
+def _backfill_item_slots_from_title_and_text(
+    slots: dict[str, Any],
+    *,
+    summary_title: str | None,
+    user_text: str | None,
+    heard_transcript: str | None,
+) -> None:
+    """Rescue item_name and inline dimensions when LLM puts the furniture name only in summary_title."""
+    if str(slots.get("operation_kind") or "") != "item_upsert_or_move":
+        return
+    if not slots.get("item_id") and not str(slots.get("item_name") or "").strip():
+        for src in (summary_title, slots.get("summary_title")):
+            t_str = (src or "").strip()
+            if not t_str:
+                continue
+            m_title = _ADD_ITEM_TITLE_RE.match(t_str)
+            if m_title:
+                cand = re.sub(r"\s+", " ", m_title.group(1)).strip(" \t\r\n.,:-")
+                if cand and cand.lower() not in _NULL_STRINGS:
+                    slots["item_name"] = cand
+                    break
+    if not str(slots.get("dimensions") or "").strip():
+        for src in (slots.get("item_name"), summary_title, user_text, heard_transcript):
+            m_dim = _INLINE_DIM_RE.search(str(src or ""))
+            if m_dim:
+                slots["dimensions"] = m_dim.group(1).strip()
+                break
+
+
 def _backfill_onboarding_and_open_goal_slots(
     slots: dict[str, Any],
     *,
@@ -603,7 +706,7 @@ def _backfill_onboarding_and_open_goal_slots(
         prior_missing_slots
         and len(prior_missing_slots) == 1
         and not is_ambiguous
-        and prior_missing_slots[0] in ("area_landmark", "rough_scope", "full_name", "party_name")
+        and prior_missing_slots[0] in ("area_landmark", "rough_scope", "full_name", "party_name", "item_name")
     ):
         only_slot = prior_missing_slots[0]
         if not str(slots.get(only_slot) or "").strip():

@@ -27,6 +27,7 @@ from app.services.agent_core.slot_resolvers import (
     _compute_missing_slots_for_op,
     _fetch_target_row_for_slots,
     _sanitize_and_resolve_slot_ids,
+    parse_initial_items_slot,
 )
 from app.services.goal_primitives import (
     claim_goal_for_execution,
@@ -77,12 +78,25 @@ async def confirm_and_execute_goal(
             continue
 
         op = step.get("operation")
+        is_child_step = idx > 0 or str(op) != str(slots.get("operation_kind") or op)
+        if is_child_step:
+            raw_child = dict(step.get("payload") or {})
+            step_slots = {
+                **slots,
+                **{k: v for k, v in raw_child.items() if v is not None},
+            }
+            if str(op) == "item_upsert_or_move" and "specs_notes" in raw_child and raw_child["specs_notes"] is None:
+                step_slots.pop("specs_notes", None)
+            _sanitize_and_resolve_slot_ids(sb, step_slots)
+        else:
+            step_slots = slots
+
         res = await pkg._run_single_step(
             sb,
             goal_id=goal_id,
             step_index=idx,
             op=str(op),
-            slots=slots,
+            slots=step_slots,
             actor_person_id=actor_person_id,
             actor_label=actor_label,
             source_channel=source_channel,
@@ -384,6 +398,8 @@ async def _run_single_step(
             promised_delivery_date=slots.get("promised_delivery_date"),
             existing_customer_id=slots.get("customer_id"),
             actor_person_id=actor_person_id,
+            specs_notes=slots.get("specs_notes"),
+            uploaded_gcs_paths=slots.get("uploaded_gcs_paths"),
         )
     if op == "add_customer":
         return step_executors.create_standalone_customer(
@@ -440,6 +456,8 @@ async def _run_single_step(
             phone=slots.get("phone"),
             boq_scope_changed=slots.get("boq_scope_changed"),
             boq_scope_note=slots.get("boq_scope_note") or slots.get("notes"),
+            specs_notes=slots.get("specs_notes"),
+            uploaded_gcs_paths=slots.get("uploaded_gcs_paths"),
         )
     if op == "archive_record":
         kind = str(slots.get("archive_entity_kind") or "")
@@ -646,6 +664,8 @@ async def apply_slot_patch_and_resume(
         user_correction_text=correction_note,
     )
     op = str(merged_slots.get("operation_kind") or "stage_update")
+    if op in ("new_lead", "update_order_details"):
+        parse_initial_items_slot(merged_slots)
     steps = _build_steps_for_slots(op, merged_slots)
 
     still_missing = _compute_missing_slots_for_op(op, merged_slots)
@@ -746,6 +766,8 @@ def edit_open_goal_slots(
     )
 
     op = str(merged_slots.get("operation_kind") or g.get("goal_type") or "stage_update")
+    if op in ("new_lead", "update_order_details"):
+        parse_initial_items_slot(merged_slots)
     steps = _build_steps_for_slots(op, merged_slots)
     target_before_row = _fetch_target_row_for_slots(sb, op, merged_slots)
     confirm_card_text = _format_confirmation_summary(op, merged_slots, target_before_row)

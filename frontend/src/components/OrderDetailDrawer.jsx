@@ -6,6 +6,7 @@ import {
   ChevronDown,
   ChevronUp,
   Copy,
+  FileText,
   History,
   Pencil,
   Plus,
@@ -173,6 +174,24 @@ export default function OrderDetailDrawer({
   }, [allMaterials, matFilter, materialCategories, order?.id]);
 
   if (!order) return null;
+
+  const attachmentPaths = Array.isArray(order.metadata?.uploaded_gcs_paths)
+    ? order.metadata.uploaded_gcs_paths.filter(Boolean)
+    : [];
+
+  async function handleOpenAttachment(path) {
+    setBusyKey(`att:${path}`);
+    try {
+      const res = await apiFetch(
+        `/api/media/signed-url?path=${encodeURIComponent(path)}`
+      );
+      if (res?.url) {
+        window.open(res.url, "_blank", "noopener,noreferrer");
+      }
+    } finally {
+      setBusyKey(null);
+    }
+  }
 
   async function handlePipelineChange(toStage, extra = {}) {
     setBusyKey("order");
@@ -513,6 +532,28 @@ export default function OrderDetailDrawer({
                 <History className="w-3.5 h-3.5" />
                 <span>History</span>
               </button>
+
+              {attachmentPaths.map((p, idx) => {
+                const isPdf = String(p).toLowerCase().endsWith(".pdf");
+                const label =
+                  attachmentPaths.length > 1
+                    ? `${isPdf ? "Spec PDF" : "File"} ${idx + 1}`
+                    : isPdf
+                    ? "Spec PDF"
+                    : "Attachment";
+                return (
+                  <button
+                    key={p}
+                    type="button"
+                    disabled={busyKey === `att:${p}`}
+                    onClick={() => handleOpenAttachment(p)}
+                    className="min-h-[36px] px-2.5 rounded-lg border border-amber-200 bg-amber-50 font-semibold text-amber-950 flex items-center gap-1"
+                  >
+                    <FileText className="w-3.5 h-3.5" />
+                    <span>{label}</span>
+                  </button>
+                );
+              })}
             </div>
 
             {order.pipeline_stage !== "lost" && (
@@ -877,6 +918,13 @@ export default function OrderDetailDrawer({
                                   </span>
                                 </div>
                               )}
+
+                            {it.specs_notes && (
+                              <div className="bg-white rounded-lg border border-stone-200 px-2.5 py-2 text-xs text-stone-700 leading-relaxed">
+                                <span className="font-bold text-stone-900">Specs: </span>
+                                <span>{it.specs_notes}</span>
+                              </div>
+                            )}
 
                             {/* Item Raw Materials List */}
                             <div className="space-y-2">

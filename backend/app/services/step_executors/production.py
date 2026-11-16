@@ -83,7 +83,7 @@ async def transition_project_pipeline(
     # Smart Default on Execution: auto-kickoff Ansh's Material Track ('check_stock')
     ansh_ping_needed = False
     ansh_id: str | None = None
-    if to_stage == "execution" and prj.get("material_stage") == "not_started":
+    if to_stage == "execution" and (prj.get("material_stage") or "not_started") == "not_started":
         ansh_id = prj.get("material_owner_id") or get_default_person_id(sb, "is_default_purchase")
         mat_prior = build_stage_undo_snapshot(track="material", row_before=prj)
         patch["material_stage"] = "check_stock"
@@ -465,6 +465,8 @@ def create_customer_and_lead(
     existing_customer_id: str | None = None,
     force_new_customer: bool = False,
     actor_person_id: str | None = None,
+    specs_notes: str | None = None,
+    uploaded_gcs_paths: list[str] | None = None,
 ) -> dict[str, Any]:
     """Create a canonical Customer (or link repeat Customer) + Supabase Lead Project.
     Dead leads never pollute Zoho Books until conversion!
@@ -536,22 +538,34 @@ def create_customer_and_lead(
     code = f"PRJ-{now_ist:%y%m%d-%H%M%S}"
     clean_delivery = sanitize_iso_date(promised_delivery_date)
     display_cust = f"{cname} ({area})" if area and area.lower() not in cname.lower() else cname
+    meta: dict[str, Any] = {}
+    if specs_notes and str(specs_notes).strip():
+        meta["specs_notes"] = str(specs_notes).strip()
+    if uploaded_gcs_paths:
+        clean_paths = [str(p).strip() for p in uploaded_gcs_paths if str(p).strip()]
+        if clean_paths:
+            meta["uploaded_gcs_paths"] = clean_paths
+    prj_payload: dict[str, Any] = {
+        "project_code": code,
+        "customer_id": cust_id,
+        "customer_name": display_cust,
+        "site_area_landmark": area,
+        "rough_scope": rough_scope.strip(),
+        "phone": phone,
+        "quoted_total": round(float(quoted_total or 0), 2),
+        "promised_delivery_date": clean_delivery,
+        "pipeline_stage": "lead",
+        "material_stage": "not_started",
+        "payment_stage": "advance_pending",
+        "project_type": "customer",
+        "status": "active",
+        "current_owner_ids": [actor_person_id] if actor_person_id else [],
+    }
+    if meta:
+        prj_payload["metadata"] = meta
     ins_p = (
         sb.table("projects")
-        .insert(
-            {
-                "project_code": code,
-                "customer_id": cust_id,
-                "customer_name": display_cust,
-                "site_area_landmark": area,
-                "rough_scope": rough_scope.strip(),
-                "phone": phone,
-                "quoted_total": round(float(quoted_total or 0), 2),
-                "promised_delivery_date": clean_delivery,
-                "pipeline_stage": "lead",
-                "current_owner_ids": [actor_person_id] if actor_person_id else [],
-            }
-        )
+        .insert(prj_payload)
         .execute()
         .data
         or []

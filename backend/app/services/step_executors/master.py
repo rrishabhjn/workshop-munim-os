@@ -402,6 +402,8 @@ def update_order_metadata(
     phone: str | None = None,
     boq_scope_changed: bool | None = None,
     boq_scope_note: str | None = None,
+    specs_notes: str | None = None,
+    uploaded_gcs_paths: list[str] | None = None,
 ) -> dict[str, Any]:
     """Update Order metadata (deal value ₹, delivery date, scope, area, phone, BOQ note) with Undo snapshot."""
     rows = sb.table("projects").select("*").eq("id", project_id).limit(1).execute().data or []
@@ -459,6 +461,22 @@ def update_order_metadata(
     if boq_scope_note is not None and boq_scope_note.strip() != (cur.get("boq_scope_note") or ""):
         patch["boq_scope_note"] = boq_scope_note.strip() or None
         changes_desc.append("BOQ Note updated")
+
+    existing_meta = dict(cur.get("metadata") or {})
+    meta_updated = False
+    if specs_notes is not None and str(specs_notes).strip() and str(specs_notes).strip() != (existing_meta.get("specs_notes") or ""):
+        existing_meta["specs_notes"] = str(specs_notes).strip()
+        meta_updated = True
+        changes_desc.append("Specs updated")
+    if uploaded_gcs_paths:
+        merged_paths = merge_unique_str_list(existing_meta.get("uploaded_gcs_paths"), uploaded_gcs_paths)
+        if merged_paths != list(existing_meta.get("uploaded_gcs_paths") or []):
+            existing_meta["uploaded_gcs_paths"] = merged_paths
+            meta_updated = True
+            changes_desc.append("Attachments linked")
+    if meta_updated:
+        prior_snapshot["metadata"] = cur.get("metadata") or {}
+        patch["metadata"] = existing_meta
 
     if not patch:
         return {

@@ -70,6 +70,9 @@ _ONE_OFF_NUMERIC_OR_DATE_KEYS: set[str] = {
     "rough_scope",
     "notes",
     "specs_notes",
+    "initial_items_json",
+    "material_stage",
+    "item_name",
 }
 
 _LEARNABLE_MAPPING_KEYS: set[str] = {
@@ -187,7 +190,13 @@ def _verify_single_step(
     """Return None when committed DB/Zoho state matches intent, else a mismatch string."""
     op = str(step.get("operation") or "")
     res = step.get("result") or {}
-    merged = {**(step.get("payload") or {}), **slots}
+    if op != str(slots.get("operation_kind") or ""):
+        merged = {
+            **slots,
+            **{k: v for k, v in (step.get("payload") or {}).items() if v is not None},
+        }
+    else:
+        merged = {**(step.get("payload") or {}), **slots}
 
     if op == "pipeline_stage_move":
         row = _fetch_one(sb, "projects", merged.get("project_id"))
@@ -253,7 +262,13 @@ def _verify_single_step(
         cust_row = _fetch_one(sb, "customers", cust_id)
         if not prj_row or not cust_row:
             return "Lead project or customer row missing after creation."
-        if prj_row.get("zoho_tag_option_id"):
+        if prj_row.get("zoho_tag_option_id") and prj_row.get("pipeline_stage") in (
+            None,
+            "lead",
+            "design",
+            "estimating",
+            "quoted_awaiting_advance",
+        ):
             return "Pre-sales Lead unexpectedly received a Zoho Reporting Tag."
         return None
 

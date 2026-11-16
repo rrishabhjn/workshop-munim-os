@@ -38,6 +38,7 @@ from app.services.agent_core.schemas import (
 from app.services.agent_core.slot_resolvers import (
     _accept_id,
     _backfill_financial_slots_from_text,
+    _backfill_item_slots_from_title_and_text,
     _backfill_material_slots_from_text,
     _backfill_onboarding_and_open_goal_slots,
     _build_default_missing_slot_choices,
@@ -54,6 +55,7 @@ from app.services.agent_core.slot_resolvers import (
     _resolve_person_id_by_name,
     _resolve_project_id_by_hint,
     _sanitize_and_resolve_slot_ids,
+    parse_initial_items_slot,
 )
 from app.services.agent_core.turn import _process_goal_intent_item, run_agent_turn
 
@@ -65,6 +67,7 @@ __all__ = [
     "MemoryRuleOutput",
     "_accept_id",
     "_backfill_financial_slots_from_text",
+    "_backfill_item_slots_from_title_and_text",
     "_backfill_material_slots_from_text",
     "_backfill_onboarding_and_open_goal_slots",
     "_build_compact_grounding",
@@ -105,6 +108,7 @@ __all__ = [
     "get_settings",
     "goal_intelligence",
     "park_goal_for_clerk",
+    "parse_initial_items_slot",
     "run_agent_turn",
     "step_executors",
     "storage",

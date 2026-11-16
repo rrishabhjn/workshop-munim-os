@@ -165,7 +165,7 @@ def normalize_stage_code_for_op(op: str, raw_stage: str | None) -> str | None:
         return None
     raw_clean = str(raw_stage).strip()
     key = re.sub(r"[\s/_-]+", "_", raw_clean.lower()).strip("_")
-    if op == "pipeline_stage_move":
+    if op in ("pipeline_stage_move", "new_lead"):
         if raw_clean in PROJECT_PIPELINE_STAGES:
             return raw_clean
         return _PIPELINE_STAGE_SYNONYMS.get(key, raw_clean)

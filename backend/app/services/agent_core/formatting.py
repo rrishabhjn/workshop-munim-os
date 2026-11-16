@@ -5,7 +5,15 @@ from __future__ import annotations
 from typing import Any
 
 from app.services import goal_intelligence
-from app.services.goal_primitives import CheckpointedStep, format_inr, get_expense_category_label
+from app.services.agent_core.slot_resolvers import parse_initial_items_slot
+from app.services.goal_primitives import (
+    CheckpointedStep,
+    MATERIAL_TRACK_STAGES,
+    PROJECT_PIPELINE_STAGES,
+    format_inr,
+    get_expense_category_label,
+)
+from app.services.step_executors.common import normalize_stage_code_for_op
 
 
 def _default_missing_question(op: str, missing: list[str]) -> str:
@@ -36,10 +44,22 @@ def _format_confirmation_summary(
     row = before_row or {}
     if op == "new_lead":
         q_str = f" · Est: {format_inr(slots['quoted_total'])}" if slots.get("quoted_total") else ""
+        items = parse_initial_items_slot(slots)
+        items_str = f"\n• Items: *{len(items)} furniture item(s)* parsed" if items else ""
+        stage_norm = (
+            normalize_stage_code_for_op("pipeline_stage_move", slots.get("to_stage"))
+            if slots.get("to_stage")
+            else None
+        )
+        stage_str = (
+            f"\n• Start Stage: *{stage_norm.replace('_', ' ').title()}*"
+            if stage_norm and stage_norm in PROJECT_PIPELINE_STAGES and stage_norm != "lead"
+            else ""
+        )
         return (
             f"🆕 *Confirm New Lead*\n"
             f"• Customer: *{slots.get('full_name')}* ({slots.get('area_landmark')})\n"
-            f"• Scope: _{slots.get('rough_scope')}_{q_str}"
+            f"• Scope: _{slots.get('rough_scope')}_{q_str}{items_str}{stage_str}"
         )
     if op == "add_customer":
         cname = slots.get("full_name") or slots.get("party_name")
@@ -121,13 +141,64 @@ def _format_confirmation_summary(
 
 
 def _build_steps_for_slots(op: str, slots: dict[str, Any]) -> list[dict[str, Any]]:
-    step = CheckpointedStep(
-        step_index=0,
-        target="zoho" if op in ("customer_receipt", "vendor_payment", "expense", "float_transfer", "supplier_draft_bill") else "supabase",
-        operation=op,
-        payload=slots,
-    )
-    return [step.model_dump()]
+    steps: list[dict[str, Any]] = [
+        CheckpointedStep(
+            step_index=0,
+            target="zoho" if op in ("customer_receipt", "vendor_payment", "expense", "float_transfer", "supplier_draft_bill") else "supabase",
+            operation=op,
+            payload=slots,
+        ).model_dump()
+    ]
+    if op in ("new_lead", "update_order_details"):
+        for it in parse_initial_items_slot(slots):
+            steps.append(
+                CheckpointedStep(
+                    step_index=len(steps),
+                    target="supabase",
+                    operation="item_upsert_or_move",
+                    payload={
+                        "item_name": it["item_name"],
+                        "dimensions": it.get("dimensions"),
+                        "specs_notes": it.get("specs_notes"),
+                        "to_stage": "in_shop",
+                    },
+                ).model_dump()
+            )
+    if op == "new_lead":
+        lead_stage = (
+            normalize_stage_code_for_op("pipeline_stage_move", slots.get("to_stage"))
+            if slots.get("to_stage")
+            else None
+        )
+        if lead_stage and lead_stage in PROJECT_PIPELINE_STAGES and lead_stage != "lead":
+            steps.append(
+                CheckpointedStep(
+                    step_index=len(steps),
+                    target="supabase",
+                    operation="pipeline_stage_move",
+                    payload={"to_stage": lead_stage},
+                ).model_dump()
+            )
+        mat_stage = (
+            normalize_stage_code_for_op("material_stage_move", slots.get("material_stage"))
+            if slots.get("material_stage")
+            else None
+        )
+        if (
+            mat_stage
+            and mat_stage in MATERIAL_TRACK_STAGES
+            and mat_stage != "not_started"
+            and not (lead_stage == "execution" and mat_stage == "check_stock")
+        ):
+            steps.append(
+                CheckpointedStep(
+                    step_index=len(steps),
+                    target="supabase",
+                    operation="material_stage_move",
+                    payload={"to_stage": mat_stage},
+                ).model_dump()
+            )
+    return steps
 
 
 def _upsert_goal_row(

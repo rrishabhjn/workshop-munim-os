@@ -27,6 +27,7 @@ from app.services.agent_core.schemas import (
 from app.services.agent_core.slot_resolvers import (
     _accept_id,
     _backfill_financial_slots_from_text,
+    _backfill_item_slots_from_title_and_text,
     _backfill_material_slots_from_text,
     _backfill_onboarding_and_open_goal_slots,
     _build_default_missing_slot_choices,
@@ -34,6 +35,7 @@ from app.services.agent_core.slot_resolvers import (
     _fetch_target_row_for_slots,
     _map_op_to_db_goal_type,
     _sanitize_and_resolve_slot_ids,
+    parse_initial_items_slot,
 )
 from app.services.goal_primitives import (
     ThinkingLevel,
@@ -446,6 +448,12 @@ async def _process_goal_intent_item(
         user_text=user_text,
         heard_transcript=heard_transcript,
     )
+    _backfill_item_slots_from_title_and_text(
+        slots,
+        summary_title=item.summary_title,
+        user_text=user_text,
+        heard_transcript=heard_transcript,
+    )
     _backfill_onboarding_and_open_goal_slots(
         slots,
         summary_title=item.summary_title,
@@ -455,6 +463,8 @@ async def _process_goal_intent_item(
         is_ambiguous=item.is_ambiguous,
     )
     _sanitize_and_resolve_slot_ids(sb, slots)
+    if str(slots.get("operation_kind") or item.operation_kind) in ("new_lead", "update_order_details"):
+        parse_initial_items_slot(slots)
 
     # Resolve payment_account_code -> payment_account_id
     if slots.get("payment_account_code") and slots["payment_account_code"] in acc_code_to_id:

@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -732,3 +732,103 @@ async def test_pass1_rbac_can_login_munim_and_packed_ready_owner():
                 assert "project_caches" in r_sync.json()
     finally:
         app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_new_lead_pdf_items_and_item_name_summary_backfill():
+    # 1. Schema descriptions exist on item_name & initial_items_json
+    schema = agent_core._inline_json_schema(AgentTurnEnvelope)
+    props = schema["properties"]["goal_items"]["items"]["properties"]
+    assert "item_upsert_or_move" in str(props["item_name"].get("description") or "")
+    assert "initial_items_json" in props and "item_name" in str(props["initial_items_json"].get("description") or "")
+
+    # 2. new_lead with initial_items_json + specs_notes + uploaded_gcs_paths + to_stage='execution'
+    sb = FakeSupabase({
+        "people": [
+            {"id": "p-shreyansh", "full_name": "Shreyansh", "person_type": "operator", "is_active": True},
+            {"id": "p-ansh", "full_name": "Ansh", "person_type": "operator", "is_default_purchase": True, "is_active": True},
+        ],
+        "customers": [], "projects": [], "project_items": [], "stage_events": [], "agent_goals": [],
+    })
+    pdf_items = [
+        {"item_name": "Mom Room (1) - 10ft Bed", "dimensions": "Mattress 6x6'6\", Back 10ft", "specs_notes": "32mm ply, Shade 133/230"},
+        {"item_name": "Room 2 - 32\"x93\" Almirah", "dimensions": "32\"x93\"", "specs_notes": "Sainik Oxford Ash"},
+        {"item_name": "6ftx3ft Drawer Unit", "dimensions": "6ftx3ft", "specs_notes": "Hafele Quadro"},
+    ]
+    item_pdf = agent_core.GoalIntentItem(
+        operation_kind="new_lead",
+        summary_title="New Project: Arjun (Jaipur) — 3 Items",
+        full_name="Arjun",
+        area_landmark="Jaipur",
+        rough_scope="Mom Room (1): 10ft Bed; Room 2: 32\"x93\" Almirah; 6ftx3ft Drawer Unit",
+        specs_notes="19mm 15-layer ply, Hafele hardware",
+        to_stage="execution",
+        initial_items_json=json.dumps(pdf_items),
+    )
+    out = await agent_core._process_goal_intent_item(
+        sb, item=item_pdf, acc_code_to_id={}, owner_person_id="p-shreyansh", actor_label="Shreyansh",
+        source_channel="telegram", domain_scope="production", thinking_level="low", heard_transcript=None,
+        uploaded_gcs_paths=["projects/inbox/arjun.pdf"], ui_context={}, telegram_chat_id=1001, user_text="add arjun project",
+    )
+    assert out["status"] == "awaiting_confirmation"
+    assert "3 furniture item(s)" in out["prompt"]
+
+    with (
+        patch("app.services.zoho.get_settings", return_value=Settings(_env_file=None)),
+        patch("app.services.telegram_api.send_message", new_callable=AsyncMock),
+    ):
+        conf = await agent_core.confirm_and_execute_goal(
+            sb, goal_id=out["goal_id"], actor_person_id="p-shreyansh", actor_label="Shreyansh", source_channel="telegram",
+        )
+    assert conf["status"] == "completed"
+    assert conf["verified"] is True
+    assert len(sb.store["projects"]) == 1
+    prj = sb.store["projects"][0]
+    assert prj["pipeline_stage"] == "execution"
+    assert prj["material_stage"] == "check_stock"
+    assert prj["material_owner_id"] == "p-ansh"
+    assert prj["metadata"]["uploaded_gcs_paths"] == ["projects/inbox/arjun.pdf"]
+    assert prj["metadata"]["specs_notes"] == "19mm 15-layer ply, Hafele hardware"
+    assert len(sb.store["project_items"]) == 3
+    assert all(it["stage"] == "in_shop" for it in sb.store["project_items"])
+    assert sb.store["project_items"][1]["dimensions"] == '32"x93"'
+
+    # 3. Fallback when initial_items_json is omitted on semicolon/plus rough_scope
+    parsed_fb = agent_core.parse_initial_items_slot({
+        "operation_kind": "new_lead",
+        "rough_scope": 'Mom Room (1): 10ft Bed + 7ft Almirah; Room 2: 9\'6" Bed',
+    })
+    assert [x["item_name"] for x in parsed_fb] == [
+        "Mom Room (1) - 10ft Bed",
+        "Mom Room (1) - 7ft Almirah",
+        'Room 2 - 9\'6" Bed',
+    ]
+
+    # 4. item_upsert_or_move with item_name=None rescues item_name + dimensions from summary_title
+    env_json = AgentTurnEnvelope(
+        intent_category="goal_actions",
+        goal_items=[
+            agent_core.GoalIntentItem(
+                operation_kind="item_upsert_or_move",
+                summary_title='Add Room 3 - 42"x89" Almirah to Arjun (Jaipur)',
+                project_id=prj["id"],
+                item_name=None,
+                to_stage="in_shop",
+            )
+        ],
+    ).model_dump_json()
+    fake_client = MagicMock()
+    fake_client.interactions.create.return_value = SimpleNamespace(id="int_it_fb", steps=[], output_text=env_json)
+    with (
+        patch("app.services.agent_core.get_settings", return_value=Settings(gemini_api_key="test-key")),
+        patch("app.services.agent_core._get_interactions_client", return_value=fake_client),
+    ):
+        res_item = await agent_core.run_agent_turn(
+            sb, owner_person_id="p-shreyansh", actor_label="Shreyansh",
+            source_channel="web_command_bar", domain_scope="production",
+            text='Add Room 3 - 42"x89" Almirah to Arjun (Jaipur)',
+        )
+    assert res_item["goals"][0]["status"] == "completed"
+    added = next(i for i in sb.store["project_items"] if i["item_name"] == 'Room 3 - 42"x89" Almirah')
+    assert added["dimensions"] == '42"x89"'
+    assert added["stage"] == "in_shop"
