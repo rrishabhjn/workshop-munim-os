@@ -10,7 +10,7 @@ import logging
 import sys
 from typing import Any, Literal
 
-from app.services import agent_tools, decisions_triage, goal_intelligence, storage
+from app.services import action_tools, agent_tools, decisions_triage, goal_intelligence, storage
 from app.services.agent_core.formatting import (
     _build_steps_for_slots,
     _default_missing_question,
@@ -39,6 +39,7 @@ from app.services.agent_core.slot_resolvers import (
 )
 from app.services.goal_primitives import (
     ThinkingLevel,
+    has_complex_turn_cues,
     is_high_sensitivity_master_mutation,
     select_hydrogen_thinking_level,
 )
@@ -79,10 +80,16 @@ async def run_agent_turn(
         reply_to_bot_msg_id=reply_to_bot_msg_id,
     )
     sys_inst = _build_system_instruction(grounding_json)
+    open_goals_count = len(json.loads(grounding_json).get("open_goals_tray") or [])
+    has_pdf = any(m == "application/pdf" for _, m in (media_files or []))
 
     # 1. Surgical Media Triage via gemini-decision-1 ($0 output) when photos/PDFs arrive
     thinking_level: ThinkingLevel = select_hydrogen_thinking_level(
-        is_multi_item_dump=bool(text and (text.count(",") >= 2 or " aur " in text.lower()))
+        is_multi_item_dump=has_complex_turn_cues(
+            text,
+            has_pdf=has_pdf,
+            open_goals_count=open_goals_count,
+        )
     )
     uploaded_gcs_paths: list[str] = []
     media_triage_notes: list[str] = []
@@ -167,7 +174,43 @@ async def run_agent_turn(
         "schema": _inline_json_schema(AgentTurnEnvelope, force_required=("goal_items",)),
     }
 
-    # 3. Bounded Tool-Calling Loop (Max 3 rounds; previous_interaction_id strictly within-turn!)
+    # 3. Bounded Tool-Calling Loop (Max 4 rounds; previous_interaction_id strictly within-turn!)
+    staged_items: list[GoalIntentItem] = []
+    fallback_items: list[GoalIntentItem] = []
+    clarified_keys: set[str] = set()
+
+    async def _run_tool_calls(fn_calls: list[Any], *, cur_heard: str | None) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        for fc in fn_calls:
+            raw_args = getattr(fc, "arguments", None) or {}
+            args_dict = raw_args if isinstance(raw_args, dict) else json.loads(str(raw_args))
+            if action_tools.is_action_tool(fc.name):
+                tool_out = await action_tools.execute_action_tool(
+                    sb,
+                    fc.name,
+                    args_dict,
+                    staged_items=staged_items,
+                    fallback_items=fallback_items,
+                    clarified_keys=clarified_keys,
+                    acc_code_to_id=acc_code_to_id,
+                    ui_context=ui_context,
+                    user_text=text,
+                    heard_transcript=cur_heard,
+                    reply_to_bot_msg_id=reply_to_bot_msg_id,
+                    telegram_chat_id=telegram_chat_id,
+                )
+            else:
+                tool_out = await agent_tools.execute_read_tool(sb, fc.name, args_dict)
+            results.append(
+                {
+                    "type": "function_result",
+                    "call_id": fc.id,
+                    "name": fc.name,
+                    "result": [{"type": "text", "text": tool_out}],
+                }
+            )
+        return results
+
     interaction = await asyncio.to_thread(
         client.interactions.create,
         model=settings.gemini_live_model,
@@ -178,26 +221,14 @@ async def run_agent_turn(
         response_format=resp_format,
     )
 
-    for _round in range(3):
+    for _round in range(4):
         fn_calls = [
             s for s in (getattr(interaction, "steps", None) or [])
             if getattr(s, "type", None) == "function_call"
         ]
         if not fn_calls:
             break
-        fn_results: list[dict[str, Any]] = []
-        for fc in fn_calls:
-            raw_args = getattr(fc, "arguments", None) or {}
-            args_dict = raw_args if isinstance(raw_args, dict) else json.loads(str(raw_args))
-            tool_out = await agent_tools.execute_read_tool(sb, fc.name, args_dict)
-            fn_results.append(
-                {
-                    "type": "function_result",
-                    "call_id": fc.id,
-                    "name": fc.name,
-                    "result": [{"type": "text", "text": tool_out}],
-                }
-            )
+        fn_results = await _run_tool_calls(fn_calls, cur_heard=None)
         interaction = await asyncio.to_thread(
             client.interactions.create,
             model=settings.gemini_live_model,
@@ -210,8 +241,11 @@ async def run_agent_turn(
         )
 
     raw_json = _strip_json_fences(getattr(interaction, "output_text", None) or "")
-    envelope = AgentTurnEnvelope.model_validate_json(raw_json)
-    if envelope.intent_category == "goal_actions" and not envelope.goal_items:
+    if not raw_json and (staged_items or fallback_items):
+        envelope = AgentTurnEnvelope(intent_category="goal_actions", goal_items=[])
+    else:
+        envelope = AgentTurnEnvelope.model_validate_json(raw_json)
+    if envelope.intent_category == "goal_actions" and not envelope.goal_items and not staged_items:
         try:
             retry_interaction = await asyncio.to_thread(
                 client.interactions.create,
@@ -231,6 +265,7 @@ async def run_agent_turn(
                 generation_config={"thinking_level": thinking_level},
                 response_format=resp_format,
             )
+            interaction = retry_interaction
             retry_json = _strip_json_fences(getattr(retry_interaction, "output_text", None) or "")
             if retry_json:
                 envelope = AgentTurnEnvelope.model_validate_json(retry_json)
@@ -239,7 +274,144 @@ async def run_agent_turn(
 
     heard = envelope.heard_transcript if all_audio_files else None
 
-    if envelope.intent_category in ("direct_answer", "draft_whatsapp_message") and not envelope.goal_items:
+    def _merge_items(cur_staged: list[GoalIntentItem], cur_env: list[GoalIntentItem], cur_fb: list[GoalIntentItem]) -> list[GoalIntentItem]:
+        by_key: dict[str, tuple[GoalIntentItem, int, bool]] = {}
+        order: list[str] = []
+        for idx_src, (src_list, is_staged) in enumerate(((cur_staged, True), (cur_env, False))):
+            for cand in src_list:
+                key = action_tools.goal_item_dedup_key(cand)
+                missing, _ = action_tools.preflight_goal_item_missing_slots(
+                    sb,
+                    cand,
+                    acc_code_to_id=acc_code_to_id,
+                    ui_context=ui_context,
+                    user_text=text,
+                    heard_transcript=heard,
+                    reply_to_bot_msg_id=reply_to_bot_msg_id,
+                    telegram_chat_id=telegram_chat_id,
+                )
+                miss_cnt = len(missing)
+                if key not in by_key:
+                    by_key[key] = (cand, miss_cnt, is_staged)
+                    order.append(key)
+                else:
+                    prev_cand, prev_miss, prev_staged = by_key[key]
+                    if miss_cnt < prev_miss or (miss_cnt == prev_miss and is_staged and not prev_staged):
+                        by_key[key] = (cand, miss_cnt, is_staged)
+        merged = [by_key[k][0] for k in order]
+        return merged if merged else list(cur_fb)
+
+    merged_items = _merge_items(staged_items, list(envelope.goal_items or []), fallback_items)
+
+    # 3b. Silent Internal Self-Repair before asking user for already-stated details
+    if merged_items:
+        unconfirmed_missing: list[dict[str, Any]] = []
+        has_open_target = reply_to_bot_msg_id is not None
+        for idx_m, cand in enumerate(merged_items):
+            if cand.target_open_goal_id:
+                has_open_target = True
+            if cand.is_ambiguous or action_tools.goal_item_dedup_key(cand) in clarified_keys:
+                continue
+            missing_m, _ = action_tools.preflight_goal_item_missing_slots(
+                sb,
+                cand,
+                acc_code_to_id=acc_code_to_id,
+                ui_context=ui_context,
+                user_text=text,
+                heard_transcript=heard,
+                reply_to_bot_msg_id=reply_to_bot_msg_id,
+                telegram_chat_id=telegram_chat_id,
+            )
+            if missing_m:
+                unconfirmed_missing.append(
+                    {
+                        "index": idx_m,
+                        "operation_kind": cand.operation_kind,
+                        "summary_title": cand.summary_title,
+                        "missing_slots": missing_m,
+                    }
+                )
+
+        if unconfirmed_missing:
+            txt_clean = (text or "").strip()
+            low_clean = txt_clean.lower()
+            critical_slot = any(
+                slot in {"item_name", "material_lines_json", "rough_scope", "full_name"}
+                for entry in unconfirmed_missing
+                for slot in entry["missing_slots"]
+            )
+            pushback_cues = (
+                "already",
+                "confus",
+                "these are",
+                "bataya",
+                "likha",
+                "above",
+                "upar",
+                "nahi",
+                "not expense",
+            )
+            should_repair = (
+                (critical_slot and len(txt_clean) >= 15)
+                or bool(media_files)
+                or len(txt_clean) >= 40
+                or any(sep in (text or "") for sep in (";", "+", "\n", ":"))
+                or has_open_target
+                or any(cue in low_clean for cue in pushback_cues)
+            )
+            if should_repair:
+                repair_thinking: ThinkingLevel = "high" if thinking_level == "high" else "medium"
+                repair_prompt = (
+                    "INTERNAL PRE-FLIGHT CHECK (user has NOT seen this yet): "
+                    "Python rejected item(s) due to missing required JSON fields:\n"
+                    f"{json.dumps(unconfirmed_missing, ensure_ascii=False)}\n\n"
+                    "Carefully re-read the user's message, attachment/PDF, and CONTEXT. "
+                    "Fill ALL missing field(s) directly in your action tool call or `goal_items` if already stated or implied "
+                    "(do NOT leave item_name, area_landmark, amount_inr, or payment_account_code null if present!). "
+                    "Only ask the user (`allow_missing_clarification=true` / `clarification_question`) if the info is genuinely absent."
+                )
+                try:
+                    repair_int = await asyncio.to_thread(
+                        client.interactions.create,
+                        model=settings.gemini_live_model,
+                        previous_interaction_id=getattr(interaction, "id", None),
+                        system_instruction=sys_inst,
+                        input=[{"type": "text", "text": repair_prompt}],
+                        tools=agent_tools.INTERACTION_TOOLS_SCHEMA,
+                        generation_config={"thinking_level": repair_thinking},
+                        response_format=resp_format,
+                    )
+                    rep_fn_calls = [
+                        s for s in (getattr(repair_int, "steps", None) or [])
+                        if getattr(s, "type", None) == "function_call"
+                    ]
+                    if rep_fn_calls:
+                        rep_results = await _run_tool_calls(rep_fn_calls, cur_heard=heard)
+                        repair_int = await asyncio.to_thread(
+                            client.interactions.create,
+                            model=settings.gemini_live_model,
+                            previous_interaction_id=getattr(repair_int, "id", None),
+                            system_instruction=sys_inst,
+                            input=rep_results,
+                            tools=agent_tools.INTERACTION_TOOLS_SCHEMA,
+                            generation_config={"thinking_level": repair_thinking},
+                            response_format=resp_format,
+                        )
+                    rep_raw = _strip_json_fences(getattr(repair_int, "output_text", None) or "")
+                    rep_env = (
+                        AgentTurnEnvelope.model_validate_json(rep_raw)
+                        if rep_raw
+                        else AgentTurnEnvelope(intent_category="goal_actions", goal_items=[])
+                    )
+                    repaired_merged = _merge_items(staged_items, list(rep_env.goal_items or []), fallback_items)
+                    if repaired_merged:
+                        merged_items = repaired_merged
+                    if rep_env.direct_reply_text:
+                        envelope.direct_reply_text = rep_env.direct_reply_text
+                except Exception as exc:
+                    logger.warning("Silent self-repair pass failed safely: %s", exc)
+
+    if envelope.intent_category in ("direct_answer", "draft_whatsapp_message") and not merged_items:
         raw_reply_txt = envelope.direct_reply_text or "Done."
         goal_intelligence.record_query_turn_in_history(
             sb,
@@ -267,7 +439,7 @@ async def run_agent_turn(
             "parked_goal_nudge": nudge,
         }
 
-    if not envelope.goal_items:
+    if not merged_items:
         return {
             "kind": "unrecognized",
             "is_error": True,
@@ -282,7 +454,7 @@ async def run_agent_turn(
 
     # 4. Process Each Goal Item Under Deterministic Risk-Tiered Autonomy
     processed_goals: list[dict[str, Any]] = []
-    for item in envelope.goal_items:
+    for item in merged_items:
         g_out = await _process_goal_intent_item(
             sb,
             item=item,
@@ -307,7 +479,7 @@ async def run_agent_turn(
             str(g["goal_id"]) for g in processed_goals if g.get("goal_id")
         } | {
             str(it.target_open_goal_id)
-            for it in envelope.goal_items
+            for it in merged_items
             if it.target_open_goal_id
         }
         parked_nudge = goal_intelligence.build_side_quest_parked_goal_nudge(

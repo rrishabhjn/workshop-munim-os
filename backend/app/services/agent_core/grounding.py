@@ -79,7 +79,7 @@ def _build_compact_grounding(
         )
         .in_("status", ["gathering_info", "awaiting_confirmation", "needs_error_fix"])
         .order("updated_at", desc=True)
-        .limit(20)
+        .limit(30)
         .execute()
         .data
         or []
@@ -90,7 +90,7 @@ def _build_compact_grounding(
         telegram_chat_id=telegram_chat_id,
         domain_scope=domain_scope,
         reply_to_bot_msg_id=reply_to_bot_msg_id,
-        max_goals=4,
+        max_goals=10,
     )
 
     ui_prj = None
@@ -194,7 +194,7 @@ def _build_compact_grounding(
         "active_orders_index": active_orders_index,
         "learned_workshop_rules": rules,
         "open_goals_tray": build_compact_open_goals_tray(
-            open_rows, max_goals=4, reply_to_bot_msg_id=reply_to_bot_msg_id
+            open_rows, max_goals=10, reply_to_bot_msg_id=reply_to_bot_msg_id
         ),
         "recent_conversation_turns": recent_turns,
         "currently_open_ui_order": ui_prj,
@@ -215,6 +215,12 @@ def _build_system_instruction(grounding_json: str) -> str:
         "`search_people_and_vendors` or `search_projects_and_items` for vendors, completed orders, or anything not in CONTEXT. "
         "IMPORTANT: `active_orders_index` lists only the 35 most recently updated active orders — if a customer or order name is "
         "NOT in `active_orders_index`, ALWAYS call `search_projects_and_items` (and `search_customers`) before concluding it does not exist.\n"
+        "1b. FOCUSED ACTION PROPOSAL TOOLS (PREFERRED): When staging or committing actions, prefer calling the focused action tools "
+        "(`stage_new_order`, `upsert_order_items`, `move_order_or_material_stage`, `upsert_item_materials`, "
+        "`stage_financial_entry`, `resolve_open_goal`, `manage_directory_or_order`) rather than cramming everything into the final JSON form! "
+        "Each action tool validates slots immediately and returns `staged: true` or `staged: false` with exact `missing_slots`. "
+        "If a tool returns `missing_slots` that are already present in the user's message, PDF, or CONTEXT, fix them immediately and re-call the tool; "
+        "only pass `allow_missing_clarification=true` when information is truly absent from all inputs.\n"
         "2. COMPOUND REPLIES & OPEN GOALS: Check `open_goals_tray` in CONTEXT. A single user message "
         "may answer an open goal (`target_open_goal_id` set) AND also issue a brand-new update "
         "(`target_open_goal_id` = null) in the same `goal_items` list. Never drop either half! "

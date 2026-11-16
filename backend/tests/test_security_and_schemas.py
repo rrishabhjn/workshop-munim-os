@@ -110,9 +110,13 @@ async def test_zoho_request_retries_once_on_401():
 
 def test_gemini_response_schemas_accepted_by_google_genai():
     from google.genai import Client, _transformers as t
+    from app.services.agent_tools import INTERACTION_TOOLS_SCHEMA
 
     dummy_client = Client(api_key="test-key")._api_client
     t.t_schema(dummy_client, SupplierBillExtraction)
+    assert len(INTERACTION_TOOLS_SCHEMA) == 11
+    for tool in INTERACTION_TOOLS_SCHEMA:
+        t.t_schema(dummy_client, tool["parameters"])
 
 
 def test_merge_notes_text():

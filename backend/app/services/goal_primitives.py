@@ -161,6 +161,37 @@ def should_run_decisions_front_door(
     return False
 
 
+_COMPLEX_PUSHBACK_RE = re.compile(
+    r"\b(?:why|confus\w*|what are you|these are|already|pehle hi|galat|wrong|not expense|nahi)\b",
+    re.IGNORECASE,
+)
+
+
+def has_complex_turn_cues(
+    text: str | None,
+    *,
+    has_pdf: bool = False,
+    open_goals_count: int = 0,
+) -> bool:
+    """Detect compound lists, PDFs, crowded open-goal trays, or operator pushback requiring `medium` thinking."""
+    if has_pdf or open_goals_count >= 3:
+        return True
+    txt = (text or "").strip()
+    if not txt:
+        return False
+    low = txt.lower()
+    if (
+        len(txt) >= 120
+        or txt.count(",") >= 2
+        or ";" in txt
+        or "+" in txt
+        or txt.count("\n") >= 2
+        or " aur " in low
+    ):
+        return True
+    return bool(_COMPLEX_PUSHBACK_RE.search(txt))
+
+
 def select_hydrogen_thinking_level(
     *,
     ocr_difficulty_score: float | None = None,

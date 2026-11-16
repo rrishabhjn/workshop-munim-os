@@ -12,9 +12,10 @@ import json
 from typing import Any
 
 from app.services import step_executors, zoho
+from app.services.action_tools import ACTION_TOOLS_SCHEMA
 
 
-INTERACTION_TOOLS_SCHEMA: list[dict[str, Any]] = [
+_READ_TOOLS_SCHEMA: list[dict[str, Any]] = [
     {
         "type": "function",
         "name": "search_customers",
@@ -84,6 +85,9 @@ INTERACTION_TOOLS_SCHEMA: list[dict[str, Any]] = [
         },
     },
 ]
+
+INTERACTION_TOOLS_SCHEMA: list[dict[str, Any]] = [*_READ_TOOLS_SCHEMA, *ACTION_TOOLS_SCHEMA]
+ALL_INTERACTION_TOOLS_SCHEMA = INTERACTION_TOOLS_SCHEMA
 
 
 async def execute_read_tool(sb: Any, name: str, arguments: dict[str, Any]) -> str:
