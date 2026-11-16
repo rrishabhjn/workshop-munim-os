@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from typing import Any
+import uuid
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from pydantic import BaseModel, Field
@@ -18,6 +20,7 @@ from app.db import get_supabase_admin
 from app.services import agent_core, step_executors, zoho
 
 router = APIRouter(prefix="/api", tags=["domains"])
+logger = logging.getLogger(__name__)
 
 
 def _resolve_actor_person(sb: Any, user: CurrentUser) -> tuple[str | None, str]:
@@ -779,6 +782,15 @@ async def list_needs_info_queue(
     return sb.table("v_needs_info_queue").select("*").execute().data or []
 
 
+def _validate_goal_id_or_400(sb: Any, goal_id: str) -> str:
+    if hasattr(sb, "store"):
+        return goal_id
+    try:
+        return str(uuid.UUID(str(goal_id).strip()))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid goal ID.") from exc
+
+
 @router.post("/agent/turn")
 async def execute_web_agent_turn(
     text: str = Form(default=""),
@@ -808,18 +820,27 @@ async def execute_web_agent_turn(
         media_files.append((att_bytes, att_mime))
 
     scope = "munim" if domain_scope == "munim" else "production"
-    return await agent_core.run_agent_turn(
-        sb,
-        owner_person_id=actor_id,
-        actor_label=actor_name,
-        source_channel="web_command_bar",
-        domain_scope=scope,
-        text=text or None,
-        audio_bytes=audio_bytes,
-        audio_mime_type=audio_mime,
-        media_files=media_files or None,
-        ui_context=ui_ctx,
-    )
+    try:
+        return await agent_core.run_agent_turn(
+            sb,
+            owner_person_id=actor_id,
+            actor_label=actor_name,
+            source_channel="web_command_bar",
+            domain_scope=scope,
+            text=text or None,
+            audio_bytes=audio_bytes,
+            audio_mime_type=audio_mime,
+            media_files=media_files or None,
+            ui_context=ui_ctx,
+        )
+    except Exception as exc:
+        logger.exception("Unhandled error in /api/agent/turn: %s", exc)
+        return {
+            "kind": "error",
+            "is_error": True,
+            "reply_text": "⚠️ Could not process that command cleanly — your text is preserved below so you can adjust or retry.",
+            "goals": [],
+        }
 
 
 @router.post("/agent/goals/{goal_id}/confirm")
@@ -828,14 +849,19 @@ async def confirm_agent_goal(
     user: CurrentUser = Depends(get_current_user),
 ) -> dict[str, Any]:
     sb = get_supabase_admin()
+    gid = _validate_goal_id_or_400(sb, goal_id)
     actor_id, actor_name = _resolve_actor_person(sb, user)
-    return await agent_core.confirm_and_execute_goal(
-        sb,
-        goal_id=goal_id,
-        actor_person_id=actor_id,
-        actor_label=actor_name,
-        source_channel="web",
-    )
+    try:
+        return await agent_core.confirm_and_execute_goal(
+            sb,
+            goal_id=gid,
+            actor_person_id=actor_id,
+            actor_label=actor_name,
+            source_channel="web",
+        )
+    except Exception as exc:
+        logger.exception("Unhandled error in /agent/goals/%s/confirm: %s", gid, exc)
+        raise HTTPException(status_code=400, detail="Could not execute goal safely.") from exc
 
 
 @router.post("/agent/goals/{goal_id}/choice")
@@ -845,15 +871,20 @@ async def choose_agent_goal_option(
     user: CurrentUser = Depends(get_current_user),
 ) -> dict[str, Any]:
     sb = get_supabase_admin()
+    gid = _validate_goal_id_or_400(sb, goal_id)
     actor_id, actor_name = _resolve_actor_person(sb, user)
-    return await agent_core.apply_slot_patch_and_resume(
-        sb,
-        goal_id=goal_id,
-        slot_patch=body.slot_patch,
-        actor_person_id=actor_id,
-        actor_label=actor_name,
-        source_channel="web",
-    )
+    try:
+        return await agent_core.apply_slot_patch_and_resume(
+            sb,
+            goal_id=gid,
+            slot_patch=body.slot_patch,
+            actor_person_id=actor_id,
+            actor_label=actor_name,
+            source_channel="web",
+        )
+    except Exception as exc:
+        logger.exception("Unhandled error in /agent/goals/%s/choice: %s", gid, exc)
+        raise HTTPException(status_code=400, detail="Could not apply option safely.") from exc
 
 
 @router.post("/agent/goals/{goal_id}/undo")
@@ -862,8 +893,13 @@ async def undo_agent_goal(
     user: CurrentUser = Depends(get_current_user),
 ) -> dict[str, Any]:
     sb = get_supabase_admin()
+    gid = _validate_goal_id_or_400(sb, goal_id)
     actor_id, _ = _resolve_actor_person(sb, user)
-    return agent_core.undo_completed_goal(sb, goal_id=goal_id, actor_person_id=actor_id)
+    try:
+        return agent_core.undo_completed_goal(sb, goal_id=gid, actor_person_id=actor_id)
+    except Exception as exc:
+        logger.exception("Unhandled error in /agent/goals/%s/undo: %s", gid, exc)
+        raise HTTPException(status_code=400, detail="Could not undo action safely.") from exc
 
 
 @router.post("/agent/goals/{goal_id}/park")
@@ -873,7 +909,8 @@ async def park_agent_goal_for_clerk(
 ) -> dict[str, Any]:
     _ = user
     sb = get_supabase_admin()
-    return agent_core.park_goal_for_clerk(sb, goal_id)
+    gid = _validate_goal_id_or_400(sb, goal_id)
+    return agent_core.park_goal_for_clerk(sb, gid)
 
 
 @router.post("/agent/goals/{goal_id}/discard")
@@ -883,7 +920,8 @@ async def discard_agent_goal(
 ) -> dict[str, Any]:
     _ = user
     sb = get_supabase_admin()
-    return agent_core.discard_goal(sb, goal_id)
+    gid = _validate_goal_id_or_400(sb, goal_id)
+    return agent_core.discard_goal(sb, gid)
 
 
 @router.post("/agent/goals/{goal_id}/edit")
@@ -894,10 +932,15 @@ async def edit_agent_goal(
 ) -> dict[str, Any]:
     _ = user
     sb = get_supabase_admin()
-    return await asyncio.to_thread(
-        agent_core.edit_open_goal_slots,
-        sb,
-        goal_id=goal_id,
-        slot_patch=body.slot_patch,
-        correction_note=body.correction_note,
-    )
+    gid = _validate_goal_id_or_400(sb, goal_id)
+    try:
+        return await asyncio.to_thread(
+            agent_core.edit_open_goal_slots,
+            sb,
+            goal_id=gid,
+            slot_patch=body.slot_patch,
+            correction_note=body.correction_note,
+        )
+    except Exception as exc:
+        logger.exception("Unhandled error in /agent/goals/%s/edit: %s", gid, exc)
+        raise HTTPException(status_code=400, detail="Could not update goal edits cleanly.") from exc

@@ -11,8 +11,9 @@ compiles validated intents into CheckpointedSteps executed here:
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import logging
+import re
 from typing import Any
 
 from app.services import telegram_api, zoho
@@ -46,6 +47,153 @@ def _compute_duration_hours(entered_at_raw: str | None) -> float | None:
         return None
     secs = max((datetime.now(timezone.utc) - dt).total_seconds(), 0.0)
     return round(secs / 3600.0, 2)
+
+
+_DATE_NULL_STRINGS = {"", "null", "none", "nil", "tbd", "na", "n/a", "unknown", "later", "soon"}
+
+
+def sanitize_iso_date(raw: Any) -> str | None:
+    """Parse common ISO / Indian DD-MM-YYYY / today / tomorrow date strings into YYYY-MM-DD or None."""
+    if raw is None:
+        return None
+    if isinstance(raw, date) and not isinstance(raw, datetime):
+        return raw.isoformat()
+    if isinstance(raw, datetime):
+        return raw.date().isoformat()
+    txt = str(raw).strip()
+    if not txt or txt.lower() in _DATE_NULL_STRINGS:
+        return None
+    low = txt.lower()
+    today_ist = datetime.now(IST).date()
+    if low in ("today", "aaj"):
+        return today_ist.isoformat()
+    if low in ("tomorrow", "kal"):
+        return (today_ist + timedelta(days=1)).isoformat()
+
+    m_iso = re.match(r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?:[T\s].*)?$", txt)
+    if m_iso:
+        try:
+            return date(int(m_iso.group(1)), int(m_iso.group(2)), int(m_iso.group(3))).isoformat()
+        except ValueError:
+            return None
+
+    m_dmy = re.match(r"^(\d{1,2})[-/](\d{1,2})[-/](\d{4})$", txt)
+    if m_dmy:
+        try:
+            return date(int(m_dmy.group(3)), int(m_dmy.group(2)), int(m_dmy.group(1))).isoformat()
+        except ValueError:
+            return None
+
+    return None
+
+
+def parse_positive_quantity(raw: Any, default: float = 1.0) -> tuple[float, str | None]:
+    """Parse quantity from int/float or strings like '8 sheets' -> (8.0, 'sheets')."""
+    if raw is None:
+        return default, None
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        val = round(float(raw), 2)
+        return (max(val, 0.01), None) if val > 0 else (default, None)
+    txt = str(raw).strip().replace(",", "")
+    m = re.match(r"^\s*(\d+(?:\.\d+)?)\s*([a-zA-Z]+)?\s*$", txt)
+    if m:
+        val = round(float(m.group(1)), 2)
+        unit = m.group(2).lower() if m.group(2) else None
+        return (max(val, 0.01), unit) if val > 0 else (default, unit)
+    return default, None
+
+
+_PIPELINE_STAGE_SYNONYMS: dict[str, str] = {
+    "lead": "lead",
+    "new_lead": "lead",
+    "enquiry": "lead",
+    "design": "design",
+    "3d": "design",
+    "designing": "design",
+    "estimate": "estimating",
+    "estimating": "estimating",
+    "costing": "estimating",
+    "quoted": "quoted_awaiting_advance",
+    "quoted_to_customer": "quoted_awaiting_advance",
+    "awaiting_advance": "quoted_awaiting_advance",
+    "quote_sent": "quoted_awaiting_advance",
+    "quoted_to_customer_awaiting_advance": "quoted_awaiting_advance",
+    "sizing": "site_sizing_boq",
+    "site_sizing": "site_sizing_boq",
+    "boq": "site_sizing_boq",
+    "measurement": "site_sizing_boq",
+    "execution": "execution",
+    "in_execution": "execution",
+    "production": "execution",
+    "in_production": "execution",
+    "started": "execution",
+    "completed": "completed",
+    "complete": "completed",
+    "done": "completed",
+    "delivered": "completed",
+    "hold": "on_hold",
+    "on_hold": "on_hold",
+    "lost": "lost",
+    "dropped": "lost",
+    "cancelled": "lost",
+    "cancel": "lost",
+}
+
+_MATERIAL_TRACK_SYNONYMS: dict[str, str] = {
+    "not_started": "not_started",
+    "check_stock": "check_stock",
+    "to_order": "check_stock",
+    "needed": "check_stock",
+    "pending": "check_stock",
+    "ordered": "ordered_pending",
+    "ordered_pending": "ordered_pending",
+    "all_in_shop": "all_in_shop",
+    "in_shop": "all_in_shop",
+    "in_ship": "all_in_shop",
+    "received": "all_in_shop",
+}
+
+_ITEM_STAGE_SYNONYMS: dict[str, str] = {
+    "in_shop": "in_shop",
+    "in_ship": "in_shop",
+    "shop": "in_shop",
+    "production": "in_shop",
+    "making": "in_shop",
+    "cutting": "in_shop",
+    "packed": "packed_ready",
+    "ready": "packed_ready",
+    "packed_ready": "packed_ready",
+    "packed_and_ready": "packed_ready",
+    "at_site": "at_site",
+    "site": "at_site",
+    "dispatched": "at_site",
+    "fitting": "at_site",
+    "assembly": "at_site",
+    "qc": "qc_done",
+    "qc_done": "qc_done",
+    "checked": "qc_done",
+}
+
+
+def normalize_stage_code_for_op(op: str, raw_stage: str | None) -> str | None:
+    """Normalize human/Hinglish stage labels into canonical DB stage codes."""
+    if not raw_stage or not str(raw_stage).strip():
+        return None
+    raw_clean = str(raw_stage).strip()
+    key = re.sub(r"[\s/_-]+", "_", raw_clean.lower()).strip("_")
+    if op == "pipeline_stage_move":
+        if raw_clean in PROJECT_PIPELINE_STAGES:
+            return raw_clean
+        return _PIPELINE_STAGE_SYNONYMS.get(key, raw_clean)
+    if op == "material_stage_move":
+        if raw_clean in MATERIAL_TRACK_STAGES:
+            return raw_clean
+        return _MATERIAL_TRACK_SYNONYMS.get(key, raw_clean)
+    if op == "item_upsert_or_move":
+        if raw_clean in ITEM_EXECUTION_STAGES:
+            return raw_clean
+        return _ITEM_STAGE_SYNONYMS.get(key, raw_clean)
+    return raw_clean
 
 
 def get_default_person_id(sb: Any, flag_col: str) -> str | None:
@@ -114,6 +262,7 @@ async def transition_project_pipeline(
     heard_transcript: str | None = None,
     note: str | None = None,
 ) -> dict[str, Any]:
+    to_stage = normalize_stage_code_for_op("pipeline_stage_move", to_stage) or to_stage
     if to_stage not in PROJECT_PIPELINE_STAGES:
         return {
             "ok": False,
@@ -257,6 +406,7 @@ async def transition_material_track(
     heard_transcript: str | None = None,
     note: str | None = None,
 ) -> dict[str, Any]:
+    to_stage = normalize_stage_code_for_op("material_stage_move", to_stage) or to_stage
     if to_stage not in MATERIAL_TRACK_STAGES:
         return {
             "ok": False,
@@ -320,6 +470,7 @@ async def upsert_or_transition_item(
     source_channel: str = "web",
     heard_transcript: str | None = None,
 ) -> dict[str, Any]:
+    to_stage = normalize_stage_code_for_op("item_upsert_or_move", to_stage) or "in_shop"
     if to_stage not in ITEM_EXECUTION_STAGES:
         return {
             "ok": False,
@@ -574,6 +725,7 @@ def create_customer_and_lead(
 
     now_ist = datetime.now(IST)
     code = f"PRJ-{now_ist:%y%m%d-%H%M%S}"
+    clean_delivery = sanitize_iso_date(promised_delivery_date)
     display_cust = f"{cname} ({area})" if area and area.lower() not in cname.lower() else cname
     ins_p = (
         sb.table("projects")
@@ -586,7 +738,7 @@ def create_customer_and_lead(
                 "rough_scope": rough_scope.strip(),
                 "phone": phone,
                 "quoted_total": round(float(quoted_total or 0), 2),
-                "promised_delivery_date": promised_delivery_date,
+                "promised_delivery_date": clean_delivery,
                 "pipeline_stage": "lead",
                 "current_owner_ids": [actor_person_id] if actor_person_id else [],
             }
@@ -634,6 +786,7 @@ async def execute_munim_financial_step(
 ) -> dict[str, Any]:
     """Idempotent Munim -> Zoho Books Standard push + Smart Auto-Bridge Payment Track sync."""
     ref_no = make_zoho_reference_number(goal_id, step_index)
+    clean_txn_date = sanitize_iso_date(txn_date)
 
     # 1. Push to Zoho Books (with reference_number dedup + Reporting Tag bridge)
     z_res = await zoho.push_management_entry_to_zoho(
@@ -643,7 +796,7 @@ async def execute_munim_financial_step(
         payment_account_id=payment_account_id,
         to_payment_account_id=to_payment_account_id,
         reference_number=ref_no,
-        txn_date=txn_date,
+        txn_date=clean_txn_date,
         party_name=party_name,
         zoho_contact_id=zoho_contact_id,
         project_id=project_id,
@@ -1131,9 +1284,17 @@ def update_order_metadata(
                 patch["payment_stage"] = "payment_complete"
             elif paid > 0 and cur.get("payment_stage") == "payment_complete" and paid < new_q:
                 patch["payment_stage"] = "partial_paid"
-    if promised_delivery_date is not None and str(promised_delivery_date).strip() != str(cur.get("promised_delivery_date") or ""):
-        patch["promised_delivery_date"] = str(promised_delivery_date).strip() or None
-        changes_desc.append(f"Delivery Date → *{patch['promised_delivery_date'] or '-'}*")
+    if promised_delivery_date is not None:
+        raw_d = str(promised_delivery_date).strip()
+        if raw_d == "":
+            if cur.get("promised_delivery_date") is not None:
+                patch["promised_delivery_date"] = None
+                changes_desc.append("Delivery Date → *-*")
+        else:
+            parsed_d = sanitize_iso_date(raw_d)
+            if parsed_d and parsed_d != str(cur.get("promised_delivery_date") or ""):
+                patch["promised_delivery_date"] = parsed_d
+                changes_desc.append(f"Delivery Date → *{parsed_d}*")
     if rough_scope is not None and rough_scope.strip() != (cur.get("rough_scope") or ""):
         patch["rough_scope"] = rough_scope.strip() or None
         changes_desc.append(f"Scope → _{patch['rough_scope'] or '-'}_")
@@ -1509,12 +1670,9 @@ async def add_item_materials_batch(
         m_name = str(raw_line.get("material_name") or "").strip()
         if not m_name:
             continue
-        qty_raw = raw_line.get("quantity")
-        try:
-            qty_val = max(round(float(qty_raw if qty_raw is not None else 1.0), 2), 0.01)
-        except (TypeError, ValueError):
-            qty_val = 1.0
-        unit_val = str(raw_line.get("unit") or "pcs").strip() or "pcs"
+        qty_val, parsed_unit = parse_positive_quantity(raw_line.get("quantity"), default=1.0)
+        raw_unit = str(raw_line.get("unit") or "").strip()
+        unit_val = raw_unit or parsed_unit or "pcs"
         cat_val = infer_material_category(m_name, raw_line.get("category"))
         st_val = normalize_material_status(raw_line.get("status"))
         payload: dict[str, Any] = {
@@ -1631,7 +1789,10 @@ def update_item_materials_rows(
     if patch.get("category") and str(patch["category"]).strip().lower() in _VALID_MATERIAL_CATEGORIES:
         clean_patch["category"] = str(patch["category"]).strip().lower()
     if patch.get("quantity") is not None:
-        clean_patch["quantity"] = max(round(float(patch["quantity"]), 2), 0.01)
+        qty_val, parsed_unit = parse_positive_quantity(patch["quantity"], default=1.0)
+        clean_patch["quantity"] = qty_val
+        if not patch.get("unit") and parsed_unit:
+            clean_patch["unit"] = parsed_unit
     if patch.get("unit") is not None and str(patch["unit"]).strip():
         clean_patch["unit"] = str(patch["unit"]).strip()
     if "notes" in patch and patch["notes"] is not None:

@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import logging
 from typing import Any, Literal
+import uuid
 
 from google import genai
 from pydantic import BaseModel, Field
@@ -835,6 +836,34 @@ def load_rolling_conversation_context(
     return out
 
 
+def _safe_uuid_for_db(sb: Any, raw: Any, *, project_lookup: bool = False) -> str | None:
+    """Return a Postgres-safe UUID string (or FakeSupabase ID in tests), resolving project codes when asked."""
+    if raw is None:
+        return None
+    val = str(raw).strip()
+    if not val or val.lower() in ("null", "none", "nil", "undefined", "n/a"):
+        return None
+    if hasattr(sb, "store") and not getattr(sb, "strict_uuids", False):
+        return val
+    try:
+        return str(uuid.UUID(val))
+    except ValueError:
+        if project_lookup:
+            code = val.lstrip("#").strip()
+            rows = (
+                sb.table("projects")
+                .select("id")
+                .ilike("project_code", code)
+                .limit(1)
+                .execute()
+                .data
+                or []
+            )
+            if rows and rows[0].get("id"):
+                return str(rows[0]["id"])
+        return None
+
+
 def record_query_turn_in_history(
     sb: Any,
     *,
@@ -852,15 +881,16 @@ def record_query_turn_in_history(
 ) -> dict[str, Any] | None:
     """Persist completed Q&A / WhatsApp draft turns so follow-up turns retain context."""
     try:
-        proj_id = str(referenced_project_id).strip() if referenced_project_id else None
+        safe_owner = _safe_uuid_for_db(sb, owner_person_id)
+        proj_id = _safe_uuid_for_db(sb, referenced_project_id, project_lookup=True)
         if not proj_id and ui_context.get("viewing_project_id"):
-            proj_id = str(ui_context["viewing_project_id"]).strip() or None
-        cust_id = str(referenced_customer_id).strip() if referenced_customer_id else None
+            proj_id = _safe_uuid_for_db(sb, ui_context["viewing_project_id"], project_lookup=True)
+        cust_id = _safe_uuid_for_db(sb, referenced_customer_id)
 
         user_msg = (user_text or heard_transcript or "Question").strip()
         now_iso = datetime.now(timezone.utc).isoformat()
         payload = {
-            "owner_person_id": owner_person_id,
+            "owner_person_id": safe_owner,
             "source_channel": source_channel,
             "domain_scope": domain_scope,
             "telegram_chat_id": telegram_chat_id,
@@ -893,4 +923,5 @@ def record_query_turn_in_history(
         return res[0] if res else None
     except Exception as exc:
         logger.warning("Query history insert skipped safely: %s", exc)
+        return None
         return None

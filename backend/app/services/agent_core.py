@@ -50,22 +50,115 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Structured Schemas Returned by Gemini 4 Hydrogen (JSON Schema Inline-Safe)
 # ---------------------------------------------------------------------------
-_NULL_STRINGS = {"", "null", "none", "nil", "n/a", "na", "undefined"}
+_NULL_STRINGS = {"", "null", "none", "nil", "n/a", "na", "undefined", "unknown", "tbd"}
+_LIST_FIELDS = {"aliases", "payout_aliases", "role_tags", "estimator_ids", "choices", "repair_options", "goal_items"}
+_FLOAT_FIELDS = {"amount_inr", "quoted_total"}
+_JSON_STRING_FIELDS = {"material_lines_json", "bill_line_items_json", "slot_patch_json"}
+
+
+def _strip_json_fences(raw_text: str) -> str:
+    txt = (raw_text or "").strip()
+    if txt.startswith("```"):
+        txt = re.sub(r"^```(?:json)?\s*", "", txt, flags=re.IGNORECASE)
+        txt = re.sub(r"\s*```$", "", txt)
+    return txt.strip()
+
+
+def _coerce_optional_float(val: Any) -> float | None:
+    if val is None or isinstance(val, bool):
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    txt = str(val).strip()
+    if not txt or txt.lower() in _NULL_STRINGS:
+        return None
+    cleaned = txt.replace(",", "")
+    m_lakh = re.match(r"^(?:₹|rs\.?|inr)?\s*(\d+(?:\.\d+)?)\s*(?:lakh|lac|l)\b", cleaned, re.IGNORECASE)
+    if m_lakh:
+        return round(float(m_lakh.group(1)) * 100000.0, 2)
+    m_k = re.match(r"^(?:₹|rs\.?|inr)?\s*(\d+(?:\.\d+)?)\s*k\b", cleaned, re.IGNORECASE)
+    if m_k:
+        return round(float(m_k.group(1)) * 1000.0, 2)
+    m_num = re.search(r"(-?\d+(?:\.\d+)?)", cleaned)
+    if m_num:
+        try:
+            return float(m_num.group(1))
+        except ValueError:
+            return None
+    return None
+
+
+def _coerce_optional_bool(val: Any) -> bool | None:
+    if isinstance(val, bool):
+        return val
+    if val is None:
+        return None
+    low = str(val).strip().lower()
+    if low in ("true", "yes", "1"):
+        return True
+    if low in ("false", "no", "0"):
+        return False
+    return None
 
 
 def _sanitize_gemini_nulls(raw: Any) -> Any:
-    """Convert literal 'null'/'none'/'undefined'/empty strings from LLM JSON into Python None."""
+    """Normalize literal 'null', formatted numbers/dates/lists, and fences in LLM JSON outputs."""
     if not isinstance(raw, dict):
         return raw
     cleaned: dict[str, Any] = {}
     for k, v in raw.items():
+        if k in _FLOAT_FIELDS:
+            cleaned[k] = _coerce_optional_float(v)
+            continue
+        if k == "is_ambiguous":
+            cleaned[k] = bool(_coerce_optional_bool(v))
+            continue
+        if k == "boq_scope_changed":
+            cleaned[k] = _coerce_optional_bool(v)
+            continue
+        if k in _JSON_STRING_FIELDS:
+            if isinstance(v, (list, dict)):
+                cleaned[k] = json.dumps(v, ensure_ascii=False)
+            elif isinstance(v, str):
+                unwrapped = _strip_json_fences(v)
+                if unwrapped.lower() in _NULL_STRINGS:
+                    cleaned[k] = "{}" if k == "slot_patch_json" else None
+                else:
+                    cleaned[k] = unwrapped
+            else:
+                cleaned[k] = "{}" if k == "slot_patch_json" else None
+            continue
+        if k in _LIST_FIELDS:
+            if v is None:
+                cleaned[k] = []
+            elif isinstance(v, str):
+                if v.strip().lower() in _NULL_STRINGS:
+                    cleaned[k] = []
+                else:
+                    cleaned[k] = [
+                        part.strip()
+                        for part in v.split(",")
+                        if part.strip() and part.strip().lower() not in _NULL_STRINGS
+                    ]
+            elif isinstance(v, list):
+                cleaned[k] = [
+                    item
+                    for item in v
+                    if item is not None
+                    and not (isinstance(item, str) and item.strip().lower() in _NULL_STRINGS)
+                ]
+            else:
+                cleaned[k] = []
+            continue
+
         if isinstance(v, str) and v.strip().lower() in _NULL_STRINGS:
             cleaned[k] = None
         elif isinstance(v, list):
             cleaned[k] = [
                 item
                 for item in v
-                if not (isinstance(item, str) and item.strip().lower() in _NULL_STRINGS)
+                if item is not None
+                and not (isinstance(item, str) and item.strip().lower() in _NULL_STRINGS)
             ]
         else:
             cleaned[k] = v
@@ -79,6 +172,11 @@ class DisambiguationChoice(BaseModel):
         default="{}",
         description="JSON object string of slots to merge if user taps this button (e.g. '{\"project_id\":\"...\"}').",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _clean_null_strings(cls, data: Any) -> Any:
+        return _sanitize_gemini_nulls(data)
 
 
 class GoalIntentItem(BaseModel):
@@ -234,6 +332,11 @@ class ErrorRepairProposal(BaseModel):
         default_factory=list,
         description="1 to 2 concrete 1-tap repair options patching slots to fix the validation issue.",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _clean_null_strings(cls, data: Any) -> Any:
+        return _sanitize_gemini_nulls(data)
 
 
 class MemoryRuleOutput(BaseModel):
@@ -656,7 +759,7 @@ async def run_agent_turn(
             response_format=resp_format,
         )
 
-    raw_json = getattr(interaction, "output_text", None) or ""
+    raw_json = _strip_json_fences(getattr(interaction, "output_text", None) or "")
     envelope = AgentTurnEnvelope.model_validate_json(raw_json)
     if envelope.intent_category == "goal_actions" and not envelope.goal_items:
         try:
@@ -678,8 +781,8 @@ async def run_agent_turn(
                 generation_config={"thinking_level": thinking_level},
                 response_format=resp_format,
             )
-            retry_json = getattr(retry_interaction, "output_text", None) or ""
-            if retry_json.strip():
+            retry_json = _strip_json_fences(getattr(retry_interaction, "output_text", None) or "")
+            if retry_json:
                 envelope = AgentTurnEnvelope.model_validate_json(retry_json)
         except Exception as exc:
             logger.warning("Empty goal_items retry failed safely: %s", exc)
@@ -919,6 +1022,253 @@ def _backfill_financial_slots_from_text(
             slots["party_name"] = p_rows[0]["customer_name"]
 
 
+def _is_valid_uuid(val: Any) -> bool:
+    if val is None:
+        return False
+    try:
+        uuid.UUID(str(val).strip())
+        return True
+    except (ValueError, AttributeError):
+        return False
+
+
+def _is_fake_db(sb: Any) -> bool:
+    return hasattr(sb, "store")
+
+
+def _accept_id(sb: Any, val: Any, table: str | None = None) -> bool:
+    if val is None or str(val).strip().lower() in _NULL_STRINGS:
+        return False
+    if _is_valid_uuid(val):
+        return True
+    if _is_fake_db(sb) and not getattr(sb, "strict_uuids", False):
+        if table is None:
+            return True
+        return any(str(r.get("id")) == str(val) for r in (sb.store.get(table) or []))
+    return False
+
+
+def _resolve_person_id_by_name(sb: Any, raw: str) -> str | None:
+    needle = (raw or "").strip().lower()
+    if not needle or needle in _NULL_STRINGS:
+        return None
+    rows = (
+        sb.table("people")
+        .select("id,full_name,aliases,is_active")
+        .eq("is_active", True)
+        .execute()
+        .data
+        or []
+    )
+    exact: list[str] = []
+    partial: list[str] = []
+    for r in rows:
+        names = [str(r.get("full_name") or "").strip().lower(), *(str(a).strip().lower() for a in (r.get("aliases") or []))]
+        if any(n == needle for n in names if n):
+            exact.append(str(r["id"]))
+        elif any(needle in n or n in needle for n in names if n):
+            partial.append(str(r["id"]))
+    if len(exact) == 1:
+        return exact[0]
+    if not exact and len(partial) == 1:
+        return partial[0]
+    return None
+
+
+def _resolve_project_id_by_hint(sb: Any, raw: str | None) -> str | None:
+    hint = (raw or "").strip().lstrip("#").strip()
+    if not hint or hint.lower() in _NULL_STRINGS:
+        return None
+    rows = (
+        sb.table("projects")
+        .select("id,project_code,customer_name,status")
+        .execute()
+        .data
+        or []
+    )
+    low = hint.lower()
+    code_matches = [str(r["id"]) for r in rows if str(r.get("project_code") or "").strip().lower() == low]
+    if len(code_matches) == 1:
+        return code_matches[0]
+    active_rows = [r for r in rows if r.get("status", "active") == "active"] or rows
+    exact_cust = [str(r["id"]) for r in active_rows if str(r.get("customer_name") or "").strip().lower() == low]
+    if len(exact_cust) == 1:
+        return exact_cust[0]
+    partial_cust = [str(r["id"]) for r in active_rows if low in str(r.get("customer_name") or "").strip().lower()]
+    if len(partial_cust) == 1:
+        return partial_cust[0]
+    return None
+
+
+def _resolve_entity_id_by_name(sb: Any, table: str, name_col: str, raw: str | None) -> str | None:
+    hint = (raw or "").strip()
+    if not hint or hint.lower() in _NULL_STRINGS:
+        return None
+    rows = (
+        sb.table(table)
+        .select(f"id,{name_col},aliases,is_active")
+        .eq("is_active", True)
+        .execute()
+        .data
+        or []
+    )
+    low = hint.lower()
+    exact: list[str] = []
+    for r in rows:
+        candidates = [str(r.get(name_col) or "").strip().lower(), *(str(a).strip().lower() for a in (r.get("aliases") or []))]
+        if any(c == low for c in candidates if c):
+            exact.append(str(r["id"]))
+    if len(exact) == 1:
+        return exact[0]
+    return None
+
+
+def _sanitize_and_resolve_slot_ids(sb: Any, slots: dict[str, Any]) -> None:
+    """Resolve accidental project codes / human names in UUID slots and normalize dates/stages."""
+    op = str(slots.get("operation_kind") or "")
+
+    # 1. project_id: accept valid UUID/fake ID, else resolve from PRJ-code or customer_name
+    pid = slots.get("project_id")
+    if pid is not None and not _accept_id(sb, pid, "projects"):
+        resolved_pid = _resolve_project_id_by_hint(sb, str(pid))
+        if resolved_pid:
+            slots["project_id"] = resolved_pid
+        else:
+            slots.pop("project_id", None)
+    if not slots.get("project_id") and op in (
+        "pipeline_stage_move",
+        "material_stage_move",
+        "item_upsert_or_move",
+        "item_material_upsert",
+        "update_order_details",
+        "customer_receipt",
+    ):
+        hint = slots.get("party_name") or slots.get("full_name")
+        resolved_pid = _resolve_project_id_by_hint(sb, hint)
+        if resolved_pid:
+            slots["project_id"] = resolved_pid
+
+    # 2. item_id: if LLM put item name ('Sofa') into item_id, move to item_name
+    iid = slots.get("item_id")
+    if iid is not None and not _accept_id(sb, iid, "project_items"):
+        raw_item = str(iid).strip()
+        if raw_item and not slots.get("item_name"):
+            slots["item_name"] = raw_item
+        slots.pop("item_id", None)
+
+    # 3. People / Mistri UUID fields
+    for col in ("production_mistri_id", "assembly_mistri_id", "sizing_mistri_id", "person_id"):
+        val = slots.get(col)
+        if val is not None and not _accept_id(sb, val, "people"):
+            resolved = _resolve_person_id_by_name(sb, str(val))
+            if resolved:
+                slots[col] = resolved
+            else:
+                slots.pop(col, None)
+
+    if isinstance(slots.get("estimator_ids"), list):
+        resolved_ests: list[str] = []
+        for entry in slots["estimator_ids"]:
+            if _accept_id(sb, entry, "people"):
+                resolved_ests.append(str(entry))
+            else:
+                r_id = _resolve_person_id_by_name(sb, str(entry))
+                if r_id:
+                    resolved_ests.append(r_id)
+        slots["estimator_ids"] = resolved_ests
+
+    # 4. customer_id & vendor_id
+    cid = slots.get("customer_id")
+    if cid is not None and not _accept_id(sb, cid, "customers"):
+        resolved_cid = _resolve_entity_id_by_name(sb, "customers", "full_name", str(cid))
+        if resolved_cid:
+            slots["customer_id"] = resolved_cid
+        else:
+            raw_c = str(cid).strip()
+            if raw_c and not slots.get("full_name") and not slots.get("party_name"):
+                slots["full_name"] = raw_c
+            slots.pop("customer_id", None)
+
+    vid = slots.get("vendor_id")
+    if vid is not None and not _accept_id(sb, vid, "vendors"):
+        resolved_vid = _resolve_entity_id_by_name(sb, "vendors", "canonical_name", str(vid))
+        if resolved_vid:
+            slots["vendor_id"] = resolved_vid
+        else:
+            raw_v = str(vid).strip()
+            if raw_v and not slots.get("party_name"):
+                slots["party_name"] = raw_v
+            slots.pop("vendor_id", None)
+
+    # 5. Canonicalize stages, material_status, and dates
+    if slots.get("to_stage"):
+        norm_st = step_executors.normalize_stage_code_for_op(op, str(slots["to_stage"]))
+        if norm_st:
+            slots["to_stage"] = norm_st
+    if slots.get("material_status"):
+        slots["material_status"] = step_executors.normalize_material_status(str(slots["material_status"]))
+    for dcol in ("promised_delivery_date", "txn_date"):
+        if dcol in slots and slots[dcol] is not None:
+            clean_d = step_executors.sanitize_iso_date(slots[dcol])
+            if clean_d:
+                slots[dcol] = clean_d
+            else:
+                slots.pop(dcol, None)
+
+
+_MAT_UNIT_RE = (
+    r"(sheets?|pcs?|pieces?|mtrs?|meters?|sqft|sq\.?ft|rft|kg|kgs|ltrs?|liters?|litres?|box(?:es)?|sets?|rolls?)"
+)
+
+
+def _backfill_material_slots_from_text(
+    slots: dict[str, Any],
+    *,
+    user_text: str | None,
+    heard_transcript: str | None,
+) -> None:
+    """Deterministically extract material_lines_json / material_status if LLM put details only in summary/text."""
+    if str(slots.get("operation_kind") or "") != "item_material_upsert":
+        return
+    if not slots.get("material_lines_json"):
+        extracted: list[dict[str, Any]] = []
+        pattern = re.compile(
+            rf"(\d+(?:\.\d+)?)\s*{_MAT_UNIT_RE}\s+(?:of\s+)?([A-Za-z0-9][A-Za-z0-9\s./+-]{{1,48}}?)"
+            r"(?=\s+(?:to|in|on|for|mein|me|ke|ki|ka|aur|and)\b|$|,|;)",
+            re.IGNORECASE,
+        )
+        for src_text in (user_text, heard_transcript, slots.get("summary_title")):
+            txt = (src_text or "").strip()
+            if not txt:
+                continue
+            matches = list(pattern.finditer(txt))
+            if matches:
+                for m in matches:
+                    qty = float(m.group(1))
+                    unit = m.group(2).lower().rstrip(".")
+                    name = re.sub(r"\s+", " ", m.group(3)).strip(" .,-")
+                    if name:
+                        extracted.append(
+                            {
+                                "material_name": name,
+                                "quantity": round(qty, 2),
+                                "unit": unit,
+                                "status": slots.get("material_status") or "needed",
+                            }
+                        )
+                if extracted:
+                    slots["material_lines_json"] = json.dumps(extracted, ensure_ascii=False)
+                    break
+    if not slots.get("material_status") and not slots.get("material_lines_json"):
+        combined = " ".join((t or "").lower() for t in (user_text, heard_transcript, slots.get("summary_title")))
+        if any(p in combined for p in ("in shop", "in ship", "arrived", "received")):
+            slots["material_status"] = "in_shop"
+        elif "ordered" in combined:
+            slots["material_status"] = "ordered"
+        elif "to order" in combined:
+            slots["material_status"] = "needed"
+
+
 async def _process_goal_intent_item(
     sb: Any,
     *,
@@ -939,7 +1289,7 @@ async def _process_goal_intent_item(
     prior_summary = ""
     existing_goal_id: str | None = None
 
-    if item.target_open_goal_id:
+    if item.target_open_goal_id and _accept_id(sb, item.target_open_goal_id, "agent_goals"):
         g_rows = (
             sb.table("agent_goals")
             .select("*")
@@ -1001,6 +1351,12 @@ async def _process_goal_intent_item(
         user_text=user_text,
         heard_transcript=heard_transcript,
     )
+    _backfill_material_slots_from_text(
+        slots,
+        user_text=user_text,
+        heard_transcript=heard_transcript,
+    )
+    _sanitize_and_resolve_slot_ids(sb, slots)
 
     # Resolve payment_account_code -> payment_account_id
     if slots.get("payment_account_code") and slots["payment_account_code"] in acc_code_to_id:
@@ -1327,8 +1683,11 @@ def _upsert_goal_row(
     customer_id: str | None,
     user_message: str | None = None,
 ) -> dict[str, Any]:
+    safe_owner = goal_intelligence._safe_uuid_for_db(sb, owner_person_id)
+    safe_proj = goal_intelligence._safe_uuid_for_db(sb, project_id, project_lookup=True)
+    safe_cust = goal_intelligence._safe_uuid_for_db(sb, customer_id)
     payload: dict[str, Any] = {
-        "owner_person_id": owner_person_id,
+        "owner_person_id": safe_owner,
         "source_channel": source_channel,
         "domain_scope": domain_scope,
         "telegram_chat_id": telegram_chat_id,
@@ -1343,8 +1702,8 @@ def _upsert_goal_row(
         "pending_prompt": pending_prompt,
         "steps": steps,
         "repair_options": repair_options,
-        "project_id": project_id,
-        "customer_id": customer_id,
+        "project_id": safe_proj,
+        "customer_id": safe_cust,
     }
     if user_message and user_message.strip():
         payload["turn_digest"] = [{"user": user_message.strip()[:400]}]
@@ -1379,7 +1738,8 @@ async def confirm_and_execute_goal(
         }
 
     steps: list[dict[str, Any]] = list(claimed.get("steps") or [])
-    slots: dict[str, Any] = dict(claimed.get("collected_slots") or {})
+    slots: dict[str, Any] = _sanitize_gemini_nulls(dict(claimed.get("collected_slots") or {}))
+    _sanitize_and_resolve_slot_ids(sb, slots)
     heard = claimed.get("heard_transcript")
     receipts: list[str] = []
     undo_ids: list[str] = list(claimed.get("undo_event_ids") or [])
@@ -1542,8 +1902,8 @@ async def confirm_and_execute_goal(
             "steps": steps,
             "collected_slots": slots,
             "undo_event_ids": undo_ids,
-            "project_id": slots.get("project_id"),
-            "customer_id": slots.get("customer_id"),
+            "project_id": goal_intelligence._safe_uuid_for_db(sb, slots.get("project_id"), project_lookup=True),
+            "customer_id": goal_intelligence._safe_uuid_for_db(sb, slots.get("customer_id")),
             "metadata": meta_done,
             "resolved_at": datetime.now(timezone.utc).isoformat(),
         }
@@ -1912,7 +2272,7 @@ async def _diagnose_validation_error_with_hydrogen(
                 ),
             },
         )
-        return ErrorRepairProposal.model_validate_json(interaction.output_text or "")
+        return ErrorRepairProposal.model_validate_json(_strip_json_fences(interaction.output_text or ""))
     except Exception as exc:
         logger.warning("Hydrogen error diagnosis fallback: %s", exc)
         return ErrorRepairProposal(
@@ -1937,7 +2297,8 @@ async def apply_slot_patch_and_resume(
         return {"ok": False, "error": "Goal not found."}
     g = rows[0]
     prior_slots = dict(g.get("collected_slots") or {})
-    merged_slots = {**prior_slots, **slot_patch}
+    merged_slots = _sanitize_gemini_nulls({**prior_slots, **slot_patch})
+    _sanitize_and_resolve_slot_ids(sb, merged_slots)
     await asyncio.to_thread(
         goal_intelligence.maybe_distill_procedural_memory,
         sb,
@@ -1952,7 +2313,7 @@ async def apply_slot_patch_and_resume(
     # If resolving homonym disambiguation ('gathering_info') for a Confirm-Gated operation,
     # pause cleanly at 'awaiting_confirmation' with a Before->After preview card!
     target_before_row = _fetch_target_row_for_slots(sb, op, merged_slots)
-    is_auto_commit = op in ("pipeline_stage_move", "material_stage_move", "item_upsert_or_move") or (
+    is_auto_commit = op in ("pipeline_stage_move", "material_stage_move", "item_upsert_or_move", "item_material_upsert") or (
         op in ("update_customer", "update_vendor", "update_person", "update_order_details")
         and not is_high_sensitivity_master_mutation(op, merged_slots, target_before_row)
     )
@@ -2009,7 +2370,8 @@ def edit_open_goal_slots(
         return {"ok": False, "error": "Goal not found."}
     g = rows[0]
     prior_slots = dict(g.get("collected_slots") or {})
-    merged_slots = {**prior_slots, **slot_patch}
+    merged_slots = _sanitize_gemini_nulls({**prior_slots, **slot_patch})
+    _sanitize_and_resolve_slot_ids(sb, merged_slots)
     memory_res = goal_intelligence.maybe_distill_procedural_memory(
         sb,
         prior_summary=str(g.get("summary_title") or ""),

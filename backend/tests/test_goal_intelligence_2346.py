@@ -1323,3 +1323,247 @@ async def test_item_materials_crud_track_sync_undo_agent_and_rest_api():
     finally:
         app.dependency_overrides.clear()
 
+
+@pytest.mark.asyncio
+async def test_ai_text_update_adversarial_null_uuid_typecast_and_fallback_hardening():
+    import uuid as _uuid
+    from app.services import step_executors
+
+    UUID_COLS = {
+        "projects": {"id", "customer_id", "designed_by_id", "sizing_mistri_id", "material_owner_id"},
+        "project_items": {"id", "project_id", "production_mistri_id", "assembly_mistri_id", "qc_passed_by_id"},
+        "item_materials": {"id", "project_id", "item_id"},
+        "customers": {"id"},
+        "vendors": {"id"},
+        "people": {"id", "linked_vendor_id"},
+        "stage_events": {"id", "project_id", "item_id", "actor_person_id", "undone_by_person_id"},
+        "agent_goals": {"id", "owner_person_id", "project_id", "customer_id"},
+    }
+    UUID_LIST_COLS = {
+        "projects": {"estimator_ids", "current_owner_ids"},
+        "stage_events": {"assigned_people_ids", "undo_event_ids"},
+        "agent_goals": {"undo_event_ids"},
+    }
+
+    def _assert_uuid(table_name: str, col: str, val: Any) -> None:
+        if val is None:
+            return
+        if col in UUID_COLS.get(table_name, set()):
+            try:
+                _uuid.UUID(str(val))
+            except ValueError as exc:
+                raise RuntimeError(f"22P02 invalid input syntax for type uuid: {val!r} ({table_name}.{col})") from exc
+        if col in UUID_LIST_COLS.get(table_name, set()) and isinstance(val, list):
+            for entry in val:
+                try:
+                    _uuid.UUID(str(entry))
+                except ValueError as exc:
+                    raise RuntimeError(f"22P02 invalid input syntax for type uuid[]: {entry!r} ({table_name}.{col})") from exc
+
+    class _StrictQuery(FakeQuery):
+        def __init__(self, table_name: str, rows: list[dict[str, Any]]):
+            super().__init__(rows)
+            self._tname = table_name
+
+        def eq(self, col: str, val: Any) -> "_StrictQuery":
+            _assert_uuid(self._tname, col, val)
+            return super().eq(col, val)
+
+        def in_(self, col: str, vals: list[Any]) -> "_StrictQuery":
+            for v in vals:
+                _assert_uuid(self._tname, col, v)
+            return super().in_(col, vals)
+
+        def execute(self) -> SimpleNamespace:
+            if self._op == "insert":
+                items = self._payload if isinstance(self._payload, list) else [self._payload]
+                created = []
+                for it in items:
+                    row = {"id": it.get("id") or str(_uuid.uuid4()), **it}
+                    for k, v in row.items():
+                        _assert_uuid(self._tname, k, v)
+                    self._rows.append(row)
+                    created.append(dict(row))
+                return SimpleNamespace(data=created)
+            if self._op == "update":
+                for k, v in (self._payload or {}).items():
+                    _assert_uuid(self._tname, k, v)
+            return super().execute()
+
+    class _StrictTable(FakeTable):
+        def __init__(self, table_name: str, rows: list[dict[str, Any]]):
+            super().__init__(rows)
+            self._tname = table_name
+
+        def _q(self) -> _StrictQuery:
+            return _StrictQuery(self._tname, self.rows)
+
+    class _StrictUuidSupabase(FakeSupabase):
+        strict_uuids = True
+
+        def table(self, name: str) -> _StrictTable:
+            return _StrictTable(name, self.store.setdefault(name, []))
+
+    pid_samiksha = str(_uuid.uuid4())
+    cid_samiksha = str(_uuid.uuid4())
+    pid_arvind = str(_uuid.uuid4())
+    pid_manish = str(_uuid.uuid4())
+    pid_shreyansh = str(_uuid.uuid4())
+
+    sb = _StrictUuidSupabase(
+        {
+            "people": [
+                {"id": pid_shreyansh, "full_name": "Shreyansh", "email": "shreyansh@example.com", "person_type": "operator", "aliases": [], "is_active": True},
+                {"id": pid_arvind, "full_name": "Arvind Ji", "person_type": "salaried_karigar", "aliases": ["Arvind", "Arvind Sharma"], "is_active": True},
+                {"id": pid_manish, "full_name": "Manish Cushioning", "person_type": "contractor_mistri", "aliases": ["Manish Katiriya", "Manish"], "is_active": True},
+            ],
+            "customers": [
+                {"id": cid_samiksha, "full_name": "Samiksha Mam", "aliases": ["Samiksha"], "is_active": True}
+            ],
+            "vendors": [],
+            "projects": [
+                {
+                    "id": pid_samiksha,
+                    "project_code": "PRJ-OCT-007",
+                    "customer_id": cid_samiksha,
+                    "customer_name": "Samiksha Mam",
+                    "project_type": "customer",
+                    "pipeline_stage": "estimating",
+                    "material_stage": "not_started",
+                    "status": "active",
+                }
+            ],
+            "project_items": [],
+            "item_materials": [],
+            "stage_events": [],
+            "agent_goals": [],
+        }
+    )
+
+    # 1. Adversarial fenced JSON with formatted numbers, string booleans, comma aliases, list JSON-strings, dates & stage names
+    fenced_raw = """```json
+{
+  "intent_category": "goal_actions",
+  "heard_transcript": "null",
+  "direct_reply_text": "null",
+  "referenced_project_id": "PRJ-OCT-007",
+  "referenced_customer_id": "unknown-id",
+  "goal_items": [
+    {
+      "target_open_goal_id": "1",
+      "operation_kind": "item_material_upsert",
+      "summary_title": "Add 8 sheets 18mm HDHMR ply to Sofa on Samiksha",
+      "project_id": "PRJ-OCT-007",
+      "item_id": "Sofa",
+      "production_mistri_id": "Manish Katiriya",
+      "vendor_id": "Doorset",
+      "estimator_ids": ["Arvind", "unknown_person"],
+      "amount_inr": "₹20,000",
+      "quoted_total": "4,50,000",
+      "boq_scope_changed": "true",
+      "is_ambiguous": "null",
+      "aliases": "Alias One, Alias Two",
+      "material_status": "In Ship",
+      "material_lines_json": [{"material_name": "18mm HDHMR Ply", "quantity": "8 sheets"}],
+      "promised_delivery_date": "25/11/2026"
+    }
+  ]
+}
+```"""
+    env = AgentTurnEnvelope.model_validate_json(agent_core._strip_json_fences(fenced_raw))
+    it = env.goal_items[0]
+    assert it.amount_inr == 20000.0
+    assert it.quoted_total == 450000.0
+    assert it.boq_scope_changed is True
+    assert it.is_ambiguous is False
+    assert it.aliases == ["Alias One", "Alias Two"]
+    assert isinstance(it.material_lines_json, str)
+
+    out = await agent_core._process_goal_intent_item(
+        sb,
+        item=it,
+        acc_code_to_id={},
+        owner_person_id=pid_shreyansh,
+        actor_label="Shreyansh",
+        source_channel="web_command_bar",
+        domain_scope="production",
+        thinking_level="low",
+        heard_transcript=None,
+        uploaded_gcs_paths=[],
+        ui_context={},
+        telegram_chat_id=None,
+        user_text="Add 8 sheets 18mm HDHMR ply to Sofa",
+    )
+    assert out["status"] == "completed"
+    assert out["project_id"] == pid_samiksha
+    assert len(sb.store["item_materials"]) == 1
+    assert sb.store["item_materials"][0]["quantity"] == 8.0
+    assert sb.store["item_materials"][0]["unit"] == "sheets"
+    assert sb.store["item_materials"][0]["status"] == "in_shop"
+    assert out["collected_slots"]["production_mistri_id"] == pid_manish
+    assert out["collected_slots"]["estimator_ids"] == [pid_arvind]
+    assert out["collected_slots"]["party_name"] == "Doorset"
+    assert out["collected_slots"]["promised_delivery_date"] == "2026-11-25"
+
+    # 2. Human stage names normalize cleanly + invalid dates become None
+    assert step_executors.normalize_stage_code_for_op("pipeline_stage_move", "Quoted to Customer") == "quoted_awaiting_advance"
+    assert step_executors.normalize_stage_code_for_op("item_upsert_or_move", "Packed") == "packed_ready"
+    assert step_executors.normalize_stage_code_for_op("material_stage_move", "In Ship") == "all_in_shop"
+    assert step_executors.sanitize_iso_date("25/11/2026") == "2026-11-25"
+    assert step_executors.sanitize_iso_date("TBD") is None
+
+    # 3. Deterministic _backfill_material_slots_from_text when material_lines_json is omitted
+    mat_slots: dict[str, Any] = {
+        "operation_kind": "item_material_upsert",
+        "project_id": pid_samiksha,
+        "item_name": "Sofa",
+        "summary_title": "Add ply to Sofa",
+    }
+    agent_core._backfill_material_slots_from_text(
+        mat_slots, user_text="Add 8 sheets 18mm HDHMR ply to Sofa", heard_transcript=None
+    )
+    parsed_mat = json.loads(mat_slots["material_lines_json"])
+    assert parsed_mat[0]["quantity"] == 8.0
+    assert parsed_mat[0]["unit"] == "sheets"
+    assert "18mm HDHMR ply" in parsed_mat[0]["material_name"]
+
+    # 4. record_query_turn_in_history resolves PRJ code & drops invalid customer UUID on _StrictUuidSupabase
+    q_row = goal_intelligence.record_query_turn_in_history(
+        sb,
+        owner_person_id=pid_shreyansh,
+        source_channel="web_command_bar",
+        domain_scope="production",
+        telegram_chat_id=None,
+        ui_context={},
+        thinking_level="low",
+        user_text="How much is pending for Samiksha?",
+        heard_transcript=None,
+        reply_text="₹1,80,700 pending.",
+        referenced_project_id="PRJ-OCT-007",
+        referenced_customer_id="unknown-id",
+    )
+    assert q_row is not None
+    assert q_row["project_id"] == pid_samiksha
+    assert q_row["customer_id"] is None
+
+    # 5. Never-500 guard on /api/agent/turn
+    app.dependency_overrides[get_current_user] = lambda: CurrentUser(
+        auth_type="supabase", identifier="shreyansh@example.com", display_name="Shreyansh"
+    )
+    try:
+        with (
+            patch("app.routers.domains.get_supabase_admin", return_value=sb),
+            patch("app.routers.domains.agent_core.run_agent_turn", side_effect=RuntimeError("boom")),
+        ):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                r = await client.post("/api/agent/turn", data={"text": "test", "domain_scope": "production"})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["is_error"] is True
+        assert "preserved" in body["reply_text"]
+    finally:
+        app.dependency_overrides.clear()
+
+
