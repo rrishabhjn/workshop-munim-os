@@ -1152,3 +1152,174 @@ def test_financial_slot_backfill_extracts_amount_and_cash_account():
     assert slots_k["amount_inr"] == 50000.0
     assert slots_k["payment_account_code"] == "rgb"
 
+
+@pytest.mark.asyncio
+async def test_item_materials_crud_track_sync_undo_agent_and_rest_api():
+    from app.services import step_executors
+
+    # 1. Category inference & status normalization ('To Order' / 'Ordered' / 'In Ship' -> 'in_shop')
+    assert step_executors.infer_material_category("18mm HDHMR Ply") == "ply_wood"
+    assert step_executors.infer_material_category("Advance 1mm Laminate") == "laminate"
+    assert step_executors.infer_material_category("Ebco Soft Close Hinges") == "hardware"
+    assert step_executors.infer_material_category("Sleepwell 40D Foam") == "foam_fabric"
+    assert step_executors.infer_material_category("Fevicol SWR Adhesive") == "polish"
+    assert step_executors.normalize_material_status("To Order") == "needed"
+    assert step_executors.normalize_material_status("Ordered") == "ordered"
+    assert step_executors.normalize_material_status("In Ship") == "in_shop"
+    assert step_executors.normalize_material_status("In Shop") == "in_shop"
+
+    # 2. Direct executor batch add -> auto-sync check_stock -> ordered_pending -> all_in_shop + Undo
+    sb = FakeSupabase(
+        {
+            "people": [
+                {"id": "p-shreyansh", "full_name": "Shreyansh", "email": "shreyansh@example.com", "person_type": "operator", "is_active": True},
+                {"id": "p-ansh", "full_name": "Ansh", "person_type": "operator", "is_default_purchase": True, "is_active": True},
+            ],
+            "projects": [
+                {
+                    "id": "prj-1",
+                    "project_code": "PRJ-OCT-007",
+                    "customer_name": "Samiksha Mam",
+                    "project_type": "customer",
+                    "pipeline_stage": "execution",
+                    "material_stage": "not_started",
+                    "status": "active",
+                }
+            ],
+            "project_items": [
+                {"id": "it-1", "project_id": "prj-1", "item_name": "Sofa", "stage": "in_shop"},
+                {"id": "it-2", "project_id": "prj-1", "item_name": "TV Panel", "stage": "in_shop"},
+            ],
+            "material_categories": [
+                {"code": "ply_wood", "label": "Ply / Wood", "sort_order": 1},
+                {"code": "hardware", "label": "Hardware", "sort_order": 3},
+            ],
+            "item_materials": [],
+        }
+    )
+
+    add1 = await step_executors.add_item_materials_batch(
+        sb,
+        project_id="prj-1",
+        item_id="it-1",
+        materials=[
+            {"material_name": "18mm Ply", "quantity": 6, "unit": "sheets"},
+            {"material_name": "Sleepwell 40D Foam", "quantity": 4, "unit": "pcs"},
+        ],
+        actor_person_id="p-shreyansh",
+    )
+    assert add1["ok"] is True
+    assert len(sb.store["item_materials"]) == 2
+    assert sb.store["projects"][0]["material_stage"] == "check_stock"
+
+    # Marking 1 row ordered moves project track -> ordered_pending
+    m1_id, m2_id = add1["material_ids"]
+    upd1 = step_executors.update_item_materials_rows(
+        sb,
+        material_ids=[m1_id],
+        patch={"status": "ordered"},
+        actor_person_id="p-ansh",
+    )
+    assert upd1["ok"] is True
+    assert sb.store["projects"][0]["material_stage"] == "ordered_pending"
+
+    # Marking both In Shop moves project track -> all_in_shop
+    upd2 = step_executors.update_item_materials_rows(
+        sb,
+        material_ids=[m1_id, m2_id],
+        patch={"status": "in_shop"},
+        actor_person_id="p-ansh",
+    )
+    assert upd2["ok"] is True
+    assert sb.store["projects"][0]["material_stage"] == "all_in_shop"
+
+    # Undo upd2 reverts material status & project material_stage back to ordered_pending
+    reverted = step_executors.undo_stage_events(sb, upd2["undo_event_ids"], actor_person_id="p-ansh")
+    assert reverted
+    assert sb.store["projects"][0]["material_stage"] == "ordered_pending"
+
+    # Delete + Undo restores deleted row
+    del_res = step_executors.delete_item_material_row(sb, material_id=m2_id, actor_person_id="p-ansh")
+    assert del_res["ok"] is True
+    assert len(sb.store["item_materials"]) == 1
+    step_executors.undo_stage_events(sb, del_res["undo_event_ids"], actor_person_id="p-ansh")
+    assert len(sb.store["item_materials"]) == 2
+
+    # 3. AgentCore item_material_upsert (creates missing item + adds material + verifies + undoes)
+    item = agent_core.GoalIntentItem(
+        operation_kind="item_material_upsert",
+        summary_title="Add Hinges to Wardrobe on Samiksha",
+        project_id="prj-1",
+        item_name="Wardrobe",
+        material_lines_json=json.dumps([
+            {"material_name": "Ebco Soft Close Hinges", "quantity": 12, "unit": "pcs", "status": "needed"}
+        ]),
+    )
+    out = await agent_core._process_goal_intent_item(
+        sb,
+        item=item,
+        acc_code_to_id={},
+        owner_person_id="p-shreyansh",
+        actor_label="Shreyansh",
+        source_channel="web_command_bar",
+        domain_scope="production",
+        thinking_level="low",
+        heard_transcript=None,
+        uploaded_gcs_paths=[],
+        ui_context={},
+        telegram_chat_id=None,
+        user_text="Wardrobe mein 12 Ebco Hinges add karo",
+    )
+    assert out["status"] == "completed"
+    assert out["verified"] is True
+    assert out["undo_available"] is True
+    assert len(sb.store["project_items"]) == 3
+    assert len(sb.store["item_materials"]) == 3
+
+    undo_res = agent_core.undo_completed_goal(sb, goal_id=out["goal_id"], actor_person_id="p-shreyansh")
+    assert undo_res["ok"] is True
+    assert len(sb.store["project_items"]) == 2
+    assert len(sb.store["item_materials"]) == 2
+
+    # 4. REST Endpoints + /api/production/overview nesting
+    app.dependency_overrides[get_current_user] = lambda: CurrentUser(
+        auth_type="supabase", identifier="shreyansh@example.com", display_name="Shreyansh"
+    )
+    try:
+        with patch("app.routers.domains.get_supabase_admin", return_value=sb):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                r_add = await client.post(
+                    "/api/production/items/it-2/materials",
+                    json={"material_name": "18mm Ply", "quantity": 4, "unit": "sheets"},
+                )
+                assert r_add.status_code == 200
+                new_mid = r_add.json()["material_ids"][0]
+
+                r_patch = await client.patch(
+                    f"/api/production/materials/{new_mid}",
+                    json={"status": "ordered"},
+                )
+                assert r_patch.status_code == 200
+
+                r_bulk = await client.post(
+                    "/api/production/orders/prj-1/materials/bulk-status",
+                    json={"material_ids": [m1_id, new_mid], "status": "in_shop"},
+                )
+                assert r_bulk.status_code == 200
+
+                r_ov = await client.get("/api/production/overview")
+                assert r_ov.status_code == 200
+                ov = r_ov.json()
+                assert len(ov["lookups"]["material_categories"]) == 2
+                prj_ov = ov["orders"][0]
+                assert len(prj_ov["item_materials"]) == 3
+                tv_item = next(i for i in prj_ov["items"] if i["id"] == "it-2")
+                assert len(tv_item["materials"]) == 1
+
+                r_del = await client.delete(f"/api/production/materials/{new_mid}")
+                assert r_del.status_code == 200
+    finally:
+        app.dependency_overrides.clear()
+

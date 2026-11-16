@@ -222,6 +222,29 @@ def _verify_single_step(
             return "Item production_mistri_id did not match requested Mistri."
         return None
 
+    if op == "item_material_upsert":
+        mat_ids = [str(mid) for mid in (res.get("material_ids") or []) if mid]
+        if not mat_ids:
+            return "No raw material IDs returned after save."
+        rows = (
+            sb.table("item_materials")
+            .select("id,status")
+            .in_("id", mat_ids)
+            .execute()
+            .data
+            or []
+        )
+        if len(rows) < len(mat_ids):
+            return f"Expected {len(mat_ids)} raw material row(s), found {len(rows)} after save."
+        if merged.get("material_status"):
+            from app.services.step_executors import normalize_material_status
+
+            expected_st = normalize_material_status(merged["material_status"])
+            for r in rows:
+                if r.get("status") != expected_st:
+                    return f"Expected material status='{expected_st}' but found '{r.get('status')}'."
+        return None
+
     if op == "new_lead":
         prj_id = res.get("project_id") or merged.get("project_id")
         cust_id = res.get("customer_id") or merged.get("customer_id")

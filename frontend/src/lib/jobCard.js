@@ -10,10 +10,20 @@ export async function shareKarigarJobCard({
   item,
   shopMistriName,
   siteMistriName,
+  materials = [],
 }) {
+  const matLines = (materials || [])
+    .slice(0, 10)
+    .map((m) => {
+      const q = Number(m.quantity || 0);
+      const qFmt = Number.isInteger(q) ? q : q.toFixed(1);
+      return `• ${m.material_name} — ${qFmt} ${m.unit || "pcs"}`;
+    });
+  const extraHeight = matLines.length > 0 ? 72 + matLines.length * 36 : 0;
+
   const width = 900;
   const padding = 48;
-  const height = 860;
+  const height = 860 + extraHeight;
 
   const canvas = document.createElement("canvas");
   canvas.width = width;
@@ -57,6 +67,20 @@ export async function shareKarigarJobCard({
   drawField("Target Date", formatDate(item.target_date));
   drawField("Dimensions", item.dimensions || "As per finalized sizing");
   drawField("Specs / Finish Notes", item.specs_notes || "Standard workshop finish");
+
+  if (matLines.length > 0) {
+    y += 8;
+    ctx.fillStyle = "#78716c";
+    ctx.font = "bold 20px sans-serif";
+    ctx.fillText("RAW MATERIALS", padding, y);
+    y += 38;
+    ctx.fillStyle = "#1c1917";
+    ctx.font = "24px sans-serif";
+    for (const line of matLines) {
+      ctx.fillText(line.slice(0, 58), padding, y);
+      y += 36;
+    }
+  }
 
   ctx.fillStyle = "#e7e5e4";
   ctx.fillRect(padding, height - 90, width - padding * 2, 2);

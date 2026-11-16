@@ -103,6 +103,29 @@ class UndoEventsRequest(BaseModel):
     event_ids: list[str]
 
 
+class ItemMaterialCreateRequest(BaseModel):
+    material_name: str = Field(min_length=1, max_length=200)
+    quantity: float = Field(default=1.0, gt=0)
+    unit: str = Field(default="pcs", max_length=40)
+    category: str | None = None
+    status: str = "needed"
+    notes: str | None = None
+
+
+class ItemMaterialPatchRequest(BaseModel):
+    material_name: str | None = None
+    quantity: float | None = Field(default=None, gt=0)
+    unit: str | None = None
+    category: str | None = None
+    status: str | None = None
+    notes: str | None = None
+
+
+class BulkMaterialStatusRequest(BaseModel):
+    material_ids: list[str] = Field(min_length=1)
+    status: str
+
+
 class PersonCreateRequest(BaseModel):
     full_name: str = Field(min_length=1, max_length=120)
     person_type: str = "salaried_karigar"
@@ -188,6 +211,7 @@ async def get_production_overview(
     material_stages = sb.table("material_track_stages").select("*").order("sort_order").execute().data or []
     payment_stages = sb.table("payment_track_stages").select("*").order("sort_order").execute().data or []
     item_stages = sb.table("workshop_stages").select("*").order("sort_order").execute().data or []
+    material_categories = sb.table("material_categories").select("*").order("sort_order").execute().data or []
 
     people = (
         sb.table("people")
@@ -220,6 +244,7 @@ async def get_production_overview(
     )
     order_ids = [o["id"] for o in orders]
     items: list[dict[str, Any]] = []
+    materials: list[dict[str, Any]] = []
     if order_ids:
         items = (
             sb.table("project_items")
@@ -230,11 +255,35 @@ async def get_production_overview(
             .data
             or []
         )
+        materials = (
+            sb.table("item_materials")
+            .select("*")
+            .in_("project_id", order_ids)
+            .order("created_at")
+            .execute()
+            .data
+            or []
+        )
+
+    materials_by_item: dict[str, list[dict[str, Any]]] = {}
+    materials_by_order: dict[str, list[dict[str, Any]]] = {}
+    for m in materials:
+        materials_by_item.setdefault(m["item_id"], []).append(m)
+        materials_by_order.setdefault(m["project_id"], []).append(m)
+
     items_by_order: dict[str, list[dict[str, Any]]] = {}
     for it in items:
-        items_by_order.setdefault(it["project_id"], []).append(it)
+        enriched_item = {**it, "materials": materials_by_item.get(it["id"], [])}
+        items_by_order.setdefault(it["project_id"], []).append(enriched_item)
 
-    enriched_orders = [{**o, "items": items_by_order.get(o["id"], [])} for o in orders]
+    enriched_orders = [
+        {
+            **o,
+            "items": items_by_order.get(o["id"], []),
+            "item_materials": materials_by_order.get(o["id"], []),
+        }
+        for o in orders
+    ]
     whos_doing_what = sb.table("v_whos_doing_what").select("*").execute().data or []
     needs_info = sb.table("v_needs_info_queue").select("*").execute().data or []
 
@@ -250,6 +299,7 @@ async def get_production_overview(
             "material_stages": material_stages,
             "payment_stages": payment_stages,
             "item_stages": item_stages,
+            "material_categories": material_categories,
         },
         "people": people,
         "customers": customers,
@@ -410,6 +460,100 @@ async def update_order_flat_item(
     )
     if not res.get("ok"):
         raise HTTPException(status_code=400, detail=res.get("error", {}).get("message", "Failed updating item"))
+    return res
+
+
+@router.post("/production/items/{item_id}/materials")
+async def add_item_raw_material(
+    item_id: str,
+    body: ItemMaterialCreateRequest,
+    user: CurrentUser = Depends(get_current_user),
+) -> dict[str, Any]:
+    sb = get_supabase_admin()
+    actor_id, _ = _resolve_actor_person(sb, user)
+    cur = sb.table("project_items").select("project_id").eq("id", item_id).limit(1).execute().data
+    if not cur:
+        raise HTTPException(status_code=404, detail="Item not found")
+    res = await step_executors.add_item_materials_batch(
+        sb,
+        project_id=cur[0]["project_id"],
+        item_id=item_id,
+        materials=[body.model_dump()],
+        actor_person_id=actor_id,
+        source_channel="web",
+    )
+    if not res.get("ok"):
+        raise HTTPException(status_code=400, detail=res.get("error", {}).get("message", "Failed adding material"))
+    return res
+
+
+@router.patch("/production/materials/{material_id}")
+async def patch_item_raw_material(
+    material_id: str,
+    body: ItemMaterialPatchRequest,
+    user: CurrentUser = Depends(get_current_user),
+) -> dict[str, Any]:
+    sb = get_supabase_admin()
+    actor_id, _ = _resolve_actor_person(sb, user)
+    res = step_executors.update_item_materials_rows(
+        sb,
+        material_ids=[material_id],
+        patch=body.model_dump(exclude_none=True),
+        actor_person_id=actor_id,
+        source_channel="web",
+    )
+    if not res.get("ok"):
+        raise HTTPException(status_code=400, detail=res.get("error", {}).get("message", "Failed updating material"))
+    return res
+
+
+@router.post("/production/orders/{project_id}/materials/bulk-status")
+async def bulk_update_order_materials_status(
+    project_id: str,
+    body: BulkMaterialStatusRequest,
+    user: CurrentUser = Depends(get_current_user),
+) -> dict[str, Any]:
+    sb = get_supabase_admin()
+    actor_id, _ = _resolve_actor_person(sb, user)
+    rows = (
+        sb.table("item_materials")
+        .select("id")
+        .eq("project_id", project_id)
+        .in_("id", body.material_ids)
+        .execute()
+        .data
+        or []
+    )
+    valid_ids = [r["id"] for r in rows]
+    if not valid_ids:
+        raise HTTPException(status_code=404, detail="No matching material lines on this order")
+    res = step_executors.update_item_materials_rows(
+        sb,
+        material_ids=valid_ids,
+        patch={"status": body.status},
+        actor_person_id=actor_id,
+        source_channel="web",
+    )
+    if not res.get("ok"):
+        raise HTTPException(status_code=400, detail=res.get("error", {}).get("message", "Failed updating material status"))
+    return res
+
+
+@router.delete("/production/materials/{material_id}")
+async def delete_item_raw_material(
+    material_id: str,
+    user: CurrentUser = Depends(get_current_user),
+) -> dict[str, Any]:
+    sb = get_supabase_admin()
+    actor_id, _ = _resolve_actor_person(sb, user)
+    res = step_executors.delete_item_material_row(
+        sb,
+        material_id=material_id,
+        actor_person_id=actor_id,
+        source_channel="web",
+    )
+    if not res.get("ok"):
+        raise HTTPException(status_code=404, detail=res.get("error", {}).get("message", "Material line not found"))
     return res
 
 

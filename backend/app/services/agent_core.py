@@ -97,6 +97,7 @@ class GoalIntentItem(BaseModel):
         "pipeline_stage_move",
         "material_stage_move",
         "item_upsert_or_move",
+        "item_material_upsert",
         "customer_receipt",
         "vendor_payment",
         "expense",
@@ -153,6 +154,14 @@ class GoalIntentItem(BaseModel):
     specs_notes: str | None = None
     production_mistri_id: str | None = None
     assembly_mistri_id: str | None = None
+    material_lines_json: str | None = Field(
+        default=None,
+        description='JSON array string of [{"material_name":"18mm HDHMR Ply","quantity":8,"unit":"sheets","status":"needed"}] for item_material_upsert.',
+    )
+    material_status: str | None = Field(
+        default=None,
+        description="Target material status ('needed' = To Order, 'ordered' = Ordered, 'in_shop' = In Shop) when updating item material status.",
+    )
 
     # Munim Financial & Bill Slots
     amount_inr: float | None = Field(
@@ -476,10 +485,11 @@ def _build_system_instruction(grounding_json: str) -> str:
         "`amount_inr` and `payment_account_code` in `goal_items`. If account or party is truly missing, ask for ALL "
         "missing fields in ONE consolidated `clarification_question`. "
         "Never put a Supabase UUID into `zoho_contact_id`.\n"
-        "5. PRODUCTION LIFECYCLE STAGES:\n"
+        "5. PRODUCTION LIFECYCLE STAGES & ITEM RAW MATERIALS:\n"
         "   - Project `pipeline_stage_move`: `lead` -> `design` -> `estimating` -> `quoted_awaiting_advance` -> `site_sizing_boq` -> `execution` -> `completed`.\n"
         "   - Ansh `material_stage_move`: `check_stock` -> `ordered_pending` -> `all_in_shop`.\n"
         "   - Flat Item `item_upsert_or_move` ('Kitchen', 'Master Bed'): `in_shop` -> `packed_ready` -> `at_site` -> `qc_done`.\n"
+        "   - Item Raw Materials `item_material_upsert`: To add raw material requirements under a furniture item, set `project_id`, `item_name` (or `item_id`), and `material_lines_json` (JSON array of `{material_name, quantity, unit, status}` with `status` `'needed'`='To Order', `'ordered'`='Ordered', `'in_shop'`='In Shop'). To mark existing item materials Ordered/In Shop, set `project_id`, optional `item_name` / `material_lines_json`, and `material_status`.\n"
         "6. MASTER SPINE & ORDER METADATA CRUD:\n"
         "   - Always search first to populate exact `customer_id`, `vendor_id`, `person_id`, or `project_id`.\n"
         "   - Standalone customer (without an order): `add_customer`. Vendor or Mistri onboarding: `add_person_or_vendor`.\n"
@@ -778,6 +788,7 @@ def _map_op_to_db_goal_type(op: str) -> str:
         "pipeline_stage_move": "stage_update",
         "material_stage_move": "stage_update",
         "item_upsert_or_move": "stage_update",
+        "item_material_upsert": "stage_update",
         "customer_receipt": "financial_txn",
         "vendor_payment": "financial_txn",
         "expense": "financial_txn",
@@ -972,6 +983,7 @@ async def _process_goal_intent_item(
         "pipeline_stage_move",
         "material_stage_move",
         "item_upsert_or_move",
+        "item_material_upsert",
         "update_order_details",
     ):
         slots["project_id"] = ui_context["viewing_project_id"]
@@ -1039,6 +1051,11 @@ async def _process_goal_intent_item(
             missing.append("project_id")
         if not slots.get("item_id") and not slots.get("item_name"):
             missing.append("item_name")
+    elif op == "item_material_upsert":
+        if not slots.get("project_id"):
+            missing.append("project_id")
+        elif not slots.get("material_lines_json") and not slots.get("material_status"):
+            missing.append("material_lines_json")
     elif op in ("customer_receipt", "vendor_payment", "expense", "float_transfer"):
         if not slots.get("amount_inr") or float(slots.get("amount_inr") or 0) <= 0:
             missing.append("amount_inr")
@@ -1102,14 +1119,14 @@ async def _process_goal_intent_item(
     ) and not is_high_sensitivity_master_mutation(op, slots, target_before_row)
 
     # Case B: Unambiguous Production Lifecycle OR Low-Sensitivity Detail Edit -> AUTO-COMMIT + 1-Tap [↩️ Undo]!
-    if op in ("pipeline_stage_move", "material_stage_move", "item_upsert_or_move") or is_low_risk_entity_edit:
+    if op in ("pipeline_stage_move", "material_stage_move", "item_upsert_or_move", "item_material_upsert") or is_low_risk_entity_edit:
         steps = _build_steps_for_slots(op, slots)
         goal_row = _upsert_goal_row(
             sb,
             goal_id=existing_goal_id,
             owner_person_id=owner_person_id,
             source_channel=source_channel,
-            domain_scope="production" if op in ("pipeline_stage_move", "material_stage_move", "item_upsert_or_move", "update_order_details") else domain_scope,
+            domain_scope="production" if op in ("pipeline_stage_move", "material_stage_move", "item_upsert_or_move", "item_material_upsert", "update_order_details") else domain_scope,
             telegram_chat_id=telegram_chat_id,
             ui_context=ui_context,
             goal_type=_map_op_to_db_goal_type(op),
@@ -1185,6 +1202,7 @@ def _default_missing_question(op: str, missing: list[str]) -> str:
         "project_id": "Which Customer Order",
         "archive_entity_kind": "Record Type (Customer / Vendor / Person / Order)",
         "item_name": "Furniture Item Name (e.g. Kitchen, Bed)",
+        "material_lines_json": "Raw Material Name & Quantity (e.g. 8 sheets 18mm Ply)",
         "to_stage": "Target Stage",
     }
     nice = ", ".join(labels.get(m, m) for m in missing)
@@ -1593,6 +1611,78 @@ async def _run_single_step(
             assembly_mistri_id=slots.get("assembly_mistri_id"),
             dimensions=slots.get("dimensions"),
             specs_notes=slots.get("specs_notes"),
+            actor_person_id=actor_person_id,
+            source_channel=src,
+            heard_transcript=heard_transcript,
+        )
+    if op == "item_material_upsert":
+        project_id = str(slots["project_id"])
+        raw_lines_str = slots.get("material_lines_json")
+        parsed_lines: list[dict[str, Any]] = []
+        if raw_lines_str:
+            try:
+                loaded = json.loads(raw_lines_str) if isinstance(raw_lines_str, str) else raw_lines_str
+                if isinstance(loaded, list):
+                    parsed_lines = [dict(x) for x in loaded if isinstance(x, dict)]
+                elif isinstance(loaded, dict):
+                    parsed_lines = [dict(loaded)]
+            except (TypeError, ValueError):
+                parsed_lines = []
+
+        target_status = slots.get("material_status")
+        is_status_update_only = bool(target_status) and (
+            not parsed_lines or all(x.get("quantity") in (None, "", 0) for x in parsed_lines)
+        )
+        if is_status_update_only:
+            query = sb.table("item_materials").select("*").eq("project_id", project_id)
+            item_id_filter = slots.get("item_id")
+            if not item_id_filter and slots.get("item_name"):
+                found_it = (
+                    sb.table("project_items")
+                    .select("id")
+                    .eq("project_id", project_id)
+                    .ilike("item_name", str(slots["item_name"]).strip())
+                    .limit(1)
+                    .execute()
+                    .data
+                    or []
+                )
+                if found_it:
+                    item_id_filter = found_it[0]["id"]
+            if item_id_filter:
+                query = query.eq("item_id", item_id_filter)
+            existing_mats = query.execute().data or []
+            name_needles = [
+                str(x.get("material_name") or "").strip().lower()
+                for x in parsed_lines
+                if str(x.get("material_name") or "").strip()
+            ]
+            if name_needles and existing_mats:
+                existing_mats = [
+                    m
+                    for m in existing_mats
+                    if any(n in str(m.get("material_name") or "").lower() for n in name_needles)
+                ]
+            if existing_mats:
+                return step_executors.update_item_materials_rows(
+                    sb,
+                    material_ids=[str(m["id"]) for m in existing_mats],
+                    patch={"status": str(target_status)},
+                    actor_person_id=actor_person_id,
+                    source_channel=src,
+                    heard_transcript=heard_transcript,
+                )
+
+        if target_status:
+            for line in parsed_lines:
+                line.setdefault("status", str(target_status))
+
+        return await step_executors.add_item_materials_batch(
+            sb,
+            project_id=project_id,
+            item_id=slots.get("item_id"),
+            item_name=slots.get("item_name"),
+            materials=parsed_lines,
             actor_person_id=actor_person_id,
             source_channel=src,
             heard_transcript=heard_transcript,

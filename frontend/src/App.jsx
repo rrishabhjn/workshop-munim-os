@@ -228,7 +228,7 @@ export default function App() {
     <div className="min-h-screen bg-stone-100 text-stone-900">
       {/* Top Header with Domain Switcher (/production vs /munim) + Needs Info Bell */}
       <header className="sticky top-0 z-30 bg-white/95 backdrop-blur border-b border-stone-200">
-        <div className="max-w-4xl mx-auto px-3 py-2.5 flex items-center justify-between gap-2">
+        <div className="max-w-6xl mx-auto px-3 py-2.5 flex items-center justify-between gap-2">
           <div className="flex items-center gap-1.5 bg-stone-100 p-1 rounded-xl">
             <button
               onClick={() => switchDomain("production")}
@@ -289,7 +289,7 @@ export default function App() {
 
         {/* Production 2-Screen Sub-Nav */}
         {domain === "production" && (
-          <div className="max-w-4xl mx-auto px-3 pb-2 flex items-center gap-2">
+          <div className="max-w-6xl mx-auto px-3 pb-2 flex items-center gap-2">
             <button
               onClick={() => setProdTab("whos_doing_what")}
               className={`flex-1 min-h-[42px] rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition ${
@@ -317,7 +317,7 @@ export default function App() {
       </header>
 
       {/* Main Content */}
-      <main className="max-w-4xl mx-auto px-3 pt-4">
+      <main className="max-w-6xl mx-auto px-3 pt-4">
         {domain === "production" ? (
           prodTab === "whos_doing_what" ? (
             <WhosDoingWhat

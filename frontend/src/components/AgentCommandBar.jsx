@@ -649,7 +649,7 @@ export default function AgentCommandBar({
       )}
 
       {/* Persistent Bottom Command Bar + Floating Response / Undo Sheet */}
-      <div className="fixed bottom-0 inset-x-0 z-40 pointer-events-none">
+      <div className="fixed bottom-0 inset-x-0 z-[45] pointer-events-none">
         <div className="max-w-4xl mx-auto px-3 pb-3 space-y-2 pointer-events-auto">
           {/* Quick UI Stage Undo Toast */}
           {undoToast && (
