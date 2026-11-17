@@ -75,10 +75,12 @@ async def _find_existing_by_reference(
     return None
 
 
-async def ensure_project_zoho_bridge(sb: Any, project_id: str) -> dict[str, Any]:
+async def ensure_project_zoho_bridge(
+    sb: Any, project_id: str, *, ensure_contact: bool = False
+) -> dict[str, Any]:
     """Smart Auto-Bridge on Zoho Standard Plan:
-    Ensures Zoho Customer Contact + 1:1 Zoho 'Project' Reporting Tag option exist
-    when an order converts (Advance In / Site Sizing / first financial entry).
+    Ensures the 1:1 Zoho 'Project' Reporting Tag option exists when an order converts,
+    and optionally ensures a Zoho Customer Contact (for explicit AR Draft Invoices/Payments).
     """
     pkg = _pkg()
     prj_rows = (
@@ -120,8 +122,8 @@ async def ensure_project_zoho_bridge(sb: Any, project_id: str) -> dict[str, Any]
         if cust_row and cust_row.get("zoho_contact_id"):
             zoho_contact_id = cust_row["zoho_contact_id"]
 
-    # 1. Ensure Zoho Customer Contact
-    if not zoho_contact_id:
+    # 1. Ensure Zoho Customer Contact only when explicitly requested (Draft Invoice / AR Payment)
+    if ensure_contact and not zoho_contact_id:
         display_name = prj["customer_name"]
         if cust_row and cust_row.get("area_landmark"):
             display_name = f"{cust_row['full_name']} ({cust_row['area_landmark']})"

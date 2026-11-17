@@ -21,7 +21,7 @@ async def test_sales_receipts_walkin_counter_and_active_project_payment_track():
     """Walk-in counter sales book Zoho /banktransactions -> Sales without project_id; active orders update Payment Track."""
     sb = seed_goal_intelligence_sb()
     sb.store["customers"].append(
-        {"id": "c-chiranji", "full_name": "Chiranji Lal", "zoho_contact_id": "zc-chir", "is_active": True}
+        {"id": "c-chiranji", "full_name": "Chiranji Lal", "is_active": True}
     )
     sb.store["payment_accounts"].append(
         {
@@ -61,8 +61,6 @@ async def test_sales_receipts_walkin_counter_and_active_project_payment_track():
                 return httpx.Response(400, json={"code": 1002, "message": "Invalid transaction_type"})
             posted_bt.append(body)
             return httpx.Response(200, json={"banktransaction": {"transaction_id": f"bt-{len(posted_bt)}"}})
-        if method == "GET" and path == "/contacts":
-            return httpx.Response(200, json={"contacts": [{"contact_id": "zc-chir", "contact_name": "Chiranji Lal"}]})
         raise AssertionError(f"Unexpected Zoho call: {method} {path}")
 
     # 1. Counter sale ("1,05,000 cash sales to chiranji lal for door and laminate sales") -> no project_id, direct Sales
@@ -122,7 +120,8 @@ async def test_sales_receipts_walkin_counter_and_active_project_payment_track():
         )
         assert exec_counter["status"] == "completed"
         assert "Zoho `sales_deposit`" in exec_counter["receipt"]
-        assert posted_bt[0]["customer_id"] == "zc-chir"
+        assert "customer_id" not in posted_bt[0]
+        assert "Chiranji Lal" in posted_bt[0]["description"]
         assert posted_bt[0]["from_account_id"] == "inc-sales"
         assert posted_bt[0]["to_account_id"] == "za-cash"
         assert posted_bt[0]["amount"] == 105000.0
@@ -144,6 +143,7 @@ async def test_sales_receipts_walkin_counter_and_active_project_payment_track():
     assert res_proj["ok"] is True
     assert sb.store["projects"][0]["payment_stage"] == "advance_in"
     assert sb.store["projects"][0]["paid_cache_inr"] == 50000.0
+    assert posted_bt[1]["customer_id"] == "zc-amb"
     assert posted_bt[1]["from_account_id"] == "inc-sales"
     assert posted_bt[1]["to_account_id"] == "za-rgb"
     assert posted_bt[1]["transaction_type"] == "other_income"
@@ -496,4 +496,82 @@ async def test_latency_optimizations_1_to_4():
     assert slots["customer_id"] == "c-chir"
     assert slots["zoho_contact_id"] == "zc-chir-9"
     assert slots["is_new_payee"] is False
+
+
+@pytest.mark.asyncio
+async def test_same_name_customer_vendor_zoho_collision_auto_suffixes():
+    """Customer/Vendor sharing a name auto-suffixes on Zoho 3062 collision instead of locking out."""
+    fake_settings = Settings(zoho_client_id="c", zoho_client_secret="s", zoho_refresh_token="r", zoho_org_id="o")
+    posted_names: list[tuple[str, str]] = []
+    double_collide = False
+
+    async def fake_zoho_req(client, method, path, *, params=None, json_body=None):
+        if method == "POST" and path == "/contacts":
+            cname = str((json_body or {}).get("contact_name") or "")
+            ctype = str((json_body or {}).get("contact_type") or "")
+            posted_names.append((cname, ctype))
+            if cname in ("Suresh Ji", "Sunil"):
+                return httpx.Response(
+                    400,
+                    json={"code": 3062, "message": f"The contact name {cname} already exists."},
+                )
+            if cname == "Suresh Ji (Customer)":
+                if double_collide:
+                    return httpx.Response(
+                        400,
+                        json={"code": 3062, "message": "The contact name Suresh Ji (Customer) already exists."},
+                    )
+                return httpx.Response(
+                    201,
+                    json={"contact": {"contact_id": "zc-suresh-cust", "contact_name": "Suresh Ji (Customer)"}},
+                )
+            if cname == "Sunil (Vendor)":
+                return httpx.Response(
+                    201,
+                    json={"contact": {"contact_id": "zv-sunil-vend", "contact_name": "Sunil (Vendor)"}},
+                )
+        if method == "GET" and path == "/contacts":
+            return httpx.Response(
+                200,
+                json={
+                    "contacts": [
+                        {"contact_id": "zc-suresh-other", "contact_name": "Suresh Kumawat"},
+                        {"contact_id": "zc-suresh-cust", "contact_name": "Suresh Ji (Customer)"},
+                    ]
+                },
+            )
+        raise AssertionError(f"Unexpected Zoho call: {method} {path} params={params}")
+
+    with (
+        patch("app.services.zoho.get_settings", return_value=fake_settings),
+        patch("app.services.zoho._zoho_request", side_effect=fake_zoho_req),
+    ):
+        # 1. Vendor "Suresh Ji" exists -> Customer "Suresh Ji" auto-suffixes to "Suresh Ji (Customer)"
+        res_cust = await zoho.create_zoho_contact("Suresh Ji", "customer")
+        assert res_cust["ok"] is True
+        assert res_cust["contact"]["contact_id"] == "zc-suresh-cust"
+        assert res_cust["contact"]["contact_name"] == "Suresh Ji (Customer)"
+
+        # 2. Customer "Sunil" exists -> Vendor "Sunil" auto-suffixes to "Sunil (Vendor)"
+        res_vend = await zoho.create_zoho_contact("Sunil", "vendor")
+        assert res_vend["ok"] is True
+        assert res_vend["contact"]["contact_id"] == "zv-sunil-vend"
+        assert res_vend["contact"]["contact_name"] == "Sunil (Vendor)"
+
+        # 3. If both bare AND suffixed already exist, fallback GET resolves existing suffixed row
+        double_collide = True
+        res_existing = await zoho.create_zoho_contact("Suresh Ji", "customer")
+        assert res_existing["ok"] is True
+        assert res_existing["contact"]["contact_id"] == "zc-suresh-cust"
+
+        # 4. search_zoho_contacts recognizes "Suresh Ji (Customer)" as an exact match alone
+        found = await zoho.search_zoho_contacts("Suresh Ji", "customer")
+        assert len(found) == 1
+        assert found[0]["contact_id"] == "zc-suresh-cust"
+
+    assert ("Suresh Ji", "customer") in posted_names
+    assert ("Suresh Ji (Customer)", "customer") in posted_names
+    assert ("Sunil", "vendor") in posted_names
+    assert ("Sunil (Vendor)", "vendor") in posted_names
+
 

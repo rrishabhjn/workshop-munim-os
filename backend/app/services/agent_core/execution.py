@@ -593,6 +593,7 @@ async def apply_slot_patch_and_resume(
         return {"ok": False, "error": "Goal not found."}
     g = rows[0]
     prior_slots = dict(g.get("collected_slots") or {})
+    explicit_op = str(slot_patch["operation_kind"]).strip() if slot_patch.get("operation_kind") else None
     merged_slots = _sanitize_gemini_nulls({**prior_slots, **slot_patch})
     _backfill_financial_slots_from_text(
         sb,
@@ -600,6 +601,8 @@ async def apply_slot_patch_and_resume(
         user_text=correction_note,
         heard_transcript=g.get("heard_transcript"),
     )
+    if explicit_op:
+        merged_slots["operation_kind"] = explicit_op
     _sanitize_and_resolve_slot_ids(sb, merged_slots)
     await asyncio.to_thread(
         goal_intelligence.maybe_distill_procedural_memory,

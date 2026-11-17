@@ -383,11 +383,9 @@ async def push_management_entry_to_zoho(
                         "zoho_id": existing_id,
                         "deduped": True,
                     }
-                if not zoho_contact_id and party_name:
-                    c_res = await pkg.resolve_or_create_contact(
-                        sb, party_name, "customer"
-                    )
-                    zoho_contact_id = c_res.get("contact_id")
+                # Routine Sales inflows (/banktransactions) do not create Zoho Customer Contacts
+                # for walk-in / one-off buyers (party_name is already stamped in desc); attach
+                # customer_id only when already cached on the linked customer/project.
                 coa_resp = await pkg._zoho_request(client, "GET", "/chartofaccounts")
                 accounts = coa_resp.json().get("chartofaccounts", []) if coa_resp.is_success else []
                 sales_coa = _pick_zoho_income_account(accounts)

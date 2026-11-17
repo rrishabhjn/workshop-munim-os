@@ -166,7 +166,12 @@ async def search_zoho_contacts(name: str, contact_type: str) -> list[dict[str, A
         return []
 
     target_lower = name.strip().lower()
-    exact = [c for c in contacts if (c.get("contact_name") or "").strip().lower() == target_lower]
+    suffixed_lower = f"{target_lower} ({contact_type.strip().lower()})"
+    exact = [
+        c
+        for c in contacts
+        if (c.get("contact_name") or "").strip().lower() in (target_lower, suffixed_lower)
+    ]
     if len(exact) == 1:
         return exact
     return contacts[:5]
@@ -201,6 +206,31 @@ async def create_zoho_contact(
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await pkg._zoho_request(client, "POST", "/contacts", json_body=payload)
+            if not resp.is_success and resp.status_code == 400 and (
+                "already exists" in resp.text.lower() or "3062" in resp.text
+            ):
+                # Zoho shares contact_name uniqueness across customers and vendors; auto-suffix on collision
+                suffix = " (Customer)" if contact_type == "customer" else " (Vendor)"
+                clean_name = name.strip()
+                disambiguated_name = (
+                    clean_name if clean_name.lower().endswith(suffix.lower()) else f"{clean_name}{suffix}"
+                )
+                if disambiguated_name != payload["contact_name"]:
+                    retry_payload = {**payload, "contact_name": disambiguated_name}
+                    resp = await pkg._zoho_request(client, "POST", "/contacts", json_body=retry_payload)
+                    if not resp.is_success and resp.status_code == 400 and (
+                        "already exists" in resp.text.lower() or "3062" in resp.text
+                    ):
+                        lookup_resp = await pkg._zoho_request(
+                            client,
+                            "GET",
+                            "/contacts",
+                            params={"contact_name_contains": disambiguated_name, "contact_type": contact_type},
+                        )
+                        if lookup_resp.is_success:
+                            for existing in lookup_resp.json().get("contacts", []):
+                                if (existing.get("contact_name") or "").strip().lower() == disambiguated_name.lower():
+                                    return {"ok": True, "contact": existing}
             if not resp.is_success:
                 return {"ok": False, "error": f"Zoho Contact error {resp.status_code}: {resp.text[:140]}"}
             return {"ok": True, "contact": resp.json().get("contact", {})}
