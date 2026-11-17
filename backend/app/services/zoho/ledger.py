@@ -288,7 +288,11 @@ async def push_management_entry_to_zoho(
         custom_field_api_name=settings.zoho_project_custom_field,
     )
     proj_prefix = f"[{bridge['cf_project_code']}] " if bridge.get("cf_project_code") else ""
-    desc = f"[{actor_label}] {proj_prefix}{party_name} {notes}".strip()[:250]
+    desc = (
+        f"[{actor_label}] {proj_prefix}{party_name} — {notes}"
+        if (party_name and notes)
+        else f"[{actor_label}] {proj_prefix}{party_name} {notes}"
+    ).strip()[:250]
 
     try:
         async with httpx.AsyncClient(timeout=12.0) as client:
@@ -386,8 +390,7 @@ async def push_management_entry_to_zoho(
                 # Routine Sales inflows (/banktransactions) do not create Zoho Customer Contacts
                 # for walk-in / one-off buyers (party_name is already stamped in desc); attach
                 # customer_id only when already cached on the linked customer/project.
-                coa_resp = await pkg._zoho_request(client, "GET", "/chartofaccounts")
-                accounts = coa_resp.json().get("chartofaccounts", []) if coa_resp.is_success else []
+                accounts = await pkg._get_chart_of_accounts(client)
                 sales_coa = _pick_zoho_income_account(accounts)
                 if not sales_coa:
                     return {
@@ -402,7 +405,7 @@ async def push_management_entry_to_zoho(
                     else "Bank Transfer"
                 )
                 resp = None
-                for tx_type in ("sales_without_invoices", "other_income", "deposit"):
+                for tx_type in ("deposit", "sales_without_invoices", "other_income"):
                     bt_payload: dict[str, Any] = {
                         "transaction_type": tx_type,
                         "from_account_id": sales_coa["account_id"],
@@ -568,8 +571,7 @@ async def push_management_entry_to_zoho(
                     "zoho_id": existing_id,
                     "deduped": True,
                 }
-            coa_resp = await pkg._zoho_request(client, "GET", "/chartofaccounts")
-            accounts = coa_resp.json().get("chartofaccounts", []) if coa_resp.is_success else []
+            accounts = await pkg._get_chart_of_accounts(client)
             cat_code = normalize_or_infer_expense_category(expense_category, party_name, notes)
             matched_coa = _pick_zoho_expense_account(accounts, cat_code)
             if not matched_coa:

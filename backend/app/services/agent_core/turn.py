@@ -455,6 +455,11 @@ async def run_agent_turn(
                 or has_open_target
                 or any(cue in low_clean for cue in pushback_cues)
             )
+            if not media_files and all(
+                set(entry["missing_slots"]) <= {"payment_account_code", "to_payment_account_code"}
+                for entry in unconfirmed_missing
+            ):
+                should_repair = False
             if should_repair:
                 repair_thinking: ThinkingLevel = "high" if thinking_level == "high" else "medium"
                 repair_prompt = (

@@ -41,6 +41,9 @@ _STALE_CLAIM_SECONDS = 120
 def _get_burst_lock(chat_id: int, user_id: int) -> asyncio.Lock:
     key = (int(chat_id), int(user_id))
     if key not in _BURST_LOCKS:
+        if len(_BURST_LOCKS) > 512:
+            for k in [k for k, lk in _BURST_LOCKS.items() if not lk.locked()]:
+                _BURST_LOCKS.pop(k, None)
         _BURST_LOCKS[key] = asyncio.Lock()
     return _BURST_LOCKS[key]
 
@@ -196,7 +199,7 @@ def _build_goal_keyboard(goal_out: dict[str, Any]) -> dict[str, Any] | None:
 
 
 async def _handle_agent_callback(
-    sb: Any, cq: dict[str, Any]
+    sb: Any, cq: dict[str, Any], *, already_answered: bool = False
 ) -> dict[str, Any]:
     cq_id = cq["id"]
     data = cq.get("data", "")
@@ -213,7 +216,8 @@ async def _handle_agent_callback(
     goal_id = parts[1] if len(parts) > 1 else ""
 
     if cmd == "ag_confirm":
-        await telegram_api.answer_callback_query(cq_id, "Saving...")
+        if not already_answered:
+            await telegram_api.answer_callback_query(cq_id, "Saving...")
         out = await agent_core.confirm_and_execute_goal(
             sb,
             goal_id=goal_id,
@@ -249,7 +253,8 @@ async def _handle_agent_callback(
             text=f"↩️ *Undone* — {summary}",
             reply_markup={"inline_keyboard": []},
         )
-        await telegram_api.answer_callback_query(cq_id, "Undone!")
+        if not already_answered:
+            await telegram_api.answer_callback_query(cq_id, "Undone!")
         return {"ok": True}
 
     if cmd == "ag_park":
@@ -260,7 +265,8 @@ async def _handle_agent_callback(
             text="📥 *Parked in 'Needs Info' Queue* for Clerk review.",
             reply_markup={"inline_keyboard": []},
         )
-        await telegram_api.answer_callback_query(cq_id, "Parked for Clerk")
+        if not already_answered:
+            await telegram_api.answer_callback_query(cq_id, "Parked for Clerk")
         return {"ok": True}
 
     if cmd == "ag_discard":
@@ -271,11 +277,13 @@ async def _handle_agent_callback(
             text="❌ *Discarded* — nothing was saved.",
             reply_markup={"inline_keyboard": []},
         )
-        await telegram_api.answer_callback_query(cq_id, "Discarded")
+        if not already_answered:
+            await telegram_api.answer_callback_query(cq_id, "Discarded")
         return {"ok": True}
 
     if cmd == "ag_choice" and len(parts) >= 3:
-        await telegram_api.answer_callback_query(cq_id, "Applying...")
+        if not already_answered:
+            await telegram_api.answer_callback_query(cq_id, "Applying...")
         choice_idx = int(parts[2])
         g_rows = sb.table("agent_goals").select("repair_options").eq("id", goal_id).limit(1).execute().data or []
         opts = (g_rows[0].get("repair_options") or []) if g_rows else []
@@ -304,7 +312,8 @@ async def _handle_agent_callback(
         )
         return {"ok": True}
 
-    await telegram_api.answer_callback_query(cq_id, "Action processed.")
+    if not already_answered:
+        await telegram_api.answer_callback_query(cq_id, "Action processed.")
     return {"ok": True}
 
 
@@ -605,7 +614,14 @@ async def telegram_webhook(
         ) from exc
 
     if "callback_query" in update:
-        return await _handle_agent_callback(sb, update["callback_query"])
+        cq = update["callback_query"]
+        if settings.cloud_tasks_enabled:
+            if settings.telegram_bot_token:
+                await telegram_api.answer_callback_query(str(cq.get("id") or ""), "Working...")
+            _dispatch_to_cloud_tasks({"callback_query": cq}, settings, delay_seconds=0.0)
+        else:
+            background_tasks.add_task(_handle_agent_callback, sb, cq)
+        return {"ok": True, "queued": True}
 
     msg = update.get("message") or update.get("edited_message") or {}
     if not msg or not chat_id or not user_id:
@@ -653,6 +669,10 @@ async def telegram_worker(
             detail="Invalid task worker secret.",
         )
     payload: dict[str, Any] = await request.json()
+    if isinstance(payload.get("callback_query"), dict):
+        return await _handle_agent_callback(
+            get_supabase_admin(), payload["callback_query"], already_answered=True
+        )
     chat_id = int(payload.get("chat_id") or 0)
     user_id = int(payload.get("user_id") or 0)
     if chat_id and user_id:

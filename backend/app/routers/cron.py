@@ -1,4 +1,4 @@
-from datetime import date, timedelta
+from datetime import datetime, timedelta
 import hmac
 from typing import Any
 
@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, status
 from app.config import Settings, get_settings
 from app.db import get_supabase_admin
 from app.services import sheets_backup, step_executors, telegram_api, zoho
-from app.services.goal_primitives import format_inr
+from app.services.goal_primitives import IST, format_inr
 
 router = APIRouter(prefix="/cron", tags=["cron"])
 
@@ -29,7 +29,7 @@ async def morning_brief(
     _verify_cron_secret(x_cron_secret, settings.cron_auth_secret)
     sb = get_supabase_admin()
 
-    today = date.today()
+    today = datetime.now(IST).date()
     three_days = (today + timedelta(days=3)).isoformat()
 
     upcoming_projects = (
@@ -50,7 +50,7 @@ async def morning_brief(
     ansh_pending = [w for w in wdw if w.get("work_kind") == "material_track"]
     packed_gate = [w for w in wdw if w.get("stage_code") == "packed_ready"]
 
-    needs_info = sb.table("v_needs_info_queue").select("goal_id,summary_title,status").limit(5).execute().data or []
+    needs_info = sb.table("v_needs_info_queue").select("goal_id,summary_title,status,domain_scope").limit(10).execute().data or []
     pnl_rows = (
         sb.table("v_project_pnl")
         .select("customer_name,balance_pending")
@@ -76,10 +76,18 @@ async def morning_brief(
         ", ".join(f"{r['customer_name']} ({format_inr(float(r.get('balance_pending') or 0))})" for r in pnl_rows)
         or "All caught up"
     )
-    needs_footer = (
-        f"\n\n📌 *Needs Info / Clerk Queue ({len(needs_info)}):* "
-        + "; ".join(n.get("summary_title") or n["status"] for n in needs_info[:3])
-        if needs_info
+    prod_needs = [n for n in needs_info if n.get("domain_scope") != "munim"]
+    munim_needs = [n for n in needs_info if n.get("domain_scope") in ("munim", "shared")]
+    prod_footer = (
+        f"\n\n📌 *Needs Info / Clerk Queue ({len(prod_needs)}):* "
+        + "; ".join(n.get("summary_title") or n["status"] for n in prod_needs[:3])
+        if prod_needs
+        else ""
+    )
+    munim_footer = (
+        f"\n\n📌 *Needs Info / Clerk Queue ({len(munim_needs)}):* "
+        + "; ".join(n.get("summary_title") or n["status"] for n in munim_needs[:3])
+        if munim_needs
         else ""
     )
 
@@ -88,13 +96,13 @@ async def morning_brief(
         f"• *Deliveries Due (≤3d):* {due_summary}\n"
         f"• *Stuck ≥3 Days:* {stale_summary}\n"
         f"• *Ansh Material Queue:* {len(ansh_pending)} order(s) | *Packed / Ready Gate:* {len(packed_gate)} piece(s)"
-        f"{needs_footer}"
+        f"{prod_footer}"
     )
     munim_brief = (
         f"📒 *Munim Morning Brief ({today.strftime('%d %b')})*\n\n"
         f"• *Top Pending Receivables:* {receivables_summary}\n"
         f"• *Deliveries Due (≤3d):* {due_summary}"
-        f"{needs_footer}"
+        f"{munim_footer}"
     )
 
     prod_kb = {"inline_keyboard": [[{"text": "🏭 Open Production", "url": f"{settings.app_base_url.rstrip('/')}/production"}]]}

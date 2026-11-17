@@ -14,9 +14,10 @@ from .common import (
     GoalChoiceRequest,
     GoalEditRequest,
     GoalReplyRequest,
+    _enforce_goal_munim_rbac,
+    _filter_needs_info_rows,
     _pkg,
     _resolve_actor_access,
-    _resolve_actor_person,
     _validate_goal_id_or_400,
 )
 
@@ -28,9 +29,10 @@ logger = logging.getLogger(__name__)
 async def list_needs_info_queue(
     user: CurrentUser = Depends(get_current_user),
 ) -> list[dict[str, Any]]:
-    _ = user
     sb = _pkg().get_supabase_admin()
-    return sb.table("v_needs_info_queue").select("*").execute().data or []
+    _, _, can_munim = _resolve_actor_access(sb, user)
+    rows = sb.table("v_needs_info_queue").select("*").execute().data or []
+    return _filter_needs_info_rows(rows, can_munim=can_munim)
 
 
 @router.post("/agent/turn")
@@ -102,7 +104,7 @@ async def confirm_agent_goal(
     pkg = _pkg()
     sb = pkg.get_supabase_admin()
     gid = _validate_goal_id_or_400(sb, goal_id)
-    actor_id, actor_name = _resolve_actor_person(sb, user)
+    actor_id, actor_name, _ = _enforce_goal_munim_rbac(sb, user, gid)
     try:
         return await pkg.agent_core.confirm_and_execute_goal(
             sb,
@@ -125,7 +127,7 @@ async def choose_agent_goal_option(
     pkg = _pkg()
     sb = pkg.get_supabase_admin()
     gid = _validate_goal_id_or_400(sb, goal_id)
-    actor_id, actor_name = _resolve_actor_person(sb, user)
+    actor_id, actor_name, _ = _enforce_goal_munim_rbac(sb, user, gid)
     try:
         return await pkg.agent_core.apply_slot_patch_and_resume(
             sb,
@@ -148,7 +150,7 @@ async def undo_agent_goal(
     pkg = _pkg()
     sb = pkg.get_supabase_admin()
     gid = _validate_goal_id_or_400(sb, goal_id)
-    actor_id, _ = _resolve_actor_person(sb, user)
+    actor_id, _, _ = _enforce_goal_munim_rbac(sb, user, gid)
     try:
         return pkg.agent_core.undo_completed_goal(sb, goal_id=gid, actor_person_id=actor_id)
     except Exception as exc:
@@ -161,10 +163,10 @@ async def park_agent_goal_for_clerk(
     goal_id: str,
     user: CurrentUser = Depends(get_current_user),
 ) -> dict[str, Any]:
-    _ = user
     pkg = _pkg()
     sb = pkg.get_supabase_admin()
     gid = _validate_goal_id_or_400(sb, goal_id)
+    _enforce_goal_munim_rbac(sb, user, gid)
     return pkg.agent_core.park_goal_for_clerk(sb, gid)
 
 
@@ -173,10 +175,10 @@ async def discard_agent_goal(
     goal_id: str,
     user: CurrentUser = Depends(get_current_user),
 ) -> dict[str, Any]:
-    _ = user
     pkg = _pkg()
     sb = pkg.get_supabase_admin()
     gid = _validate_goal_id_or_400(sb, goal_id)
+    _enforce_goal_munim_rbac(sb, user, gid)
     return pkg.agent_core.discard_goal(sb, gid)
 
 
@@ -186,10 +188,10 @@ async def edit_agent_goal(
     body: GoalEditRequest,
     user: CurrentUser = Depends(get_current_user),
 ) -> dict[str, Any]:
-    _ = user
     pkg = _pkg()
     sb = pkg.get_supabase_admin()
     gid = _validate_goal_id_or_400(sb, goal_id)
+    _enforce_goal_munim_rbac(sb, user, gid)
     try:
         return await asyncio.to_thread(
             pkg.agent_core.edit_open_goal_slots,
@@ -212,7 +214,7 @@ async def reply_to_agent_goal(
     pkg = _pkg()
     sb = pkg.get_supabase_admin()
     gid = _validate_goal_id_or_400(sb, goal_id)
-    actor_id, actor_name, _ = _resolve_actor_access(sb, user)
+    actor_id, actor_name, _ = _enforce_goal_munim_rbac(sb, user, gid)
     rows = sb.table("agent_goals").select("*").eq("id", gid).limit(1).execute().data or []
     if not rows:
         raise HTTPException(status_code=404, detail="Open goal not found.")

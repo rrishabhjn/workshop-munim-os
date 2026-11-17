@@ -89,7 +89,7 @@ GoalType = Literal[
 
 StepTarget = Literal["supabase", "zoho", "gcs"]
 StepStatus = Literal["pending", "succeeded", "failed_transient", "failed_validation"]
-StepErrorKind = Literal["none", "transient_5xx", "validation_400"]
+StepErrorKind = Literal["none", "transient_5xx", "validation_400", "auth_401"]
 ThinkingLevel = Literal["minimal", "low", "medium", "high", "xhigh"]
 
 
@@ -451,16 +451,33 @@ def claim_goal_for_execution(
         "parked_for_clerk",
     ),
 ) -> dict[str, Any] | None:
-    """Atomically transition goal -> 'executing' so double-taps on 4G never double-post."""
+    """Atomically transition goal -> 'executing' (with >90s stale-executing recovery)."""
+    now_utc = datetime.now(timezone.utc)
     res = (
         sb.table("agent_goals")
-        .update({"status": "executing"})
+        .update({"status": "executing", "updated_at": now_utc.isoformat()})
         .eq("id", goal_id)
         .in_("status", list(allowed_prior_statuses))
         .execute()
     )
     rows = res.data or []
-    return rows[0] if rows else None
+    if rows:
+        return rows[0]
+    cur = sb.table("agent_goals").select("id,status,updated_at").eq("id", goal_id).limit(1).execute().data or []
+    if cur and cur[0].get("status") == "executing":
+        ts = _parse_goal_utc(cur[0].get("updated_at"))
+        if ts and (now_utc - ts).total_seconds() > 90:
+            reclaimed = (
+                sb.table("agent_goals")
+                .update({"status": "executing", "updated_at": now_utc.isoformat()})
+                .eq("id", goal_id)
+                .eq("status", "executing")
+                .execute()
+                .data
+                or []
+            )
+            return reclaimed[0] if reclaimed else None
+    return None
 
 
 def merge_buffered_telegram_burst(
@@ -549,11 +566,13 @@ def build_zoho_standard_order_tags(
 def classify_external_error(
     status_code: int | None, is_timeout: bool = False
 ) -> StepErrorKind:
-    """Split transient infra errors (silent Cloud Tasks backoff) vs 400 data errors (LLM repair)."""
+    """Split transient infra errors, auth/scope errors (fast-fail), and 400 data errors."""
     if is_timeout or status_code is None:
         return "transient_5xx"
     if status_code == 429 or status_code >= 500:
         return "transient_5xx"
+    if status_code in (401, 403):
+        return "auth_401"
     if 400 <= status_code < 500:
         return "validation_400"
     return "none"

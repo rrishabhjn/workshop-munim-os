@@ -80,13 +80,27 @@ def _fetch_target_row_for_slots(sb: Any, op: str, slots: dict[str, Any]) -> dict
     return rows[0] if rows else None
 
 
+_AMT_PREFIX_BLOCK_RE = re.compile(r"(?:\b(?:room|sector|flat|shop|plot)|#)\s*$", re.IGNORECASE)
+_AMT_SUFFIX_BLOCK_RE = re.compile(
+    r"\s*(?:mm|cm|ft|feet|inch|in\b|sqft|sq\.?ft|rft|mtrs?|meters?|kg|kgs|ltrs?|liters?|litres?|pcs?|pieces?|sheets?|box(?:es)?|rolls?|sets?|bhk|rooms?|%|am\b|pm\b|days?|hrs?|hours?)\b",
+    re.IGNORECASE,
+)
+
+
 def _extract_inr_amount_from_text(*texts: str | None) -> float | None:
-    """Deterministic fallback to extract an INR amount (e.g. ₹20,000, 50k, 1.5L) if LLM left amount_inr blank."""
+    """Deterministic fallback to extract an INR amount (e.g. ₹25, 50k, 1.5L, 20,000) without grabbing specs/room numbers."""
     for raw in texts:
         txt = (raw or "").strip()
         if not txt:
             continue
         cleaned = re.sub(r"\bPRJ-[A-Z0-9-]+\b", " ", txt, flags=re.IGNORECASE)
+        for m_cur in re.finditer(r"(?:₹|rs\.?|inr)\s*(\d[\d,]*(?:\.\d{1,2})?)\b(?!\s*(?:lakh|lac|l|k)\b)", cleaned, re.IGNORECASE):
+            try:
+                val = round(float(m_cur.group(1).replace(",", "")), 2)
+                if val > 0:
+                    return val
+            except ValueError:
+                continue
         m_lakh = re.search(r"(?:₹|rs\.?|inr)?\s*(\d+(?:\.\d+)?)\s*(?:lakh|lac|l)\b", cleaned, re.IGNORECASE)
         if m_lakh:
             val = round(float(m_lakh.group(1)) * 100000.0, 2)
@@ -97,11 +111,12 @@ def _extract_inr_amount_from_text(*texts: str | None) -> float | None:
             val = round(float(m_k.group(1)) * 1000.0, 2)
             if val > 0:
                 return val
-        for m_num in re.finditer(r"(?:₹|rs\.?|inr)?\s*(\d[\d,]*(?:\.\d{1,2})?)", cleaned, re.IGNORECASE):
-            num_str = m_num.group(1).replace(",", "")
+        for m_num in re.finditer(r"(?<![A-Za-z0-9])(\d[\d,]*(?:\.\d{1,2})?)(?![A-Za-z0-9])", cleaned):
+            if _AMT_PREFIX_BLOCK_RE.search(cleaned[: m_num.start()]) or _AMT_SUFFIX_BLOCK_RE.match(cleaned[m_num.end() :]):
+                continue
             try:
-                val = round(float(num_str), 2)
-                if val >= 10:
+                val = round(float(m_num.group(1).replace(",", "")), 2)
+                if val >= 50:
                     return val
             except ValueError:
                 continue

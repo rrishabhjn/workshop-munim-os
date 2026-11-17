@@ -59,6 +59,14 @@ class FakeQuery:
             self._filters.append(lambda r: r.get(col) is not None)
         return self
 
+    def lte(self, col: str, val: Any) -> "FakeQuery":
+        self._filters.append(lambda r: r.get(col) is not None and r.get(col) <= val)
+        return self
+
+    def gt(self, col: str, val: Any) -> "FakeQuery":
+        self._filters.append(lambda r: r.get(col) is not None and r.get(col) > val)
+        return self
+
     def order(self, col: str = "created_at", desc: bool = False, **_kwargs: Any) -> "FakeQuery":
         self._order_col = col
         self._order_desc = bool(desc)

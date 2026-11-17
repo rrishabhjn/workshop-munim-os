@@ -17,6 +17,7 @@ from .common import (
     OrderPatchRequest,
     PipelineMoveRequest,
     UndoEventsRequest,
+    _filter_needs_info_rows,
     _pkg,
     _resolve_actor_access,
     _resolve_actor_person,
@@ -31,7 +32,7 @@ async def get_production_overview(
 ) -> dict[str, Any]:
     pkg = _pkg()
     sb = pkg.get_supabase_admin()
-    actor_id, actor_name = _resolve_actor_person(sb, user)
+    actor_id, actor_name, can_munim = _resolve_actor_access(sb, user)
 
     pipeline_stages = sb.table("project_pipeline_stages").select("*").order("sort_order").execute().data or []
     material_stages = sb.table("material_track_stages").select("*").order("sort_order").execute().data or []
@@ -113,8 +114,10 @@ async def get_production_overview(
     whos_doing_what = pkg.step_executors.enrich_whos_doing_what_rows(
         sb, sb.table("v_whos_doing_what").select("*").execute().data or []
     )
-    needs_info = sb.table("v_needs_info_queue").select("*").execute().data or []
-    actor_id, actor_name, can_munim = _resolve_actor_access(sb, user)
+    needs_info = _filter_needs_info_rows(
+        sb.table("v_needs_info_queue").select("*").execute().data or [],
+        can_munim=can_munim,
+    )
 
     return {
         "me": {

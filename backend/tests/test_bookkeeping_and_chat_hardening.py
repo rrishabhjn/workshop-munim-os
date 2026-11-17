@@ -58,7 +58,7 @@ async def test_sales_receipts_walkin_counter_and_active_project_payment_track():
             )
         if method == "POST" and path == "/banktransactions":
             body = dict(json_body or {})
-            if len(posted_bt) >= 1 and body.get("transaction_type") == "sales_without_invoices":
+            if len(posted_bt) >= 1 and body.get("transaction_type") == "deposit":
                 return httpx.Response(400, json={"code": 1002, "message": "Invalid transaction_type"})
             posted_bt.append(body)
             return httpx.Response(200, json={"banktransaction": {"transaction_id": f"bt-{len(posted_bt)}"}})
@@ -126,7 +126,7 @@ async def test_sales_receipts_walkin_counter_and_active_project_payment_track():
         assert posted_bt[0]["from_account_id"] == "inc-sales"
         assert posted_bt[0]["to_account_id"] == "za-cash"
         assert posted_bt[0]["amount"] == 105000.0
-        assert posted_bt[0]["transaction_type"] == "sales_without_invoices"
+        assert posted_bt[0]["transaction_type"] == "deposit"
         assert len(sb.store["projects"]) == 1  # Never creates a fake project!
 
         # 2. Active project receipt pushes /banktransactions AND advances Payment Track
@@ -147,7 +147,7 @@ async def test_sales_receipts_walkin_counter_and_active_project_payment_track():
     assert posted_bt[1]["customer_id"] == "zc-amb"
     assert posted_bt[1]["from_account_id"] == "inc-sales"
     assert posted_bt[1]["to_account_id"] == "za-rgb"
-    assert posted_bt[1]["transaction_type"] == "other_income"
+    assert posted_bt[1]["transaction_type"] == "sales_without_invoices"
 
 
 @pytest.mark.asyncio
@@ -785,6 +785,86 @@ async def test_payment_order_link_prompt_explicit_advance_pipeline_and_manual_pa
         )
         assert add_res["ok"] is True
         assert sb.store["projects"][0]["paid_cache_inr"] == 150000.0
+
+
+@pytest.mark.asyncio
+async def test_surgical_fixes_1_to_4():
+    """Verify async callback queue + 401 fast-fail + Munim RBAC + Zoho locks/COA cache + regex tightening."""
+    import asyncio
+    from datetime import datetime, timedelta, timezone
+    import httpx
+    from app.auth import CurrentUser, get_current_user
+    from app.config import get_settings
+    from app.main import app
+    from app.services.agent_core.slot_resolvers import _extract_inr_amount_from_text
+    from app.services.goal_primitives import claim_goal_for_execution
+    from app.services.zoho.sync import _extract_party_from_desc
+
+    sb = seed_goal_intelligence_sb()
+    sb.store["agent_goals"] = [
+        {"id": "g-stale", "status": "executing", "updated_at": (datetime.now(timezone.utc) - timedelta(seconds=120)).isoformat(), "domain_scope": "munim", "steps": [], "collected_slots": {}},
+        {"id": "g-fresh", "status": "executing", "updated_at": datetime.now(timezone.utc).isoformat(), "domain_scope": "munim", "steps": [], "collected_slots": {}},
+        {"id": "g-401", "status": "awaiting_confirmation", "domain_scope": "munim", "summary_title": "401 check", "collected_slots": {"operation_kind": "customer_receipt", "amount_inr": 20000, "payment_account_id": "acc-cash"}, "steps": [{"step_index": 0, "target": "zoho", "operation": "customer_receipt", "status": "pending", "retry_count": 0}]},
+    ]
+    assert claim_goal_for_execution(sb, "g-fresh") is None and claim_goal_for_execution(sb, "g-stale")["id"] == "g-stale"
+    fake_hy, dispatched = MagicMock(), []
+    with patch("app.services.step_executors.execute_munim_financial_step", AsyncMock(return_value={"ok": False, "status_code": 401, "error_kind": "auth_401", "error": {"code": 57, "message": "Not authorized"}})), patch("app.services.agent_core.get_settings", return_value=Settings(gemini_api_key="test-key")), patch("app.services.agent_core._get_interactions_client", return_value=fake_hy):
+        err_out = await agent_core.confirm_and_execute_goal(sb, goal_id="g-401", actor_person_id="p-shreyansh", actor_label="Shreyansh")
+    assert err_out["status"] == "needs_error_fix" and err_out["choices"] == [] and fake_hy.interactions.create.call_count == 0
+
+    sb.store["people"].append({"id": "p-ops", "full_name": "OpsOnly", "email": "opsonly@example.com", "person_type": "operator", "can_login_munim": False, "is_active": True})
+    sb.store["v_whos_doing_what"], sb.store["v_project_pnl"] = [], []
+    sb.store["v_needs_info_queue"] = [
+        {"goal_id": "g-401", "domain_scope": "munim", "summary_title": "Secret Cash", "status": "needs_error_fix"},
+        {"goal_id": "g-prod", "domain_scope": "production", "summary_title": "Prod Lead", "status": "gathering_info"},
+    ]
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        app_env="production", telegram_webhook_secret="sec-t", allowed_telegram_user_ids="1001",
+        gcp_project_id="p", gcp_region="r", app_base_url="https://x.run.app", cron_auth_secret="cron-s",
+        telegram_bot_token="bot-tok", telegram_production_chat_id="-1001", telegram_munim_chat_id="-1002",
+    )
+    app.dependency_overrides[get_current_user] = lambda: CurrentUser(auth_type="supabase", identifier="opsonly@example.com", display_name="Ops")
+    mock_cb, sent_briefs = AsyncMock(return_value={"ok": True}), []
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            with patch("app.routers.telegram.get_supabase_admin", return_value=sb), patch("app.routers.telegram.telegram_api.answer_callback_query", AsyncMock()), patch("app.routers.telegram._dispatch_to_cloud_tasks", side_effect=lambda p, s, delay_seconds=0.0: dispatched.append((p, delay_seconds))), patch("app.routers.telegram._handle_agent_callback", mock_cb), patch("app.routers.domains.get_supabase_admin", return_value=sb), patch("app.routers.cron.get_supabase_admin", return_value=sb), patch("app.routers.cron.telegram_api.send_message", AsyncMock(side_effect=lambda **kw: sent_briefs.append(kw))):
+                wh = await client.post("/telegram/webhook", headers={"X-Telegram-Bot-Api-Secret-Token": "sec-t"}, json={"update_id": 771, "callback_query": {"id": "cq1", "from": {"id": 1001}, "message": {"message_id": 9, "chat": {"id": -1}}, "data": "ag_confirm:g-401"}})
+                assert wh.json() == {"ok": True, "queued": True} and "callback_query" in dispatched[0][0]
+                assert (await client.post("/tasks/telegram-worker", headers={"X-Cron-Secret": "cron-s"}, json=dispatched[0][0])).status_code == 200 and mock_cb.await_args.kwargs.get("already_answered") is True
+                assert (await client.post("/api/munim/people", json={"full_name": "Hacker", "person_type": "operator"})).status_code == 403
+                assert (await client.post("/api/munim/people", json={"full_name": "Proxy", "payout_aliases": ["Alias"]})).status_code == 403
+                assert (await client.post("/api/agent/goals/g-401/confirm")).status_code == 403
+                assert [r["goal_id"] for r in (await client.get("/api/agent/needs-info")).json()] == ["g-prod"]
+                assert [r["goal_id"] for r in (await client.get("/api/production/overview")).json()["needs_info"]] == ["g-prod"]
+                assert (await client.post("/cron/morning-brief", headers={"X-Cron-Secret": "cron-s"})).status_code == 200
+                assert "Secret Cash" not in sent_briefs[0]["text"] and "Secret Cash" in sent_briefs[1]["text"]
+    finally:
+        app.dependency_overrides.clear()
+
+    zoho._token_cache.update({"access_token": None, "expires_at": 0.0})
+    zoho._COA_CACHE.clear()
+    tok_posts, coa_gets = [0], [0]
+    async def fake_post(self, url, **kw):
+        tok_posts[0] += 1; await asyncio.sleep(0.02); return httpx.Response(200, request=httpx.Request("POST", url), json={"access_token": "tok-1", "expires_in": 3600})
+    async def fake_coa_req(c, m, p, **kw):
+        coa_gets[0] += 1; return httpx.Response(200, json={"chartofaccounts": [{"account_id": "a1", "account_name": "Sales", "account_type": "income"}]})
+    with patch("app.services.zoho.get_settings", return_value=Settings(zoho_client_id="c", zoho_client_secret="s", zoho_refresh_token="r", zoho_org_id="o")), patch("httpx.AsyncClient.post", new=fake_post), patch("app.services.zoho._zoho_request", side_effect=fake_coa_req):
+        assert len(set(await asyncio.gather(*[zoho._get_access_token() for _ in range(6)]))) == 1 and tok_posts[0] == 1
+        async with httpx.AsyncClient() as hc:
+            assert len(await zoho._get_chart_of_accounts(hc)) == 1 and len(await zoho._get_chart_of_accounts(hc)) == 1
+        assert coa_gets[0] == 1
+    assert _extract_party_from_desc("[Rishabh] [PRJ-01] Chiranji Lal — Door") == "Chiranji Lal"
+
+    assert all(_extract_inr_amount_from_text(t) is None for t in ("18mm ply", "10ft bed", "25 sheets", "Room 12", "Sector 140"))
+    assert _extract_inr_amount_from_text("₹25") == 25.0 and _extract_inr_amount_from_text("Received 20,000 from Arjun") == 20000.0
+    fake_nr = MagicMock()
+    fake_nr.interactions.create.side_effect = [
+        SimpleNamespace(id="int_no_rep", steps=[SimpleNamespace(type="function_call", id="fc_nr", name="stage_financial_entry", arguments={"entry_kind": "expense", "amount_inr": 5000, "party_name": "Suresh Ji", "notes": "Long description exceeding forty chars without account"})], output_text=None),
+        SimpleNamespace(id="int_nr2", steps=[], output_text=""),
+    ]
+    with patch("app.services.agent_core.get_settings", return_value=Settings(gemini_api_key="test-key")), patch("app.services.agent_core._get_interactions_client", return_value=fake_nr):
+        nr_out = await agent_core.run_agent_turn(sb, owner_person_id="p-shreyansh", actor_label="Shreyansh", source_channel="telegram", domain_scope="munim", text="5000 paid to Suresh Ji painter for long wall polish work today")
+    assert fake_nr.interactions.create.call_count == 2 and all(c.kwargs["generation_config"]["thinking_level"] == "low" for c in fake_nr.interactions.create.call_args_list) and nr_out["goals"][0]["status"] == "gathering_info"
 
 
 

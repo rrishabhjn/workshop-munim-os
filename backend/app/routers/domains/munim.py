@@ -16,6 +16,7 @@ from .common import (
     VendorPatchRequest,
     _pkg,
     _require_munim_access,
+    _resolve_actor_access,
 )
 
 router = APIRouter()
@@ -89,8 +90,13 @@ async def add_person_to_roster(
     body: PersonCreateRequest,
     user: CurrentUser = Depends(get_current_user),
 ) -> dict[str, Any]:
-    _ = user
     sb = _pkg().get_supabase_admin()
+    _, _, can_munim = _resolve_actor_access(sb, user)
+    if not can_munim and (body.person_type == "operator" or body.payout_aliases):
+        raise HTTPException(
+            status_code=403,
+            detail="Munim finance access required to create operators or bank payout aliases.",
+        )
     payload = body.model_dump(exclude_none=True)
     if body.person_type == "operator":
         payload["can_login_prod"] = True
@@ -105,9 +111,16 @@ async def patch_person_in_roster(
     body: PersonPatchRequest,
     user: CurrentUser = Depends(get_current_user),
 ) -> dict[str, Any]:
-    _ = user
     pkg = _pkg()
     sb = pkg.get_supabase_admin()
+    _, _, can_munim = _resolve_actor_access(sb, user)
+    if not can_munim:
+        existing = sb.table("people").select("person_type").eq("id", person_id).limit(1).execute().data or []
+        if (existing and existing[0].get("person_type") == "operator") or body.person_type == "operator" or body.payout_aliases is not None:
+            raise HTTPException(
+                status_code=403,
+                detail="Munim finance access required to modify operators or bank payout aliases.",
+            )
     res = pkg.step_executors.update_person_record(
         sb,
         person_id=person_id,

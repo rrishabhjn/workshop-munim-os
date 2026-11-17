@@ -43,7 +43,39 @@ def _resolve_actor_access(sb: Any, user: CurrentUser) -> tuple[str | None, str, 
         )
         if rows:
             return str(rows[0]["id"]), str(rows[0]["full_name"]), rows[0].get("can_login_munim") is not False
-    return None, user.display_name, True
+    return None, user.display_name, False
+
+
+def _filter_needs_info_rows(
+    rows: list[dict[str, Any]], *, can_munim: bool
+) -> list[dict[str, Any]]:
+    """Hide Munim finance clarifications/errors from Production-only operators."""
+    if can_munim:
+        return rows
+    return [r for r in rows if r.get("domain_scope") != "munim"]
+
+
+def _enforce_goal_munim_rbac(
+    sb: Any, user: CurrentUser, goal_id: str
+) -> tuple[str | None, str, bool]:
+    """Block Production-only operators from reading or acting on Munim finance goals."""
+    actor_id, actor_name, can_munim = _resolve_actor_access(sb, user)
+    if not can_munim:
+        rows = (
+            sb.table("agent_goals")
+            .select("domain_scope")
+            .eq("id", goal_id)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if rows and rows[0].get("domain_scope") == "munim":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Munim finance access required for this goal.",
+            )
+    return actor_id, actor_name, can_munim
 
 
 def _resolve_actor_person(sb: Any, user: CurrentUser) -> tuple[str | None, str]:

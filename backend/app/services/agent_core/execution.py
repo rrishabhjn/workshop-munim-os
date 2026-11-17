@@ -191,6 +191,31 @@ async def confirm_and_execute_goal(
                 "can_park_for_clerk": True,
             }
 
+        err_obj = res.get("error") or {}
+        if err_kind == "auth_401" or (isinstance(err_obj, dict) and err_obj.get("code") == 57):
+            step["status"] = "failed_validation"
+            detail_msg = err_obj.get("message") if isinstance(err_obj, dict) else str(err_obj)
+            auth_msg = (
+                f"🔒 Zoho Books permission/auth error ({detail_msg or 'Unauthorized'}) — "
+                "Zoho OAuth token scope check karein ya Clerk queue mein park karein."
+            )
+            sb.table("agent_goals").update(
+                {
+                    "status": "needs_error_fix",
+                    "steps": steps,
+                    "pending_prompt": auth_msg,
+                    "repair_options": [],
+                }
+            ).eq("id", goal_id).execute()
+            return {
+                "goal_id": goal_id,
+                "status": "needs_error_fix",
+                "summary_title": claimed.get("summary_title"),
+                "prompt": auth_msg,
+                "choices": [],
+                "can_park_for_clerk": True,
+            }
+
         # Validation 400 -> Invoke Hydrogen ('medium' thinking) Self-Healing!
         step["status"] = "failed_validation"
         diagnosis = await _diagnose_validation_error_with_hydrogen(
