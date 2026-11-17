@@ -17,8 +17,11 @@ from app.services.zoho.client import (
 )
 from app.services.zoho.contacts import (
     NON_PAYEE_WORDS,
+    ROLE_STOPWORDS,
     _upsert_entity_alias,
     create_zoho_contact,
+    match_existing_order_or_customer,
+    match_existing_payee,
     merge_notes_text,
     resolve_or_create_contact,
     resolve_payee_zoho_vendor,
@@ -43,6 +46,7 @@ __all__ = [
     "_COA_CACHE",
     "_TOKEN_CACHE",
     "NON_PAYEE_WORDS",
+    "ROLE_STOPWORDS",
     "_extract_zoho_doc_project_keys",
     "_find_existing_by_reference",
     "_get_access_token",
@@ -60,6 +64,8 @@ __all__ = [
     "ensure_project_zoho_bridge",
     "get_settings",
     "list_recent_ledger_transactions",
+    "match_existing_order_or_customer",
+    "match_existing_payee",
     "merge_notes_text",
     "push_management_entry_to_zoho",
     "resolve_or_create_contact",

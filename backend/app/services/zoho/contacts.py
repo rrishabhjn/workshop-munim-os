@@ -2,13 +2,38 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 import sys
 from typing import Any
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+_HONORIFIC_STOPWORDS: frozenset[str] = frozenset({"ji", "bhaiya", "bhai", "sir", "mam", "madam", "mr", "mrs"})
+ROLE_STOPWORDS: frozenset[str] = _HONORIFIC_STOPWORDS | frozenset(
+    {
+        "mistri",
+        "karigar",
+        "painter",
+        "polish",
+        "polisher",
+        "carpenter",
+        "suthar",
+        "cushion",
+        "cushioning",
+        "sofa",
+        "electrician",
+        "plumber",
+        "fabricator",
+        "welder",
+        "contractor",
+        "thekedar",
+        "helper",
+    }
+)
 
 NON_PAYEE_WORDS: frozenset[str] = frozenset(
     {
@@ -389,3 +414,229 @@ async def resolve_payee_zoho_vendor(
     if err_msg:
         out["error"] = err_msg
     return out
+
+
+def _core_name_tokens(raw: str | None) -> tuple[str, ...]:
+    tokens = re.findall(r"[a-z0-9]+", (raw or "").strip().lower())
+    return tuple(t for t in tokens if len(t) > 1 and t not in ROLE_STOPWORDS)
+
+
+async def match_existing_payee(sb: Any, raw_name: str | None) -> dict[str, Any]:
+    """Read-only deterministic matcher across Supabase vendors, people, payout_aliases & Zoho Vendors."""
+    raw = (raw_name or "").strip()
+    if not raw or raw.lower() in NON_PAYEE_WORDS:
+        return {"status": "none"}
+
+    raw_low = raw.lower()
+    core_tokens = _core_name_tokens(raw)
+    pool: list[dict[str, Any]] = []
+
+    if sb is not None:
+        for v in sb.table("vendors").select("id,canonical_name,aliases,specialty,zoho_contact_id,is_active").eq("is_active", True).execute().data or []:
+            cname = str(v.get("canonical_name") or "").strip()
+            if not cname:
+                continue
+            spec = str(v.get("specialty") or "").strip()
+            all_names = [cname, *(str(a).strip() for a in (v.get("aliases") or []) if str(a).strip())]
+            pool.append(
+                {
+                    "canonical_name": cname,
+                    "vendor_id": str(v["id"]),
+                    "person_id": None,
+                    "zoho_contact_id": str(v["zoho_contact_id"]) if v.get("zoho_contact_id") else None,
+                    "source": "vendor",
+                    "source_label": f"Vendor{' · ' + spec if spec else ''}",
+                    "all_names": all_names,
+                    "role_blob": " ".join([*all_names, spec]).lower(),
+                }
+            )
+        for p in sb.table("people").select("id,full_name,person_type,role_tags,aliases,payout_aliases,metadata,is_active").eq("is_active", True).execute().data or []:
+            fname = str(p.get("full_name") or "").strip()
+            if not fname:
+                continue
+            all_names = [
+                fname,
+                *(str(a).strip() for a in (p.get("aliases") or []) if str(a).strip()),
+                *(str(pa).strip() for pa in (p.get("payout_aliases") or []) if str(pa).strip()),
+            ]
+            meta = p.get("metadata") or {}
+            pool.append(
+                {
+                    "canonical_name": fname,
+                    "vendor_id": None,
+                    "person_id": str(p["id"]),
+                    "zoho_contact_id": str(meta["zoho_contact_id"]) if meta.get("zoho_contact_id") else None,
+                    "source": "person",
+                    "source_label": str(p.get("person_type") or "Person"),
+                    "all_names": all_names,
+                    "role_blob": " ".join([*all_names, *(str(rt) for rt in (p.get("role_tags") or []))]).lower(),
+                }
+            )
+
+    pkg = _pkg()
+    if pkg.get_settings().zoho_enabled and core_tokens:
+        z_hits = await pkg.search_zoho_contacts(" ".join(core_tokens), "vendor")
+        for z in z_hits:
+            zid = str(z.get("contact_id") or "").strip()
+            zname = str(z.get("contact_name") or "").strip()
+            if not zname:
+                continue
+            existing = next(
+                (
+                    it
+                    for it in pool
+                    if (zid and it["zoho_contact_id"] == zid)
+                    or it["canonical_name"].lower() == zname.lower()
+                ),
+                None,
+            )
+            if existing:
+                if zid and not existing["zoho_contact_id"]:
+                    existing["zoho_contact_id"] = zid
+                continue
+            pool.append(
+                {
+                    "canonical_name": zname,
+                    "vendor_id": None,
+                    "person_id": None,
+                    "zoho_contact_id": zid or None,
+                    "source": "zoho",
+                    "source_label": "Zoho Vendor",
+                    "all_names": [zname],
+                    "role_blob": zname.lower(),
+                }
+            )
+
+    def _to_matched(it: dict[str, Any], role_hint: str | None = None) -> dict[str, Any]:
+        via = raw if raw_low != it["canonical_name"].lower() and not role_hint else None
+        return {
+            "status": "matched",
+            "canonical_name": it["canonical_name"],
+            "zoho_contact_id": it["zoho_contact_id"],
+            "vendor_id": it["vendor_id"],
+            "person_id": it["person_id"],
+            "via_alias": via,
+            "source": it["source"],
+            "role_hint": role_hint,
+        }
+
+    exact_hits = [it for it in pool if any(n.lower() == raw_low for n in it["all_names"])]
+    if len(exact_hits) == 1:
+        return _to_matched(exact_hits[0])
+
+    candidates = exact_hits if len(exact_hits) >= 2 else []
+    raw_roles = set(re.findall(r"[a-z0-9]+", raw_low)) & (ROLE_STOPWORDS - _HONORIFIC_STOPWORDS)
+    if not candidates and core_tokens:
+        for it in pool:
+            for nm in it["all_names"]:
+                c_toks = _core_name_tokens(nm)
+                if c_toks == core_tokens or (len(c_toks) >= len(core_tokens) and c_toks[: len(core_tokens)] == core_tokens):
+                    candidates.append(it)
+                    break
+
+    if len(candidates) > 1 and raw_roles:
+        narrowed = [it for it in candidates if any(rk in it["role_blob"] for rk in raw_roles)]
+        if narrowed:
+            candidates = narrowed
+
+    if len(candidates) == 1:
+        hint = ", ".join(sorted(raw_roles)).title() if raw_roles else None
+        return _to_matched(candidates[0], role_hint=hint)
+
+    if len(candidates) >= 2:
+        choices: list[dict[str, Any]] = []
+        for idx, it in enumerate(candidates[:3]):
+            patch_obj: dict[str, Any] = {
+                "party_name": it["canonical_name"],
+                "is_ambiguous": False,
+                "is_new_payee": False,
+            }
+            if it["zoho_contact_id"]:
+                patch_obj["zoho_contact_id"] = it["zoho_contact_id"]
+            if it["vendor_id"]:
+                patch_obj["vendor_id"] = it["vendor_id"]
+            if it["person_id"]:
+                patch_obj["person_id"] = it["person_id"]
+            choices.append(
+                {
+                    "choice_id": f"payee_{idx}",
+                    "label": f"{it['canonical_name']} ({it['source_label']})"[:42],
+                    "slot_patch_json": json.dumps(patch_obj, ensure_ascii=False),
+                }
+            )
+        choices.append(
+            {
+                "choice_id": "payee_new",
+                "label": f"🆕 New: {raw[:32]}",
+                "slot_patch_json": json.dumps({"party_name": raw, "is_ambiguous": False, "is_new_payee": True}, ensure_ascii=False),
+            }
+        )
+        return {
+            "status": "ambiguous",
+            "choices": choices,
+            "question": f"Multiple payees match *{raw}* — kaunsa select karein?",
+        }
+
+    return {"status": "new", "canonical_name": raw}
+
+
+def match_existing_order_or_customer(sb: Any, hint: str | None) -> dict[str, Any]:
+    """Read-only deterministic matcher for active Supabase customer orders."""
+    raw = (hint or "").strip().lstrip("#").strip()
+    if sb is None or not raw:
+        return {"status": "none"}
+
+    projects = (
+        sb.table("projects")
+        .select("id,project_code,customer_id,customer_name,site_area_landmark,status")
+        .eq("status", "active")
+        .execute()
+        .data
+        or []
+    )
+    low = raw.lower()
+    code_hits = [p for p in projects if str(p.get("project_code") or "").strip().lower() == low]
+    if len(code_hits) == 1:
+        p = code_hits[0]
+        return {"status": "matched", "project_id": p["id"], "customer_id": p.get("customer_id"), "customer_name": p.get("customer_name")}
+
+    exact_hits = [p for p in projects if str(p.get("customer_name") or "").strip().lower() == low]
+    if len(exact_hits) == 1:
+        p = exact_hits[0]
+        return {"status": "matched", "project_id": p["id"], "customer_id": p.get("customer_id"), "customer_name": p.get("customer_name")}
+
+    core = _core_name_tokens(raw)
+    tok_hits = exact_hits if len(exact_hits) >= 2 else []
+    if not tok_hits and core:
+        for p in projects:
+            c_toks = _core_name_tokens(p.get("customer_name"))
+            if c_toks == core or (len(c_toks) >= len(core) and c_toks[: len(core)] == core):
+                tok_hits.append(p)
+
+    if len(tok_hits) == 1:
+        p = tok_hits[0]
+        return {"status": "matched", "project_id": p["id"], "customer_id": p.get("customer_id"), "customer_name": p.get("customer_name")}
+
+    if len(tok_hits) >= 2:
+        choices = []
+        for idx, p in enumerate(tok_hits[:4]):
+            area = f" ({p['site_area_landmark']})" if p.get("site_area_landmark") else ""
+            lbl = f"#{p.get('project_code') or ''} {p.get('customer_name')}{area}".strip()[:42]
+            patch_obj = {"project_id": p["id"], "is_ambiguous": False}
+            if p.get("customer_id"):
+                patch_obj["customer_id"] = p["customer_id"]
+            if p.get("customer_name"):
+                patch_obj["party_name"] = p["customer_name"]
+            choices.append(
+                {
+                    "choice_id": f"order_{idx}",
+                    "label": lbl,
+                    "slot_patch_json": json.dumps(patch_obj, ensure_ascii=False),
+                }
+            )
+        return {
+            "status": "ambiguous",
+            "choices": choices,
+            "question": f"Multiple active orders match *{raw}* — kaunsa order select karein?",
+        }
+    return {"status": "none"}

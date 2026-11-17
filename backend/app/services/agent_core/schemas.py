@@ -72,7 +72,7 @@ def _sanitize_gemini_nulls(raw: Any) -> Any:
         if k == "is_ambiguous":
             cleaned[k] = bool(_coerce_optional_bool(v))
             continue
-        if k == "boq_scope_changed":
+        if k in ("boq_scope_changed", "is_new_payee"):
             cleaned[k] = _coerce_optional_bool(v)
             continue
         if k in _JSON_STRING_FIELDS:
@@ -277,6 +277,7 @@ class GoalIntentItem(BaseModel):
         description="Customer, vendor, or payee name for receipts, bills, or payouts.",
     )
     zoho_contact_id: str | None = None
+    is_new_payee: bool | None = None
     txn_date: str | None = None
     invoice_no: str | None = None
     bill_line_items_json: str | None = Field(

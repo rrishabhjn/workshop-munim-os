@@ -123,17 +123,24 @@ def _format_confirmation_summary(
         acc = (slots.get("payment_account_code") or "").upper()
         badge = "🟢 PAISA AAYA (IN)" if op == "customer_receipt" else ("🔄 TRANSFER" if op == "float_transfer" else "🔴 PAISA GAYA (OUT)")
         party = slots.get("party_name") or slots.get("to_payment_account_code") or op
+        match_tag = ""
+        if op != "float_transfer" and slots.get("party_name"):
+            if slots.get("is_new_payee") is True:
+                match_tag = " _(🆕 New Customer)_" if op == "customer_receipt" else " _(🆕 New Vendor)_"
+            elif slots.get("is_new_payee") is False or any(slots.get(k) for k in ("zoho_contact_id", "vendor_id", "person_id")):
+                match_tag = " _(✅ Matched)_"
         cat_line = (
             f"\n• Category: *{get_expense_category_label(slots.get('expense_category'))}*"
             if op == "expense"
             else ""
         )
-        return f"{badge}: *{amt}*\n• Party/To: *{party}*{cat_line}\n• Account: `{acc}`\n• Note: _{slots.get('notes') or slots.get('summary_title') or '-'}_"
+        return f"{badge}: *{amt}*\n• Party/To: *{party}*{match_tag}{cat_line}\n• Account: `{acc}`\n• Note: _{slots.get('notes') or slots.get('summary_title') or '-'}_"
     if op == "supplier_draft_bill":
         amt = format_inr(float(slots.get("amount_inr") or 0))
+        match_tag = " _(🆕 New Vendor)_" if slots.get("is_new_payee") is True else (" _(✅ Matched)_" if slots.get("is_new_payee") is False or slots.get("zoho_contact_id") or slots.get("vendor_id") else "")
         return (
             f"🧾 *Confirm Zoho Draft Bill*\n"
-            f"• Vendor: *{slots.get('party_name')}*\n"
+            f"• Vendor: *{slots.get('party_name')}*{match_tag}\n"
             f"• Invoice: `{slots.get('invoice_no') or 'Auto'}` · Total: *{amt}*\n"
             f"_(Strictly saved as Draft in Zoho Books for Clerk review)_"
         )

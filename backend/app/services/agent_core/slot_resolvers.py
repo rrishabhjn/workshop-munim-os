@@ -394,6 +394,11 @@ def _resolve_entity_id_by_name(sb: Any, table: str, name_col: str, raw: str | No
 def _sanitize_and_resolve_slot_ids(sb: Any, slots: dict[str, Any]) -> None:
     """Resolve accidental project codes / human names in UUID slots and normalize dates/stages."""
     op = str(slots.get("operation_kind") or "")
+    for eid_col, tbl in (("vendor_id", "vendors"), ("customer_id", "customers"), ("person_id", "people")):
+        ev = slots.get(eid_col)
+        if sb is not None and ev and _is_valid_uuid(ev):
+            if not (sb.table(tbl).select("id").eq("id", ev).limit(1).execute().data or []) and (sb.table("projects").select("id").eq("id", ev).limit(1).execute().data or []):
+                slots.pop(eid_col, None)
 
     pid = slots.get("project_id")
     if pid is not None and not _accept_id(sb, pid, "projects"):

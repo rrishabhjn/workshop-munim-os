@@ -218,3 +218,7 @@ class GoalChoiceRequest(BaseModel):
 class GoalEditRequest(BaseModel):
     slot_patch: dict[str, Any] = Field(default_factory=dict)
     correction_note: str | None = None
+
+
+class GoalReplyRequest(BaseModel):
+    text: str = Field(min_length=1)

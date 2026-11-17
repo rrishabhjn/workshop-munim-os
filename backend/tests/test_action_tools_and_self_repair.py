@@ -118,6 +118,7 @@ async def test_action_tools_upsert_order_items_and_in_loop_validation_feedback()
     with (
         patch("app.services.agent_core.get_settings", return_value=Settings(gemini_api_key="test-key")),
         patch("app.services.agent_core._get_interactions_client", return_value=fake_client),
+        patch("app.services.zoho.get_settings", return_value=Settings(_env_file=None)),
     ):
         out = await agent_core.run_agent_turn(
             sb,
@@ -236,6 +237,7 @@ async def test_silent_internal_self_repair_fixes_sloppy_envelope_before_promptin
     with (
         patch("app.services.agent_core.get_settings", return_value=Settings(gemini_api_key="test-key")),
         patch("app.services.agent_core._get_interactions_client", return_value=fake_client),
+        patch("app.services.zoho.get_settings", return_value=Settings(_env_file=None)),
     ):
         out = await agent_core.run_agent_turn(
             sb,
@@ -310,6 +312,7 @@ async def test_financial_dedup_collapses_staged_party_name_and_envelope_person_i
     with (
         patch("app.services.agent_core.get_settings", return_value=Settings(gemini_api_key="test-key")),
         patch("app.services.agent_core._get_interactions_client", return_value=fake_client),
+        patch("app.services.zoho.get_settings", return_value=Settings(_env_file=None)),
     ):
         out = await agent_core.run_agent_turn(
             sb,
@@ -323,3 +326,308 @@ async def test_financial_dedup_collapses_staged_party_name_and_envelope_person_i
     assert len(out["goals"]) == 1
     assert out["goals"][0]["collected_slots"]["party_name"] == "Rajesh Ji"
     assert "Rajesh Ji" in out["goals"][0]["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_upgrade_a_draft_id_and_duplicate_financial_guard():
+    sb = seed_goal_intelligence_sb()
+    sb.store["people"].extend(
+        [
+            {"id": "p-raj", "full_name": "Rajesh Ji", "person_type": "salaried_karigar", "is_active": True},
+            {"id": "p-brij", "full_name": "Brijesh Ji", "person_type": "salaried_karigar", "is_active": True},
+        ]
+    )
+
+    # 1. Duplicate ₹5,000 Cash Galla entry blocked in-loop; draft_id='D1' updates in-place cleanly
+    dup_t1 = SimpleNamespace(
+        id="int_d1",
+        steps=[
+            SimpleNamespace(
+                type="function_call",
+                id="c1",
+                name="stage_financial_entry",
+                arguments={"entry_kind": "vendor_payment", "amount_inr": 5000, "party_name": "Suresh Ji", "payment_account_code": "cash_galla"},
+            ),
+            SimpleNamespace(
+                type="function_call",
+                id="c2",
+                name="stage_financial_entry",
+                arguments={"entry_kind": "vendor_payment", "amount_inr": 5000, "payment_account_code": "cash_galla"},
+            ),
+            SimpleNamespace(
+                type="function_call",
+                id="c3",
+                name="stage_financial_entry",
+                arguments={"draft_id": "D1", "entry_kind": "vendor_payment", "amount_inr": 5000, "party_name": "Suresh Ji", "payment_account_code": "cash_galla", "notes": "Updated note"},
+            ),
+        ],
+        output_text=None,
+    )
+    dup_t2 = SimpleNamespace(id="int_d2", steps=[], output_text="")
+    fake_client = MagicMock()
+    fake_client.interactions.create.side_effect = [dup_t1, dup_t2]
+
+    with (
+        patch("app.services.agent_core.get_settings", return_value=Settings(gemini_api_key="test-key")),
+        patch("app.services.agent_core._get_interactions_client", return_value=fake_client),
+        patch("app.services.zoho.get_settings", return_value=Settings(_env_file=None)),
+    ):
+        out = await agent_core.run_agent_turn(
+            sb,
+            owner_person_id="p-shreyansh",
+            actor_label="Shreyansh",
+            source_channel="telegram",
+            domain_scope="munim",
+            text="5000 cash paid to Suresh Ji",
+        )
+
+    assert len(out["goals"]) == 1
+    assert out["goals"][0]["collected_slots"]["notes"] == "Updated note"
+    fn_results = fake_client.interactions.create.call_args_list[1].kwargs["input"]
+    assert json.loads(fn_results[0]["result"][0]["text"])["draft_id"] == "D1"
+    assert json.loads(fn_results[1]["result"][0]["text"])["duplicate_of"] == "D1"
+
+    # 2. Distinct payees ("1000 each to Rajesh and Brijesh") pass through as D1 and D2
+    split_t1 = SimpleNamespace(
+        id="int_s1",
+        steps=[
+            SimpleNamespace(
+                type="function_call",
+                id="cs1",
+                name="stage_financial_entry",
+                arguments={"entry_kind": "expense", "amount_inr": 1000, "party_name": "Rajesh Ji", "payment_account_code": "cash_galla", "expense_category": "salary_wages"},
+            ),
+            SimpleNamespace(
+                type="function_call",
+                id="cs2",
+                name="stage_financial_entry",
+                arguments={"entry_kind": "expense", "amount_inr": 1000, "party_name": "Brijesh Ji", "payment_account_code": "cash_galla", "expense_category": "salary_wages"},
+            ),
+        ],
+        output_text=None,
+    )
+    split_t2 = SimpleNamespace(id="int_s2", steps=[], output_text="")
+    fake_split = MagicMock()
+    fake_split.interactions.create.side_effect = [split_t1, split_t2]
+
+    with (
+        patch("app.services.agent_core.get_settings", return_value=Settings(gemini_api_key="test-key")),
+        patch("app.services.agent_core._get_interactions_client", return_value=fake_split),
+    ):
+        split_out = await agent_core.run_agent_turn(
+            sb,
+            owner_person_id="p-shreyansh",
+            actor_label="Shreyansh",
+            source_channel="telegram",
+            domain_scope="munim",
+            text="1000 each paid to Rajesh and Brijesh in cash salary advance",
+        )
+
+    assert len(split_out["goals"]) == 2
+    assert {g["collected_slots"]["party_name"] for g in split_out["goals"]} == {"Rajesh Ji", "Brijesh Ji"}
+
+
+@pytest.mark.asyncio
+async def test_upgrade_b_payee_matching_homonym_choices_and_cross_table_uuid_guard():
+    sb = seed_goal_intelligence_sb()
+    sb.store["vendors"] = [
+        {"id": "v-suresh", "canonical_name": "Suresh Ji", "vendor_kind": "contractor", "specialty": "Painter", "zoho_contact_id": "zv-suresh", "aliases": [], "is_active": True}
+    ]
+    # 1. "suresh ji painter" matches Suresh Ji inside tool -> ✅ Matched badge & zoho_contact_id locked
+    t1 = SimpleNamespace(
+        id="int_b1",
+        steps=[
+            SimpleNamespace(
+                type="function_call",
+                id="cb1",
+                name="stage_financial_entry",
+                arguments={"entry_kind": "vendor_payment", "amount_inr": 5000, "party_name": "suresh ji painter", "payment_account_code": "cash_galla"},
+            )
+        ],
+        output_text=None,
+    )
+    t2 = SimpleNamespace(id="int_b2", steps=[], output_text="")
+    fake_client = MagicMock()
+    fake_client.interactions.create.side_effect = [t1, t2]
+
+    with (
+        patch("app.services.agent_core.get_settings", return_value=Settings(gemini_api_key="test-key")),
+        patch("app.services.agent_core._get_interactions_client", return_value=fake_client),
+        patch("app.services.zoho.get_settings", return_value=Settings(_env_file=None)),
+    ):
+        out = await agent_core.run_agent_turn(
+            sb,
+            owner_person_id="p-shreyansh",
+            actor_label="Shreyansh",
+            source_channel="telegram",
+            domain_scope="munim",
+            text="5000 cash paid to suresh ji painter",
+        )
+
+    assert len(out["goals"]) == 1
+    slots = out["goals"][0]["collected_slots"]
+    assert slots["party_name"] == "Suresh Ji"
+    assert slots["zoho_contact_id"] == "zv-suresh"
+    assert "✅ Matched" in out["goals"][0]["prompt"]
+
+    # 2. Homonym vendors trigger Python-built choices; bogus project UUID in vendor_id is stripped
+    pid_uuid = "60e1f4d2-b5c4-4fa7-a8c5-1a8583c6f8f9"
+    sb.store["projects"].append({"id": pid_uuid, "project_code": "PRJ-ARJUN", "customer_name": "Arjun", "status": "active"})
+    bogus_slots = {"operation_kind": "item_material_upsert", "project_id": pid_uuid, "vendor_id": pid_uuid}
+    agent_core._sanitize_and_resolve_slot_ids(sb, bogus_slots)
+    assert "vendor_id" not in bogus_slots
+
+    sb.store["vendors"] = [
+        {"id": "v-sp", "canonical_name": "Suresh Painter", "vendor_kind": "contractor", "specialty": "Painter", "aliases": [], "is_active": True},
+        {"id": "v-sc", "canonical_name": "Suresh Carpenter", "vendor_kind": "contractor", "specialty": "Carpenter", "aliases": [], "is_active": True},
+    ]
+    amb_t1 = SimpleNamespace(
+        id="int_amb1",
+        steps=[
+            SimpleNamespace(
+                type="function_call",
+                id="ca1",
+                name="stage_financial_entry",
+                arguments={"entry_kind": "vendor_payment", "amount_inr": 2000, "party_name": "Suresh", "payment_account_code": "cash_galla"},
+            )
+        ],
+        output_text=None,
+    )
+    amb_t2 = SimpleNamespace(id="int_amb2", steps=[], output_text="")
+    fake_amb = MagicMock()
+    fake_amb.interactions.create.side_effect = [amb_t1, amb_t2]
+
+    with (
+        patch("app.services.agent_core.get_settings", return_value=Settings(gemini_api_key="test-key")),
+        patch("app.services.agent_core._get_interactions_client", return_value=fake_amb),
+        patch("app.services.zoho.get_settings", return_value=Settings(_env_file=None)),
+    ):
+        amb_out = await agent_core.run_agent_turn(
+            sb,
+            owner_person_id="p-shreyansh",
+            actor_label="Shreyansh",
+            source_channel="telegram",
+            domain_scope="munim",
+            text="2000 cash paid to Suresh",
+        )
+
+    assert amb_out["goals"][0]["status"] == "gathering_info"
+    assert len(amb_out["goals"][0]["choices"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_upgrade_c_no_response_format_plain_text_qa_and_inline_needs_info_reply():
+    import httpx
+    from app.auth import CurrentUser, get_current_user
+    from app.main import app
+
+    sb = seed_goal_intelligence_sb()
+    sb.store["vendors"] = [
+        {"id": "v-suresh", "canonical_name": "Suresh Ji", "vendor_kind": "contractor", "specialty": "Painter", "zoho_contact_id": "zv-suresh", "aliases": [], "is_active": True}
+    ]
+    sb.store["agent_goals"].append(
+        {
+            "id": "goal-ask-vendor",
+            "owner_person_id": "p-shreyansh",
+            "domain_scope": "munim",
+            "goal_type": "financial_txn",
+            "status": "gathering_info",
+            "summary_title": "₹5,000 paid from Cash Galla",
+            "missing_slots": ["party_name"],
+            "pending_prompt": "Kripya yeh details batayein (vendor payment): *Customer / Vendor Name*",
+            "collected_slots": {
+                "operation_kind": "vendor_payment",
+                "amount_inr": 5000.0,
+                "payment_account_code": "cash_galla",
+                "payment_account_id": "acc-galla",
+            },
+            "steps": [],
+            "repair_options": [],
+        }
+    )
+
+    # 1. Interactions call omits response_format; cart ignores trailing noisy JSON echo; audio HEARD extracted
+    t_act = SimpleNamespace(
+        id="int_c1",
+        steps=[
+            SimpleNamespace(
+                type="function_call",
+                id="cc1",
+                name="stage_financial_entry",
+                arguments={
+                    "entry_kind": "expense",
+                    "amount_inr": 300,
+                    "party_name": "chai",
+                    "payment_account_code": "cash_galla",
+                    "expense_category": "food_tea_mess",
+                    "heard_transcript": "300 rupaye chai nasta cash se",
+                },
+            )
+        ],
+        output_text=None,
+    )
+    t_echo = SimpleNamespace(
+        id="int_c2",
+        steps=[],
+        output_text='{"intent_category":"goal_actions","goal_items":[{"operation_kind":"expense","summary_title":"duplicate echo"}]}',
+    )
+    # 2. Native plain-text Q&A (no JSON response_format)
+    t_qa = SimpleNamespace(id="int_qa1", steps=[], output_text="HEARD: Cash balance kya hai?\nCash Galla balance ₹10,000 hai.")
+
+    fake_c = MagicMock()
+    fake_c.interactions.create.side_effect = [t_act, t_echo, t_qa]
+
+    with (
+        patch("app.services.agent_core.get_settings", return_value=Settings(gemini_api_key="test-key")),
+        patch("app.services.agent_core._get_interactions_client", return_value=fake_c),
+    ):
+        act_out = await agent_core.run_agent_turn(
+            sb,
+            owner_person_id="p-shreyansh",
+            actor_label="Shreyansh",
+            source_channel="web_command_bar",
+            domain_scope="munim",
+            audio_bytes=b"ogg-bytes",
+        )
+        qa_out = await agent_core.run_agent_turn(
+            sb,
+            owner_person_id="p-shreyansh",
+            actor_label="Shreyansh",
+            source_channel="web_command_bar",
+            domain_scope="munim",
+            audio_bytes=b"ogg-bytes",
+            text=None,
+        )
+
+    for call in fake_c.interactions.create.call_args_list:
+        assert "response_format" not in call.kwargs
+    assert len(act_out["goals"]) == 1  # Noisy JSON echo ignored completely!
+    assert act_out["heard_transcript"] == "300 rupaye chai nasta cash se"
+    assert qa_out["kind"] == "direct_answer"
+    assert qa_out["heard_transcript"] == "Cash balance kya hai?"
+    assert "Cash Galla balance" in qa_out["reply_text"]
+
+    # 3. Fix #1: POST /api/agent/goals/{goal_id}/reply resolves Suresh Ji Painter -> awaiting_confirmation
+    app.dependency_overrides[get_current_user] = lambda: CurrentUser(
+        auth_type="telegram", identifier="1001", display_name="Shreyansh"
+    )
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            with (
+                patch("app.routers.domains.get_supabase_admin", return_value=sb),
+                patch("app.services.zoho.get_settings", return_value=Settings(_env_file=None)),
+            ):
+                r = await client.post(
+                    "/api/agent/goals/goal-ask-vendor/reply",
+                    json={"text": "Suresh Ji Painter"},
+                )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert r.status_code == 200
+    g_res = r.json()["goals"][0]
+    assert g_res["status"] == "awaiting_confirmation"
+    assert g_res["collected_slots"]["party_name"] == "Suresh Ji"
+    assert g_res["collected_slots"]["zoho_contact_id"] == "zv-suresh"
+    assert "✅ Matched" in g_res["prompt"]

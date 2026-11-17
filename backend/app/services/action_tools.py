@@ -162,6 +162,10 @@ ACTION_TOOLS_SCHEMA: list[dict[str, Any]] = [
                 },
                 "txn_date": {"type": "string", "description": "YYYY-MM-DD if specified"},
                 "notes": {"type": "string"},
+                "confirm_separate_duplicate_entry": {
+                    "type": "boolean",
+                    "description": "True ONLY if user explicitly asked for two identical-amount entries on the same account in one message",
+                },
                 "clarification_question": {"type": "string"},
                 "allow_missing_clarification": {"type": "boolean"},
             },
@@ -241,6 +245,27 @@ ACTION_TOOLS_SCHEMA: list[dict[str, Any]] = [
     },
 ]
 
+_ACTION_META_KEYS = frozenset(
+    {
+        "goal_id",
+        "draft_id",
+        "heard_transcript",
+        "allow_missing_clarification",
+        "confirm_separate_duplicate_entry",
+    }
+)
+
+for _t in ACTION_TOOLS_SCHEMA:
+    _props = _t["parameters"]["properties"]
+    _props.setdefault(
+        "draft_id",
+        {"type": "string", "description": "Draft handle ('D1', 'D2') from earlier in this turn to update in-place"},
+    )
+    _props.setdefault(
+        "heard_transcript",
+        {"type": "string", "description": "Exact Hinglish voice transcript when audio is attached"},
+    )
+
 _ACTION_TOOL_NAMES = {str(t["name"]) for t in ACTION_TOOLS_SCHEMA}
 
 
@@ -283,6 +308,7 @@ def preflight_goal_item_missing_slots(
     heard_transcript: str | None,
     reply_to_bot_msg_id: int | None = None,
     telegram_chat_id: int | None = None,
+    pinned_goal_id: str | None = None,
 ) -> tuple[list[str], dict[str, Any]]:
     """Run deterministic slot resolution & backfills side-effect-free to compute missing slots."""
     from app.services.agent_core.slot_resolvers import (
@@ -301,11 +327,12 @@ def preflight_goal_item_missing_slots(
     prior_missing_slots: list[str] = []
     existing_goal_id: str | None = None
 
-    if item.target_open_goal_id and _accept_id(sb, item.target_open_goal_id, "agent_goals"):
+    effective_open_id = item.target_open_goal_id or pinned_goal_id
+    if effective_open_id and _accept_id(sb, effective_open_id, "agent_goals"):
         g_rows = (
             sb.table("agent_goals")
             .select("id,collected_slots,missing_slots")
-            .eq("id", item.target_open_goal_id)
+            .eq("id", effective_open_id)
             .limit(1)
             .execute()
             .data
@@ -484,7 +511,7 @@ def _build_candidates_from_tool(sb: Any, name: str, args: dict[str, Any]) -> lis
         g_rows = sb.table("agent_goals").select("collected_slots").eq("id", gid).limit(1).execute().data or []
         if g_rows:
             op_kind = str((g_rows[0].get("collected_slots") or {}).get("operation_kind") or "new_lead")
-        patch_fields = {k: v for k, v in args.items() if k != "goal_id" and v is not None}
+        patch_fields = {k: v for k, v in args.items() if k not in _ACTION_META_KEYS and v is not None}
         return [
             GoalIntentItem(
                 target_open_goal_id=gid,
@@ -496,7 +523,11 @@ def _build_candidates_from_tool(sb: Any, name: str, args: dict[str, Any]) -> lis
 
     # manage_directory_or_order
     op = str(args.get("operation_kind") or "update_order_details")
-    allowed_fields = {k: v for k, v in args.items() if k not in ("operation_kind", "allow_missing_clarification") and v is not None}
+    allowed_fields = {
+        k: v
+        for k, v in args.items()
+        if k != "operation_kind" and k not in _ACTION_META_KEYS and v is not None
+    }
     return [
         GoalIntentItem(
             operation_kind=op,  # type: ignore[arg-type]
@@ -506,10 +537,225 @@ def _build_candidates_from_tool(sb: Any, name: str, args: dict[str, Any]) -> lis
     ]
 
 
-def _replace_by_key(target: list[Any], item: Any) -> None:
-    key = goal_item_dedup_key(item)
-    target[:] = [x for x in target if goal_item_dedup_key(x) != key]
-    target.append(item)
+_FIN_FAMILY = frozenset({"customer_receipt", "vendor_payment", "expense", "float_transfer", "supplier_draft_bill"})
+
+
+def _merge_goal_intent_items(base: Any, patch: Any) -> Any:
+    """Merge non-empty fields from patch onto base GoalIntentItem in-place without losing prior slots."""
+    base_data = base.model_dump()
+    patch_data = patch.model_dump()
+    for k, v in patch_data.items():
+        if k == "is_ambiguous":
+            base_data[k] = bool(v)
+        elif k in ("choices", "clarification_question"):
+            base_data[k] = v if v else ([] if k == "choices" else None)
+        elif v is not None and v != [] and v != "":
+            base_data[k] = v
+    return type(base).model_validate(base_data)
+
+
+class TurnDraftCart:
+    """Stateful per-turn workspace mapping explicit handles ('D1', 'D2', ...) to GoalIntentItem drafts."""
+
+    def __init__(self) -> None:
+        self.entries: dict[str, dict[str, Any]] = {}
+        self.heard_transcript: str | None = None
+        self._seq: int = 0
+
+    def has_items(self) -> bool:
+        return bool(self.entries)
+
+    def items(self) -> list[Any]:
+        return [e["item"] for e in self.entries.values()]
+
+    def clarified_keys(self) -> set[str]:
+        return {goal_item_dedup_key(e["item"]) for e in self.entries.values() if e.get("clarified")}
+
+    def upsert(
+        self,
+        sb: Any,
+        cand: Any,
+        *,
+        requested_draft_id: str | None = None,
+        allow_clarify: bool = False,
+        confirm_separate_duplicate: bool = False,
+        acc_code_to_id: dict[str, str],
+        ui_context: dict[str, Any] | None,
+        user_text: str | None,
+        heard_transcript: str | None,
+        reply_to_bot_msg_id: int | None = None,
+        telegram_chat_id: int | None = None,
+        pinned_goal_id: str | None = None,
+    ) -> tuple[str, Any, list[str], dict[str, Any], bool]:
+        from app.services.zoho.contacts import _core_name_tokens
+
+        def _preflight(it: Any) -> tuple[list[str], dict[str, Any]]:
+            m, rs = preflight_goal_item_missing_slots(
+                sb,
+                it,
+                acc_code_to_id=acc_code_to_id,
+                ui_context=ui_context,
+                user_text=user_text,
+                heard_transcript=heard_transcript,
+                reply_to_bot_msg_id=reply_to_bot_msg_id,
+                telegram_chat_id=telegram_chat_id,
+                pinned_goal_id=pinned_goal_id,
+            )
+            if not getattr(it, "party_name", None) and rs.get("party_name"):
+                it.party_name = str(rs["party_name"])
+            return m, rs
+
+        req_did = requested_draft_id.strip().upper() if requested_draft_id and requested_draft_id.strip() else None
+        if req_did and req_did in self.entries:
+            merged = _merge_goal_intent_items(self.entries[req_did]["item"], cand)
+            m, rs = _preflight(merged)
+            self.entries[req_did] = {
+                "item": merged,
+                "missing": m,
+                "clarified": bool(self.entries[req_did].get("clarified") or allow_clarify),
+            }
+            return req_did, merged, m, rs, False
+
+        missing, resolved_slots = _preflight(cand)
+        op = str(resolved_slots.get("operation_kind") or cand.operation_kind)
+
+        # Same-turn financial duplicate guard (blocks double-entry unless distinct payees or explicitly confirmed)
+        if op in _FIN_FAMILY and not confirm_separate_duplicate:
+            amt = resolved_slots.get("amount_inr")
+            acc = str(resolved_slots.get("payment_account_code") or "").strip().lower()
+            p_new = str(resolved_slots.get("party_name") or "").strip().lower()
+            toks_new = _core_name_tokens(p_new)
+            for did, ent in list(self.entries.items()):
+                e_it = ent["item"]
+                e_op = str(e_it.operation_kind or "")
+                if e_op not in _FIN_FAMILY:
+                    continue
+                if (op == "customer_receipt") != (e_op == "customer_receipt"):
+                    continue
+                same_amt = bool(amt and e_it.amount_inr and abs(float(amt) - float(e_it.amount_inr)) < 0.01)
+                e_acc = str(e_it.payment_account_code or "").strip().lower()
+                same_or_blank_acc = (acc and e_acc and acc == e_acc) or (not acc or not e_acc)
+                if same_amt and same_or_blank_acc:
+                    p_old = str(e_it.party_name or "").strip().lower()
+                    toks_old = _core_name_tokens(p_old)
+                    distinct_payees = bool(p_old and p_new and (toks_old != toks_new if (toks_old and toks_new) else p_old != p_new))
+                    if not distinct_payees:
+                        merged = _merge_goal_intent_items(e_it, cand)
+                        m2, rs2 = _preflight(merged)
+                        self.entries[did] = {
+                            "item": merged,
+                            "missing": m2,
+                            "clarified": bool(ent.get("clarified") or allow_clarify),
+                        }
+                        return did, merged, m2, rs2, True
+
+        # Dedup key or single incomplete same-op draft merge
+        new_key = goal_item_dedup_key(cand, resolved_slots)
+        for did, ent in list(self.entries.items()):
+            if goal_item_dedup_key(ent["item"]) == new_key:
+                merged = _merge_goal_intent_items(ent["item"], cand)
+                m2, rs2 = _preflight(merged)
+                self.entries[did] = {
+                    "item": merged,
+                    "missing": m2,
+                    "clarified": bool(ent.get("clarified") or allow_clarify),
+                }
+                return did, merged, m2, rs2, False
+
+        incomplete_same_op = [
+            (did, ent)
+            for did, ent in self.entries.items()
+            if ent.get("missing") and str(ent["item"].operation_kind) == op
+        ]
+        if len(incomplete_same_op) == 1:
+            did, ent = incomplete_same_op[0]
+            p_old = str(ent["item"].party_name or "").strip().lower()
+            p_new = str(resolved_slots.get("party_name") or "").strip().lower()
+            if not p_old or not p_new or _core_name_tokens(p_old) == _core_name_tokens(p_new):
+                merged = _merge_goal_intent_items(ent["item"], cand)
+                m2, rs2 = _preflight(merged)
+                self.entries[did] = {
+                    "item": merged,
+                    "missing": m2,
+                    "clarified": bool(ent.get("clarified") or allow_clarify),
+                }
+                return did, merged, m2, rs2, False
+
+        self._seq += 1
+        new_did = f"D{self._seq}"
+        self.entries[new_did] = {
+            "item": cand,
+            "missing": missing,
+            "clarified": bool(allow_clarify),
+        }
+        return new_did, cand, missing, resolved_slots, False
+
+
+async def _enrich_candidate_entities(sb: Any, cand: Any) -> None:
+    """Upgrade B: Deterministically match payees & customer orders inside the action tool."""
+    from app.services import zoho
+    from app.services.agent_core.schemas import DisambiguationChoice
+    from app.services.agent_core.slot_resolvers import _accept_id
+
+    op = str(cand.operation_kind or "")
+    if op in ("expense", "vendor_payment", "supplier_draft_bill") and cand.party_name:
+        m = await zoho.match_existing_payee(sb, cand.party_name)
+        if m.get("status") == "matched":
+            cand.party_name = m["canonical_name"]
+            cand.is_new_payee = False
+            if m.get("zoho_contact_id"):
+                cand.zoho_contact_id = m["zoho_contact_id"]
+            if m.get("vendor_id"):
+                cand.vendor_id = m["vendor_id"]
+            if m.get("person_id"):
+                cand.person_id = m["person_id"]
+            extra = m.get("role_hint") or (f"via {m['via_alias']}" if m.get("via_alias") else "")
+            if extra and extra.lower() not in (cand.notes or "").lower():
+                cand.notes = f"{extra}; {cand.notes}".strip("; ") if cand.notes else extra
+        elif m.get("status") == "ambiguous":
+            cand.is_ambiguous = True
+            cand.choices = [DisambiguationChoice(**c) for c in (m.get("choices") or [])]
+            cand.clarification_question = m.get("question")
+        elif m.get("status") == "new":
+            cand.is_new_payee = True
+
+    if op in (
+        "pipeline_stage_move",
+        "material_stage_move",
+        "item_upsert_or_move",
+        "item_material_upsert",
+        "update_order_details",
+        "customer_receipt",
+    ):
+        has_valid_pid = bool(cand.project_id and _accept_id(sb, cand.project_id, "projects"))
+        hint = (cand.project_id if (cand.project_id and not has_valid_pid) else None) or (
+            cand.party_name if op == "customer_receipt" and not has_valid_pid else None
+        )
+        if hint:
+            om = zoho.match_existing_order_or_customer(sb, hint)
+            if om.get("status") == "matched":
+                cand.project_id = om["project_id"]
+                if om.get("customer_id"):
+                    cand.customer_id = om["customer_id"]
+                if op == "customer_receipt" and om.get("customer_name"):
+                    cand.party_name = om["customer_name"]
+                    cand.is_new_payee = False
+            elif om.get("status") == "ambiguous":
+                cand.is_ambiguous = True
+                cand.choices = [DisambiguationChoice(**c) for c in (om.get("choices") or [])]
+                cand.clarification_question = om.get("question")
+        if op == "customer_receipt" and cand.party_name and cand.is_new_payee is None and sb is not None:
+            c_hits = (
+                sb.table("customers")
+                .select("id")
+                .ilike("full_name", cand.party_name.strip())
+                .eq("is_active", True)
+                .limit(2)
+                .execute()
+                .data
+                or []
+            )
+            cand.is_new_payee = len(c_hits) == 0
 
 
 async def execute_action_tool(
@@ -517,75 +763,138 @@ async def execute_action_tool(
     name: str,
     arguments: dict[str, Any],
     *,
-    staged_items: list[Any],
-    fallback_items: list[Any],
-    clarified_keys: set[str],
+    cart: TurnDraftCart | None = None,
+    staged_items: list[Any] | None = None,
+    fallback_items: list[Any] | None = None,
+    clarified_keys: set[str] | None = None,
     acc_code_to_id: dict[str, str],
     ui_context: dict[str, Any] | None,
     user_text: str | None,
     heard_transcript: str | None,
     reply_to_bot_msg_id: int | None = None,
     telegram_chat_id: int | None = None,
+    pinned_goal_id: str | None = None,
 ) -> str:
-    """Validate and stage an action proposal in-memory before final AgentCore execution."""
+    """Validate, link entities, and stage an action draft into TurnDraftCart."""
+    if cart is not None and arguments.get("heard_transcript"):
+        ht = str(arguments["heard_transcript"]).strip()
+        if ht:
+            cart.heard_transcript = ht
+
     candidates = _build_candidates_from_tool(sb, name, arguments)
     if not candidates:
         return json.dumps({"ok": False, "staged": False, "error": "No items supplied to action tool."})
 
     allow_clarify = bool(arguments.get("allow_missing_clarification"))
+    confirm_dup = bool(arguments.get("confirm_separate_duplicate_entry"))
+    req_draft_id = arguments.get("draft_id")
+
+    draft_ids: list[str] = []
     missing_report: list[dict[str, Any]] = []
+    matched_parties: list[str] = []
+
     for idx, cand in enumerate(candidates):
-        missing, resolved_slots = preflight_goal_item_missing_slots(
-            sb,
-            cand,
-            acc_code_to_id=acc_code_to_id,
-            ui_context=ui_context,
-            user_text=user_text,
-            heard_transcript=heard_transcript,
-            reply_to_bot_msg_id=reply_to_bot_msg_id,
-            telegram_chat_id=telegram_chat_id,
-        )
-        if not getattr(cand, "party_name", None) and resolved_slots.get("party_name"):
-            cand.party_name = str(resolved_slots["party_name"])
-        if missing and not cand.is_ambiguous:
-            missing_report.append(
-                {
-                    "index": idx,
-                    "summary": cand.summary_title,
-                    "missing_slots": missing,
-                }
+        await _enrich_candidate_entities(sb, cand)
+        if cart is not None:
+            did, saved_cand, missing, _, blocked_dup = cart.upsert(
+                sb,
+                cand,
+                requested_draft_id=req_draft_id if len(candidates) == 1 else None,
+                allow_clarify=allow_clarify,
+                confirm_separate_duplicate=confirm_dup,
+                acc_code_to_id=acc_code_to_id,
+                ui_context=ui_context,
+                user_text=user_text,
+                heard_transcript=(cart.heard_transcript or heard_transcript),
+                reply_to_bot_msg_id=reply_to_bot_msg_id,
+                telegram_chat_id=telegram_chat_id,
+                pinned_goal_id=pinned_goal_id,
             )
+            if blocked_dup:
+                return json.dumps(
+                    {
+                        "ok": False,
+                        "staged": False,
+                        "duplicate_of": did,
+                        "instruction": (
+                            f"Draft {did} already stages this exact amount & account. "
+                            f"Pass draft_id='{did}' to modify it, or confirm_separate_duplicate_entry=true "
+                            "ONLY if the user requested two separate identical payments."
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+            draft_ids.append(did)
+            if saved_cand.party_name:
+                matched_parties.append(str(saved_cand.party_name))
+            if missing and not saved_cand.is_ambiguous:
+                missing_report.append(
+                    {"index": idx, "draft_id": did, "summary": saved_cand.summary_title, "missing_slots": missing}
+                )
+        else:
+            missing, resolved_slots = preflight_goal_item_missing_slots(
+                sb,
+                cand,
+                acc_code_to_id=acc_code_to_id,
+                ui_context=ui_context,
+                user_text=user_text,
+                heard_transcript=heard_transcript,
+                reply_to_bot_msg_id=reply_to_bot_msg_id,
+                telegram_chat_id=telegram_chat_id,
+                pinned_goal_id=pinned_goal_id,
+            )
+            if not getattr(cand, "party_name", None) and resolved_slots.get("party_name"):
+                cand.party_name = str(resolved_slots["party_name"])
+            if cand.party_name:
+                matched_parties.append(str(cand.party_name))
+            if missing and not cand.is_ambiguous:
+                missing_report.append({"index": idx, "summary": cand.summary_title, "missing_slots": missing})
+
+    if cart is None:
+        s_items = staged_items if staged_items is not None else []
+        f_items = fallback_items if fallback_items is not None else []
+        c_keys = clarified_keys if clarified_keys is not None else set()
+        if missing_report and not allow_clarify:
+            for cand in candidates:
+                key = goal_item_dedup_key(cand)
+                f_items[:] = [x for x in f_items if goal_item_dedup_key(x) != key]
+                f_items.append(cand)
+        else:
+            for cand in candidates:
+                key = goal_item_dedup_key(cand)
+                s_items[:] = [x for x in s_items if goal_item_dedup_key(x) != key]
+                s_items.append(cand)
+                if allow_clarify:
+                    c_keys.add(key)
 
     if missing_report and not allow_clarify:
-        for cand in candidates:
-            _replace_by_key(fallback_items, cand)
+        did_hint = draft_ids[0] if len(draft_ids) == 1 else ""
+        did_clause = f"with draft_id='{did_hint}' " if did_hint else ""
         return json.dumps(
             {
                 "ok": False,
                 "staged": False,
+                **({"draft_id": did_hint} if did_hint else {}),
                 "missing_slots": missing_report,
                 "instruction": (
-                    "Pre-flight validation found missing slot(s). If stated or implied in the user's "
-                    "message, PDF/image, or CONTEXT, re-call the tool with those field(s) filled. "
-                    "If genuinely omitted by the user, re-call with allow_missing_clarification=true "
-                    "and a polite clarification_question."
+                    f"Pre-flight found missing slot(s). Re-call this tool {did_clause}with those field(s) filled "
+                    "if stated or implied in the user's message, PDF/image, or CONTEXT. "
+                    f"If genuinely absent from all inputs, re-call {did_clause}with "
+                    "allow_missing_clarification=true and a polite clarification_question."
                 ),
             },
             ensure_ascii=False,
         )
 
-    for cand in candidates:
-        _replace_by_key(staged_items, cand)
-        if allow_clarify:
-            clarified_keys.add(goal_item_dedup_key(cand))
-
     return json.dumps(
         {
             "ok": True,
             "staged": True,
+            "draft_id": draft_ids[0] if len(draft_ids) == 1 else ",".join(draft_ids),
             "staged_count": len(candidates),
+            **({"matched_party": matched_parties[0]} if matched_parties else {}),
             "missing_for_user": missing_report,
-            "ref_preview": make_zoho_reference_number("staged", len(staged_items)),
+            "ref_preview": make_zoho_reference_number("staged", len(cart.entries) if cart is not None else 1),
         },
         ensure_ascii=False,
     )

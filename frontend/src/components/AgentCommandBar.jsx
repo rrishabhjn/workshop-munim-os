@@ -36,6 +36,8 @@ export default function AgentCommandBar({
   const [editingGoalId, setEditingGoalId] = useState(null);
   const [editDraft, setEditDraft] = useState({});
   const [editNote, setEditNote] = useState("");
+  const [replyDrafts, setReplyDrafts] = useState({});
+  const [drawerStagedGoals, setDrawerStagedGoals] = useState({});
   const [errorMsg, setErrorMsg] = useState("");
 
   const WINDOW_MS = 30 * 60 * 1000;
@@ -208,6 +210,11 @@ export default function AgentCommandBar({
       }
 
       if (action === "discard" && res?.ok) {
+        setDrawerStagedGoals((prev) => {
+          const next = { ...prev };
+          delete next[goalId];
+          return next;
+        });
         if (lastTurn?.goals) {
           setLastTurn((prev) => {
             if (!prev) return null;
@@ -223,6 +230,11 @@ export default function AgentCommandBar({
       }
 
       if (res?.status === "completed") {
+        setDrawerStagedGoals((prev) => {
+          const next = { ...prev };
+          delete next[goalId];
+          return next;
+        });
         if (lastTurn?.goals) {
           setLastTurn((prev) => {
             if (!prev) return null;
@@ -246,6 +258,9 @@ export default function AgentCommandBar({
         return;
       }
 
+      setDrawerStagedGoals((prev) =>
+        prev[goalId] ? { ...prev, [goalId]: { ...prev[goalId], ...res } } : prev
+      );
       if (lastTurn?.goals) {
         setLastTurn((prev) =>
           prev
@@ -333,6 +348,7 @@ export default function AgentCommandBar({
         }),
       });
       setEditingGoalId(null);
+      setDrawerStagedGoals((prev) => ({ ...prev, [gid]: { ...g, ...res } }));
       if (lastTurn?.goals) {
         setLastTurn((prev) =>
           prev
@@ -353,8 +369,63 @@ export default function AgentCommandBar({
     }
   }
 
+  async function submitGoalInlineReply(goalId) {
+    const replyText = String(replyDrafts[goalId] ?? "").trim();
+    if (!replyText) return;
+    setSending(true);
+    setErrorMsg("");
+    try {
+      const res = await apiFetch(`/api/agent/goals/${goalId}/reply`, {
+        method: "POST",
+        body: JSON.stringify({ text: replyText }),
+      });
+      setReplyDrafts((prev) => ({ ...prev, [goalId]: "" }));
+      const goalsOut = res?.goals || [];
+      const updatedGoal = goalsOut[0];
+      if (updatedGoal) {
+        if (updatedGoal.status === "completed") {
+          setDrawerStagedGoals((prev) => {
+            const next = { ...prev };
+            delete next[goalId];
+            return next;
+          });
+          showAiToast(
+            {
+              message: updatedGoal.receipt || updatedGoal.summary_title || "Saved",
+              projectId: updatedGoal.project_id || null,
+              goalId: updatedGoal.goal_id || goalId,
+              undoAvailable: Boolean(updatedGoal.undo_available),
+            },
+            6000
+          );
+        } else {
+          setDrawerStagedGoals((prev) => ({ ...prev, [goalId]: updatedGoal }));
+        }
+        if (lastTurn?.goals) {
+          setLastTurn((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  goals: prev.goals.map((item) =>
+                    (item.goal_id || item.id) === goalId ? { ...item, ...updatedGoal } : item
+                  ),
+                }
+              : null
+          );
+        }
+      } else if (res?.reply_text) {
+        setErrorMsg(res.reply_text);
+      }
+      await onAfterAgentMutation();
+    } catch (err) {
+      setErrorMsg(err.message || "Reply failed");
+    } finally {
+      setSending(false);
+    }
+  }
+
   function renderGoalCard(g) {
-    const gid = g.goal_id;
+    const gid = g.goal_id || g.id;
     const choices = g.choices || g.repair_options || [];
     const slots = g.collected_slots || {};
     const isEditing = editingGoalId === gid;
@@ -521,7 +592,7 @@ export default function AgentCommandBar({
                 <span>Confirm</span>
               </button>
               <button
-                onClick={() => openInlineEdit(g)}
+                onClick={() => openInlineEdit({ ...g, goal_id: gid })}
                 className="min-h-[40px] px-3 rounded-xl border border-stone-300 bg-white font-semibold text-stone-800 flex items-center gap-1"
               >
                 <Pencil className="w-3.5 h-3.5" />
@@ -586,6 +657,43 @@ export default function AgentCommandBar({
                 </button>
               )}
 
+              {(g.status === "gathering_info" || g.status === "needs_error_fix") && (
+                <form
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    submitGoalInlineReply(gid);
+                  }}
+                  className="w-full flex items-center gap-1.5 pt-1"
+                >
+                  <input
+                    value={replyDrafts[gid] ?? ""}
+                    onChange={(e) =>
+                      setReplyDrafts((prev) => ({ ...prev, [gid]: e.target.value }))
+                    }
+                    placeholder="Type missing detail (e.g. Suresh Ji Painter, Jaipur, Axis)..."
+                    className="flex-1 min-h-[44px] px-3 rounded-xl border border-stone-300 bg-white text-xs text-stone-900"
+                  />
+                  <button
+                    type="submit"
+                    disabled={sending || !String(replyDrafts[gid] ?? "").trim()}
+                    className="min-h-[44px] px-3.5 rounded-xl bg-amber-900 text-white font-bold text-xs disabled:opacity-40 shrink-0"
+                  >
+                    Reply
+                  </button>
+                </form>
+              )}
+
+              {!isEditing && (
+                <button
+                  type="button"
+                  onClick={() => openInlineEdit({ ...g, goal_id: gid })}
+                  className="min-h-[40px] px-3 rounded-xl border border-stone-300 bg-white font-semibold text-stone-800 flex items-center gap-1"
+                >
+                  <Pencil className="w-3.5 h-3.5" />
+                  <span>Edit</span>
+                </button>
+              )}
+
               <button
                 onClick={() => handleGoalAction(gid, "discard", null, g)}
                 className="min-h-[40px] px-3 rounded-xl border border-rose-200 bg-rose-50 font-semibold text-rose-700"
@@ -636,13 +744,28 @@ export default function AgentCommandBar({
             </div>
 
             <div className="p-4 overflow-y-auto flex-1 space-y-3">
-              {(needsInfo || []).length === 0 ? (
-                <p className="text-sm text-stone-500 text-center py-8">
-                  All clear — zero unfinished clarifications or Zoho errors!
-                </p>
-              ) : (
-                (needsInfo || []).map((n) => renderGoalCard(n))
+              {errorMsg && (
+                <div className="text-xs text-rose-700 font-semibold bg-rose-50 border border-rose-200 rounded-xl px-3 py-2">
+                  {errorMsg}
+                </div>
               )}
+              {(() => {
+                const mergedDrawerGoals = (needsInfo || []).map((n) => {
+                  const id = n.goal_id || n.id;
+                  return drawerStagedGoals[id] ? { ...n, ...drawerStagedGoals[id] } : n;
+                });
+                const seenDrawerIds = new Set(mergedDrawerGoals.map((n) => n.goal_id || n.id));
+                for (const [id, st] of Object.entries(drawerStagedGoals)) {
+                  if (!seenDrawerIds.has(id)) mergedDrawerGoals.unshift(st);
+                }
+                return mergedDrawerGoals.length === 0 ? (
+                  <p className="text-sm text-stone-500 text-center py-8">
+                    All clear — zero unfinished clarifications or Zoho errors!
+                  </p>
+                ) : (
+                  mergedDrawerGoals.map((n) => renderGoalCard(n))
+                );
+              })()}
             </div>
           </div>
         </div>

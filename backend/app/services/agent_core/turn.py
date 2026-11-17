@@ -7,6 +7,7 @@ import base64
 from datetime import datetime, timezone
 import json
 import logging
+import re
 import sys
 from typing import Any, Literal
 
@@ -21,7 +22,6 @@ from app.services.agent_core.grounding import _build_compact_grounding, _build_s
 from app.services.agent_core.schemas import (
     AgentTurnEnvelope,
     GoalIntentItem,
-    _inline_json_schema,
     _strip_json_fences,
 )
 from app.services.agent_core.slot_resolvers import (
@@ -33,6 +33,7 @@ from app.services.agent_core.slot_resolvers import (
     _build_default_missing_slot_choices,
     _compute_missing_slots_for_op,
     _fetch_target_row_for_slots,
+    _is_valid_uuid,
     _map_op_to_db_goal_type,
     _sanitize_and_resolve_slot_ids,
     parse_initial_items_slot,
@@ -66,6 +67,7 @@ async def run_agent_turn(
     ui_context: dict[str, Any] | None = None,
     telegram_chat_id: int | None = None,
     reply_to_bot_msg_id: int | None = None,
+    pinned_goal_id: str | None = None,
 ) -> dict[str, Any]:
     """Execute one complete omnichannel AgentCore turn and return structured UI/Telegram response."""
     pkg = _pkg()
@@ -161,6 +163,8 @@ async def run_agent_turn(
     prompt_parts = []
     if media_triage_notes:
         prompt_parts.append("\n".join(media_triage_notes))
+    if pinned_goal_id:
+        prompt_parts.append(f"[PINNED OPEN GOAL TO RESOLVE: goal_id={pinned_goal_id}]")
     if text and text.strip():
         prompt_parts.append(text.strip())
     elif not prompt_parts:
@@ -168,18 +172,23 @@ async def run_agent_turn(
     input_blocks.append({"type": "text", "text": "\n".join(prompt_parts)})
 
     client = pkg._get_interactions_client()
-    resp_format = {
-        "type": "text",
-        "mime_type": "application/json",
-        "schema": _inline_json_schema(AgentTurnEnvelope, force_required=("goal_items",)),
-    }
 
-    # 3. Bounded Tool-Calling Loop (Max 4 rounds; previous_interaction_id strictly within-turn!)
-    staged_items: list[GoalIntentItem] = []
-    fallback_items: list[GoalIntentItem] = []
-    clarified_keys: set[str] = set()
+    # 3. Native Tool-Calling Loop with Stateful TurnDraftCart (Upgrade A + B + C; no JSON response_format!)
+    cart = action_tools.TurnDraftCart()
+    read_tools_called = 0
+
+    def _extract_heard_and_text(raw: str) -> tuple[str | None, str]:
+        clean = (raw or "").strip()
+        if not clean:
+            return None, ""
+        lines = clean.splitlines()
+        m_h = re.match(r"^\s*HEARD\s*:\s*(.+)$", lines[0], re.IGNORECASE)
+        if m_h:
+            return (m_h.group(1).strip().strip('"').strip("'") or None), "\n".join(lines[1:]).strip()
+        return None, clean
 
     async def _run_tool_calls(fn_calls: list[Any], *, cur_heard: str | None) -> list[dict[str, Any]]:
+        nonlocal read_tools_called
         results: list[dict[str, Any]] = []
         for fc in fn_calls:
             raw_args = getattr(fc, "arguments", None) or {}
@@ -189,17 +198,17 @@ async def run_agent_turn(
                     sb,
                     fc.name,
                     args_dict,
-                    staged_items=staged_items,
-                    fallback_items=fallback_items,
-                    clarified_keys=clarified_keys,
+                    cart=cart,
                     acc_code_to_id=acc_code_to_id,
                     ui_context=ui_context,
                     user_text=text,
                     heard_transcript=cur_heard,
                     reply_to_bot_msg_id=reply_to_bot_msg_id,
                     telegram_chat_id=telegram_chat_id,
+                    pinned_goal_id=pinned_goal_id,
                 )
             else:
+                read_tools_called += 1
                 tool_out = await agent_tools.execute_read_tool(sb, fc.name, args_dict)
             results.append(
                 {
@@ -218,7 +227,6 @@ async def run_agent_turn(
         input=input_blocks,
         tools=agent_tools.INTERACTION_TOOLS_SCHEMA,
         generation_config={"thinking_level": thinking_level},
-        response_format=resp_format,
     )
 
     for _round in range(4):
@@ -237,78 +245,151 @@ async def run_agent_turn(
             input=fn_results,
             tools=agent_tools.INTERACTION_TOOLS_SCHEMA,
             generation_config={"thinking_level": thinking_level},
-            response_format=resp_format,
         )
 
-    raw_json = _strip_json_fences(getattr(interaction, "output_text", None) or "")
-    if not raw_json and (staged_items or fallback_items):
-        envelope = AgentTurnEnvelope(intent_category="goal_actions", goal_items=[])
-    else:
-        envelope = AgentTurnEnvelope.model_validate_json(raw_json)
-    if envelope.intent_category == "goal_actions" and not envelope.goal_items and not staged_items:
-        try:
-            retry_interaction = await asyncio.to_thread(
-                client.interactions.create,
-                model=settings.gemini_live_model,
-                previous_interaction_id=getattr(interaction, "id", None),
-                system_instruction=sys_inst,
-                input=[
-                    {
-                        "type": "text",
-                        "text": (
-                            "You set intent_category='goal_actions' but omitted goal_items. "
-                            "Populate goal_items with the concrete action(s) now, or set "
-                            "intent_category='direct_answer' with an explanation in direct_reply_text."
-                        ),
-                    }
-                ],
-                generation_config={"thinking_level": thinking_level},
-                response_format=resp_format,
-            )
-            interaction = retry_interaction
-            retry_json = _strip_json_fences(getattr(retry_interaction, "output_text", None) or "")
-            if retry_json:
-                envelope = AgentTurnEnvelope.model_validate_json(retry_json)
-        except Exception as exc:
-            logger.warning("Empty goal_items retry failed safely: %s", exc)
+    raw_out = (getattr(interaction, "output_text", None) or "").strip()
+    stripped_out = _strip_json_fences(raw_out)
 
-    heard = envelope.heard_transcript if all_audio_files else None
-
-    def _merge_items(cur_staged: list[GoalIntentItem], cur_env: list[GoalIntentItem], cur_fb: list[GoalIntentItem]) -> list[GoalIntentItem]:
-        by_key: dict[str, tuple[GoalIntentItem, int, bool]] = {}
+    def _merge_legacy_items(cur_env: list[GoalIntentItem]) -> list[GoalIntentItem]:
+        by_key: dict[str, tuple[GoalIntentItem, int]] = {}
         order: list[str] = []
-        for idx_src, (src_list, is_staged) in enumerate(((cur_staged, True), (cur_env, False))):
-            for cand in src_list:
-                missing, resolved_slots = action_tools.preflight_goal_item_missing_slots(
-                    sb,
-                    cand,
-                    acc_code_to_id=acc_code_to_id,
-                    ui_context=ui_context,
-                    user_text=text,
-                    heard_transcript=heard,
-                    reply_to_bot_msg_id=reply_to_bot_msg_id,
-                    telegram_chat_id=telegram_chat_id,
-                )
-                if not cand.party_name and resolved_slots.get("party_name"):
-                    cand.party_name = str(resolved_slots["party_name"])
-                key = action_tools.goal_item_dedup_key(cand, resolved_slots)
-                miss_cnt = len(missing)
+        for cand in cur_env:
+            missing, resolved_slots = action_tools.preflight_goal_item_missing_slots(
+                sb,
+                cand,
+                acc_code_to_id=acc_code_to_id,
+                ui_context=ui_context,
+                user_text=text,
+                heard_transcript=heard,
+                reply_to_bot_msg_id=reply_to_bot_msg_id,
+                telegram_chat_id=telegram_chat_id,
+                pinned_goal_id=pinned_goal_id,
+            )
+            if not cand.party_name and resolved_slots.get("party_name"):
+                cand.party_name = str(resolved_slots["party_name"])
+            key = action_tools.goal_item_dedup_key(cand, resolved_slots)
+            miss_cnt = len(missing)
+            if key not in by_key or miss_cnt < by_key[key][1]:
                 if key not in by_key:
-                    by_key[key] = (cand, miss_cnt, is_staged)
                     order.append(key)
-                else:
-                    prev_cand, prev_miss, prev_staged = by_key[key]
-                    if miss_cnt < prev_miss or (miss_cnt == prev_miss and is_staged and not prev_staged):
-                        by_key[key] = (cand, miss_cnt, is_staged)
-        merged = [by_key[k][0] for k in order]
-        return merged if merged else list(cur_fb)
+                by_key[key] = (cand, miss_cnt)
+        return [by_key[k][0] for k in order]
 
-    merged_items = _merge_items(staged_items, list(envelope.goal_items or []), fallback_items)
+    envelope = AgentTurnEnvelope(intent_category="goal_actions", goal_items=[])
+    merged_items: list[GoalIntentItem] = []
+    clarified_keys: set[str] = set()
+    heard: str | None = None
+
+    if cart.has_items():
+        # Primary Upgrade A+C Path: action tools exclusively own goal state; ignore any text/JSON echo!
+        parsed_heard, _ = _extract_heard_and_text(raw_out)
+        heard = (cart.heard_transcript or parsed_heard) if all_audio_files else None
+        merged_items = cart.items()
+        clarified_keys = cart.clarified_keys()
+    elif stripped_out.startswith("{"):
+        # Compatibility path for JSON-mocked unit tests & legacy structured envelopes
+        envelope = AgentTurnEnvelope.model_validate_json(stripped_out)
+        if envelope.intent_category == "goal_actions" and not envelope.goal_items:
+            try:
+                retry_int = await asyncio.to_thread(
+                    client.interactions.create,
+                    model=settings.gemini_live_model,
+                    previous_interaction_id=getattr(interaction, "id", None),
+                    system_instruction=sys_inst,
+                    input=[
+                        {
+                            "type": "text",
+                            "text": (
+                                "You set intent_category='goal_actions' without calling an action tool or populating goal_items. "
+                                "Call the appropriate action tool now, or answer plainly in direct_reply_text."
+                            ),
+                        }
+                    ],
+                    tools=agent_tools.INTERACTION_TOOLS_SCHEMA,
+                    generation_config={"thinking_level": thinking_level},
+                )
+                interaction = retry_int
+                r_calls = [s for s in (getattr(retry_int, "steps", None) or []) if getattr(s, "type", None) == "function_call"]
+                if r_calls:
+                    await _run_tool_calls(r_calls, cur_heard=None)
+                retry_txt = _strip_json_fences(getattr(retry_int, "output_text", None) or "")
+                if retry_txt.startswith("{"):
+                    envelope = AgentTurnEnvelope.model_validate_json(retry_txt)
+            except Exception as exc:
+                logger.warning("Empty goal_items retry failed safely: %s", exc)
+        heard = (cart.heard_transcript or envelope.heard_transcript) if all_audio_files else None
+        merged_items = cart.items() if cart.has_items() else _merge_legacy_items(list(envelope.goal_items or []))
+        clarified_keys = cart.clarified_keys()
+    else:
+        # Native plain-text reply / Missing-tool nudge guard
+        parsed_heard, plain_text = _extract_heard_and_text(raw_out)
+        heard = (cart.heard_transcript or parsed_heard) if all_audio_files else None
+        txt_clean = (text or "").strip()
+        is_query = (
+            "?" in txt_clean
+            or "whatsapp" in txt_clean.lower()
+            or bool(
+                re.search(
+                    r"^(who|what|which|when|where|how|why|kitna|kitne|kaun|kya|batao|bata|dikhao|show|list|draft|write)\b",
+                    txt_clean,
+                    re.I,
+                )
+            )
+        )
+        claimed_action = bool(
+            re.search(r"\b(saved|staged|moved|added|updated|recorded|posted|kar diya|ho gaya|noted)\b", plain_text, re.I)
+        )
+        if txt_clean and read_tools_called == 0 and (not is_query or pinned_goal_id is not None) and (not plain_text or claimed_action):
+            try:
+                nudge_int = await asyncio.to_thread(
+                    client.interactions.create,
+                    model=settings.gemini_live_model,
+                    previous_interaction_id=getattr(interaction, "id", None),
+                    system_instruction=sys_inst,
+                    input=[
+                        {
+                            "type": "text",
+                            "text": (
+                                "Nothing was staged yet because no action tool was called. "
+                                "If the user requested a create/update/move/payment, call the appropriate action tool now "
+                                "(or resolve_open_goal). Otherwise give a helpful direct answer."
+                            ),
+                        }
+                    ],
+                    tools=agent_tools.INTERACTION_TOOLS_SCHEMA,
+                    generation_config={"thinking_level": thinking_level},
+                )
+                n_calls = [s for s in (getattr(nudge_int, "steps", None) or []) if getattr(s, "type", None) == "function_call"]
+                if n_calls:
+                    await _run_tool_calls(n_calls, cur_heard=heard)
+                    if cart.has_items():
+                        merged_items = cart.items()
+                        clarified_keys = cart.clarified_keys()
+                if not merged_items:
+                    n_heard, n_plain = _extract_heard_and_text(getattr(nudge_int, "output_text", None) or "")
+                    if n_plain:
+                        plain_text = n_plain
+                    if n_heard and all_audio_files and not heard:
+                        heard = n_heard
+            except Exception as exc:
+                logger.warning("Missing-tool action nudge failed safely: %s", exc)
+
+        if not merged_items:
+            if not plain_text:
+                return {
+                    "kind": "unrecognized",
+                    "is_error": True,
+                    "heard_transcript": heard,
+                    "reply_text": "⚠️ Could not match that command to an order or action — please check the customer/order name and try again.",
+                    "goals": [],
+                    "parked_goal_nudge": None,
+                }
+            envelope = AgentTurnEnvelope(intent_category="direct_answer", direct_reply_text=plain_text, goal_items=[])
 
     # 3b. Silent Internal Self-Repair before asking user for already-stated details
     if merged_items:
         unconfirmed_missing: list[dict[str, Any]] = []
-        has_open_target = reply_to_bot_msg_id is not None
+        has_open_target = reply_to_bot_msg_id is not None or pinned_goal_id is not None
         for idx_m, cand in enumerate(merged_items):
             if cand.target_open_goal_id:
                 has_open_target = True
@@ -323,10 +404,13 @@ async def run_agent_turn(
                 heard_transcript=heard,
                 reply_to_bot_msg_id=reply_to_bot_msg_id,
                 telegram_chat_id=telegram_chat_id,
+                pinned_goal_id=pinned_goal_id,
             )
             if missing_m:
+                draft_lbl = next((did for did, ent in cart.entries.items() if ent["item"] is cand), f"D{idx_m + 1}")
                 unconfirmed_missing.append(
                     {
+                        "draft_id": draft_lbl,
                         "index": idx_m,
                         "operation_kind": cand.operation_kind,
                         "summary_title": cand.summary_title,
@@ -342,17 +426,7 @@ async def run_agent_turn(
                 for entry in unconfirmed_missing
                 for slot in entry["missing_slots"]
             )
-            pushback_cues = (
-                "already",
-                "confus",
-                "these are",
-                "bataya",
-                "likha",
-                "above",
-                "upar",
-                "nahi",
-                "not expense",
-            )
+            pushback_cues = ("already", "confus", "these are", "bataya", "likha", "above", "upar", "nahi", "not expense")
             should_repair = (
                 (critical_slot and len(txt_clean) >= 15)
                 or bool(media_files)
@@ -365,12 +439,11 @@ async def run_agent_turn(
                 repair_thinking: ThinkingLevel = "high" if thinking_level == "high" else "medium"
                 repair_prompt = (
                     "INTERNAL PRE-FLIGHT CHECK (user has NOT seen this yet): "
-                    "Python rejected item(s) due to missing required JSON fields:\n"
+                    "Python rejected draft(s) due to missing required fields:\n"
                     f"{json.dumps(unconfirmed_missing, ensure_ascii=False)}\n\n"
                     "Carefully re-read the user's message, attachment/PDF, and CONTEXT. "
-                    "Fill ALL missing field(s) directly in your action tool call or `goal_items` if already stated or implied "
-                    "(do NOT leave item_name, area_landmark, amount_inr, or payment_account_code null if present!). "
-                    "Only ask the user (`allow_missing_clarification=true` / `clarification_question`) if the info is genuinely absent."
+                    "Re-call the action tool with `draft_id` (or populate all missing fields cleanly) if stated or implied. "
+                    "Only pass `allow_missing_clarification=true` with `clarification_question` if genuinely absent."
                 )
                 try:
                     repair_int = await asyncio.to_thread(
@@ -381,35 +454,25 @@ async def run_agent_turn(
                         input=[{"type": "text", "text": repair_prompt}],
                         tools=agent_tools.INTERACTION_TOOLS_SCHEMA,
                         generation_config={"thinking_level": repair_thinking},
-                        response_format=resp_format,
                     )
                     rep_fn_calls = [
                         s for s in (getattr(repair_int, "steps", None) or [])
                         if getattr(s, "type", None) == "function_call"
                     ]
                     if rep_fn_calls:
-                        rep_results = await _run_tool_calls(rep_fn_calls, cur_heard=heard)
-                        repair_int = await asyncio.to_thread(
-                            client.interactions.create,
-                            model=settings.gemini_live_model,
-                            previous_interaction_id=getattr(repair_int, "id", None),
-                            system_instruction=sys_inst,
-                            input=rep_results,
-                            tools=agent_tools.INTERACTION_TOOLS_SCHEMA,
-                            generation_config={"thinking_level": repair_thinking},
-                            response_format=resp_format,
-                        )
-                    rep_raw = _strip_json_fences(getattr(repair_int, "output_text", None) or "")
-                    rep_env = (
-                        AgentTurnEnvelope.model_validate_json(rep_raw)
-                        if rep_raw
-                        else AgentTurnEnvelope(intent_category="goal_actions", goal_items=[])
-                    )
-                    repaired_merged = _merge_items(staged_items, list(rep_env.goal_items or []), fallback_items)
-                    if repaired_merged:
-                        merged_items = repaired_merged
-                    if rep_env.direct_reply_text:
-                        envelope.direct_reply_text = rep_env.direct_reply_text
+                        await _run_tool_calls(rep_fn_calls, cur_heard=heard)
+                    if cart.has_items():
+                        merged_items = cart.items()
+                        clarified_keys = cart.clarified_keys()
+                    else:
+                        rep_raw = _strip_json_fences(getattr(repair_int, "output_text", None) or "")
+                        if rep_raw.startswith("{"):
+                            rep_env = AgentTurnEnvelope.model_validate_json(rep_raw)
+                            repaired_merged = _merge_legacy_items(list(rep_env.goal_items or []))
+                            if repaired_merged:
+                                merged_items = repaired_merged
+                            if rep_env.direct_reply_text:
+                                envelope.direct_reply_text = rep_env.direct_reply_text
                 except Exception as exc:
                     logger.warning("Silent self-repair pass failed safely: %s", exc)
 
@@ -472,6 +535,7 @@ async def run_agent_turn(
             telegram_chat_id=telegram_chat_id,
             user_text=text,
             reply_to_bot_msg_id=reply_to_bot_msg_id,
+            pinned_goal_id=pinned_goal_id,
         )
         processed_goals.append(g_out)
 
@@ -520,6 +584,7 @@ async def _process_goal_intent_item(
     telegram_chat_id: int | None,
     user_text: str | None = None,
     reply_to_bot_msg_id: int | None = None,
+    pinned_goal_id: str | None = None,
 ) -> dict[str, Any]:
     pkg = _pkg()
     prior_slots: dict[str, Any] = {}
@@ -528,11 +593,12 @@ async def _process_goal_intent_item(
     existing_goal_id: str | None = None
     existing_owner_person_id: str | None = None
 
-    if item.target_open_goal_id and _accept_id(sb, item.target_open_goal_id, "agent_goals"):
+    effective_open_id = item.target_open_goal_id or pinned_goal_id
+    if effective_open_id and _accept_id(sb, effective_open_id, "agent_goals"):
         g_rows = (
             sb.table("agent_goals")
             .select("*")
-            .eq("id", item.target_open_goal_id)
+            .eq("id", effective_open_id)
             .limit(1)
             .execute()
             .data
@@ -579,7 +645,10 @@ async def _process_goal_intent_item(
         if v is not None and v != [] and v != ""
     }
     slots: dict[str, Any] = {**prior_slots, **new_slots}
-    if slots.get("zoho_contact_id") and "-" in str(slots["zoho_contact_id"]):
+    if slots.get("zoho_contact_id") and (
+        _is_valid_uuid(slots["zoho_contact_id"])
+        or str(slots["zoho_contact_id"]).strip().lower() in ("none", "none_needed", "null", "na", "n/a")
+    ):
         slots.pop("zoho_contact_id", None)
     if uploaded_gcs_paths and not slots.get("uploaded_gcs_paths"):
         slots["uploaded_gcs_paths"] = uploaded_gcs_paths

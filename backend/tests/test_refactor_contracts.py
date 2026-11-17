@@ -49,6 +49,7 @@ def test_fastapi_route_inventory_and_wave0_removal():
         "/api/agent/goals/{goal_id}/park",
         "/api/agent/goals/{goal_id}/discard",
         "/api/agent/goals/{goal_id}/edit",
+        "/api/agent/goals/{goal_id}/reply",
         "/telegram/webhook",
         "/tasks/telegram-worker",
         "/tasks/goal-retry",
