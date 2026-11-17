@@ -12,6 +12,20 @@ const PRE_PROD_CODES = new Set([
   "site_sizing_boq",
 ]);
 
+const PAYMENT_STAGE_PILL_CLASS = {
+  advance_pending: "bg-stone-100 text-stone-700 border-stone-200",
+  advance_in: "bg-sky-50 text-sky-800 border-sky-200",
+  partial_paid: "bg-amber-50 text-amber-900 border-amber-200",
+  payment_complete: "bg-emerald-50 text-emerald-800 border-emerald-200",
+};
+
+const PAYMENT_STAGE_LABELS = {
+  advance_pending: "Advance Pending",
+  advance_in: "Advance In",
+  partial_paid: "Partial Paid",
+  payment_complete: "Complete ✓",
+};
+
 function orderNeedsMaterial(order) {
   const mats = order.item_materials || [];
   if (mats.length > 0) {
@@ -333,12 +347,16 @@ export default function AllOrdersBoard({
                       #{order.project_code}
                     </span>
                     <div className="flex items-center gap-1.5">
-                      {Number(order.quoted_total) > 0 && (
+                      {Number(order.quoted_total) > 0 ? (
                         <span className="text-[11px] font-bold text-stone-700 bg-stone-100 px-2 py-0.5 rounded-md">
                           {formatINR(order.paid_cache_inr)} /{" "}
                           {formatINR(order.quoted_total)}
                         </span>
-                      )}
+                      ) : Number(order.paid_cache_inr) > 0 ? (
+                        <span className="text-[11px] font-bold text-sky-900 bg-sky-50 border border-sky-200 px-2 py-0.5 rounded-md">
+                          {formatINR(order.paid_cache_inr)} received
+                        </span>
+                      ) : null}
                       <ChevronRight className="w-4 h-4 text-stone-400" />
                     </div>
                   </div>
@@ -370,12 +388,13 @@ export default function AllOrdersBoard({
                     </span>
                     <span
                       className={`font-semibold px-2 py-0.5 rounded-full border ${
-                        order.payment_stage === "payment_complete"
-                          ? "bg-emerald-50 text-emerald-800 border-emerald-200"
-                          : "bg-stone-100 text-stone-700 border-stone-200"
+                        PAYMENT_STAGE_PILL_CLASS[order.payment_stage] ||
+                        "bg-stone-100 text-stone-700 border-stone-200"
                       }`}
                     >
-                      Pay: {order.payment_stage.replace(/_/g, " ")}
+                      Pay:{" "}
+                      {PAYMENT_STAGE_LABELS[order.payment_stage] ||
+                        order.payment_stage.replace(/_/g, " ")}
                     </span>
                     {order.promised_delivery_date && (
                       <span className="text-stone-500 font-medium">

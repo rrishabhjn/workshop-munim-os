@@ -280,6 +280,9 @@ class GoalIntentItem(BaseModel):
     )
     zoho_contact_id: str | None = None
     is_new_payee: bool | None = None
+    order_link_confirmed: bool | None = None
+    skip_order_link: bool | None = None
+    is_explicit_advance: bool | None = None
     txn_date: str | None = None
     invoice_no: str | None = None
     bill_line_items_json: str | None = Field(

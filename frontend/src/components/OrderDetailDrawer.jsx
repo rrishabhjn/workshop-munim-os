@@ -51,6 +51,20 @@ const MATERIAL_STATUS_PILL_CLASS = {
   mixed: "bg-stone-100 text-stone-700 border-stone-300",
 };
 
+const PAYMENT_STAGE_PILL_CLASS = {
+  advance_pending: "bg-stone-100 text-stone-700 border-stone-200",
+  advance_in: "bg-sky-50 text-sky-800 border-sky-200",
+  partial_paid: "bg-amber-50 text-amber-900 border-amber-200",
+  payment_complete: "bg-emerald-50 text-emerald-800 border-emerald-200",
+};
+
+const DEFAULT_PAYMENT_STAGES = [
+  { code: "advance_pending", label: "Advance Pending" },
+  { code: "advance_in", label: "Advance In" },
+  { code: "partial_paid", label: "Partial Paid" },
+  { code: "payment_complete", label: "Complete ✓" },
+];
+
 function fmtQty(val) {
   const n = Number(val || 0);
   return Number.isInteger(n) ? String(n) : String(Number(n.toFixed(2)));
@@ -240,6 +254,8 @@ export default function OrderDetailDrawer({
     }
     setEditingOrder({
       quoted_total: order.quoted_total ?? 0,
+      paid_cache_inr: order.paid_cache_inr ?? 0,
+      payment_stage: order.payment_stage || "advance_pending",
       promised_delivery_date: order.promised_delivery_date || "",
       rough_scope: order.rough_scope || "",
       site_area_landmark: order.site_area_landmark || "",
@@ -257,6 +273,8 @@ export default function OrderDetailDrawer({
         method: "PATCH",
         body: JSON.stringify({
           quoted_total: Number(editingOrder.quoted_total || 0),
+          paid_cache_inr: Number(editingOrder.paid_cache_inr || 0),
+          payment_stage: editingOrder.payment_stage,
           promised_delivery_date: editingOrder.promised_delivery_date || "",
           rough_scope: editingOrder.rough_scope,
           site_area_landmark: editingOrder.site_area_landmark,
@@ -474,11 +492,25 @@ export default function OrderDetailDrawer({
                 <h2 className="font-extrabold text-lg text-stone-900 truncate">
                   {order.customer_name}
                 </h2>
-                {Number(order.quoted_total) > 0 && (
+                {Number(order.quoted_total) > 0 ? (
                   <span className="text-xs font-bold text-stone-700 bg-stone-100 px-2.5 py-0.5 rounded-lg">
                     {formatINR(order.paid_cache_inr)} / {formatINR(order.quoted_total)}
                   </span>
-                )}
+                ) : Number(order.paid_cache_inr) > 0 ? (
+                  <span className="text-xs font-bold text-sky-900 bg-sky-50 border border-sky-200 px-2.5 py-0.5 rounded-lg">
+                    {formatINR(order.paid_cache_inr)} received
+                  </span>
+                ) : null}
+                <span
+                  className={`text-[11px] font-semibold px-2 py-0.5 rounded-full border ${
+                    PAYMENT_STAGE_PILL_CLASS[order.payment_stage] ||
+                    "bg-stone-100 text-stone-700 border-stone-200"
+                  }`}
+                >
+                  Pay:{" "}
+                  {DEFAULT_PAYMENT_STAGES.find((s) => s.code === order.payment_stage)?.label ||
+                    (order.payment_stage || "advance_pending").replace(/_/g, " ")}
+                </span>
               </div>
               <p className="text-xs text-stone-600 line-clamp-2">
                 {order.rough_scope || order.site_area_landmark || "Customer Order"}
@@ -670,15 +702,73 @@ export default function OrderDetailDrawer({
               className="bg-amber-50/50 rounded-xl border border-amber-200 p-3 space-y-2"
             >
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
-                <input
-                  type="number"
-                  value={editingOrder.quoted_total}
-                  onChange={(e) =>
-                    setEditingOrder({ ...editingOrder, quoted_total: e.target.value })
-                  }
-                  placeholder="Deal Value ₹"
-                  className="min-h-[40px] px-2.5 rounded-lg border border-stone-300 text-xs bg-white"
-                />
+                <label className="space-y-0.5">
+                  <span className="text-[10px] font-bold uppercase text-stone-500">
+                    Deal Value ₹
+                  </span>
+                  <input
+                    type="number"
+                    value={editingOrder.quoted_total}
+                    onChange={(e) =>
+                      setEditingOrder({ ...editingOrder, quoted_total: e.target.value })
+                    }
+                    placeholder="Deal Value ₹"
+                    className="w-full min-h-[40px] px-2.5 rounded-lg border border-stone-300 text-xs bg-white"
+                  />
+                </label>
+                <label className="space-y-0.5">
+                  <span className="text-[10px] font-bold uppercase text-stone-500">
+                    Paid / Advance ₹
+                  </span>
+                  <input
+                    type="number"
+                    min="0"
+                    value={editingOrder.paid_cache_inr}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      const numPaid = Number(val || 0);
+                      const numQuoted = Number(editingOrder.quoted_total || 0);
+                      let nextStage = editingOrder.payment_stage;
+                      if (numPaid <= 0) {
+                        nextStage = "advance_pending";
+                      } else if (numQuoted > 0 && numPaid >= numQuoted) {
+                        nextStage = "payment_complete";
+                      } else if (nextStage === "advance_pending") {
+                        nextStage = "advance_in";
+                      }
+                      setEditingOrder({
+                        ...editingOrder,
+                        paid_cache_inr: val,
+                        payment_stage: nextStage,
+                      });
+                    }}
+                    placeholder="Paid / Advance ₹"
+                    className="w-full min-h-[40px] px-2.5 rounded-lg border border-stone-300 text-xs bg-white"
+                  />
+                </label>
+                <label className="space-y-0.5">
+                  <span className="text-[10px] font-bold uppercase text-stone-500">
+                    Payment Status
+                  </span>
+                  <select
+                    value={editingOrder.payment_stage}
+                    onChange={(e) =>
+                      setEditingOrder({ ...editingOrder, payment_stage: e.target.value })
+                    }
+                    className="w-full min-h-[40px] px-2.5 rounded-lg border border-stone-300 text-xs bg-white font-semibold"
+                  >
+                    {(lookups?.payment_stages?.length
+                      ? lookups.payment_stages
+                      : DEFAULT_PAYMENT_STAGES
+                    ).map((s) => (
+                      <option key={s.code} value={s.code}>
+                        {s.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                 <input
                   type="date"
                   value={editingOrder.promised_delivery_date}

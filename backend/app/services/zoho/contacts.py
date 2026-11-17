@@ -610,11 +610,11 @@ async def match_existing_payee(sb: Any, raw_name: str | None) -> dict[str, Any]:
     return {"status": "new", "canonical_name": raw}
 
 
-def match_existing_order_or_customer(sb: Any, hint: str | None) -> dict[str, Any]:
-    """Read-only deterministic matcher for active Supabase customer orders."""
+def find_matching_active_orders(sb: Any, hint: str | None) -> list[dict[str, Any]]:
+    """Find active Supabase customer orders matching project code, customer/alias, or city hint."""
     raw = (hint or "").strip().lstrip("#").strip()
     if sb is None or not raw:
-        return {"status": "none"}
+        return []
 
     projects = (
         sb.table("projects")
@@ -624,32 +624,80 @@ def match_existing_order_or_customer(sb: Any, hint: str | None) -> dict[str, Any
         .data
         or []
     )
+    if not projects:
+        return []
+
     low = raw.lower()
     code_hits = [p for p in projects if str(p.get("project_code") or "").strip().lower() == low]
-    if len(code_hits) == 1:
-        p = code_hits[0]
-        return {"status": "matched", "project_id": p["id"], "customer_id": p.get("customer_id"), "customer_name": p.get("customer_name")}
+    if code_hits:
+        return code_hits
 
-    exact_hits = [p for p in projects if str(p.get("customer_name") or "").strip().lower() == low]
-    if len(exact_hits) == 1:
-        p = exact_hits[0]
-        return {"status": "matched", "project_id": p["id"], "customer_id": p.get("customer_id"), "customer_name": p.get("customer_name")}
+    cust_rows = (
+        sb.table("customers")
+        .select("id,full_name,aliases,area_landmark")
+        .eq("is_active", True)
+        .execute()
+        .data
+        or []
+    )
+    cust_by_id = {str(c["id"]): c for c in cust_rows if c.get("id")}
+
+    def _name_variants(p: dict[str, Any]) -> list[str]:
+        names = [str(p.get("customer_name") or "").strip()]
+        c = cust_by_id.get(str(p.get("customer_id") or ""))
+        if c:
+            if c.get("full_name"):
+                names.append(str(c["full_name"]).strip())
+            names.extend(str(a).strip() for a in (c.get("aliases") or []) if str(a).strip())
+        return [n for n in names if n]
+
+    exact_hits = [p for p in projects if any(n.lower() == low for n in _name_variants(p))]
+    if exact_hits:
+        return exact_hits
 
     core = _core_name_tokens(raw)
-    tok_hits = exact_hits if len(exact_hits) >= 2 else []
-    if not tok_hits and core:
-        for p in projects:
-            c_toks = _core_name_tokens(p.get("customer_name"))
-            if c_toks == core or (len(c_toks) >= len(core) and c_toks[: len(core)] == core):
-                tok_hits.append(p)
+    if not core:
+        return []
+    raw_set = set(core)
+    tok_hits: list[dict[str, Any]] = []
+    area_narrowed: list[dict[str, Any]] = []
 
-    if len(tok_hits) == 1:
-        p = tok_hits[0]
-        return {"status": "matched", "project_id": p["id"], "customer_id": p.get("customer_id"), "customer_name": p.get("customer_name")}
+    for p in projects:
+        c = cust_by_id.get(str(p.get("customer_id") or ""))
+        area_str = str(p.get("site_area_landmark") or (c or {}).get("area_landmark") or "")
+        area_toks = set(_core_name_tokens(area_str))
+        query_toks = [t for t in core if t not in area_toks]
+        if not query_toks:
+            continue
+        q_set = set(query_toks)
+        variants = _name_variants(p)
+        if any(q_set.issubset(set(_core_name_tokens(v))) for v in variants):
+            tok_hits.append(p)
+            if area_toks and (raw_set & area_toks):
+                area_narrowed.append(p)
 
-    if len(tok_hits) >= 2:
+    return area_narrowed if area_narrowed else tok_hits
+
+
+def match_existing_order_or_customer(sb: Any, hint: str | None) -> dict[str, Any]:
+    """Read-only deterministic matcher for active Supabase customer orders."""
+    raw = (hint or "").strip().lstrip("#").strip()
+    if sb is None or not raw:
+        return {"status": "none"}
+
+    hits = find_matching_active_orders(sb, raw)
+    if len(hits) == 1:
+        p = hits[0]
+        return {
+            "status": "matched",
+            "project_id": p["id"],
+            "customer_id": p.get("customer_id"),
+            "customer_name": p.get("customer_name"),
+        }
+
+    if len(hits) >= 2:
         choices = []
-        for idx, p in enumerate(tok_hits[:4]):
+        for idx, p in enumerate(hits[:4]):
             area = f" ({p['site_area_landmark']})" if p.get("site_area_landmark") else ""
             lbl = f"#{p.get('project_code') or ''} {p.get('customer_name')}{area}".strip()[:42]
             patch_obj = {"project_id": p["id"], "is_ambiguous": False}

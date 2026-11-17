@@ -62,7 +62,7 @@ def _fetch_target_row_for_slots(sb: Any, op: str, slots: dict[str, Any]) -> dict
         table_and_id = ("vendors", slots.get("vendor_id"))
     elif op == "update_person":
         table_and_id = ("people", slots.get("person_id"))
-    elif op == "update_order_details":
+    elif op in ("update_order_details", "customer_receipt", "customer_payment", "customer_draft_invoice"):
         table_and_id = ("projects", slots.get("project_id"))
     elif op == "archive_record":
         kind = slots.get("archive_entity_kind")
@@ -428,8 +428,6 @@ def _sanitize_and_resolve_slot_ids(sb: Any, slots: dict[str, Any]) -> None:
         "item_upsert_or_move",
         "item_material_upsert",
         "update_order_details",
-        "customer_receipt",
-        "customer_payment",
         "customer_draft_invoice",
     ):
         hint = slots.get("party_name") or slots.get("full_name")

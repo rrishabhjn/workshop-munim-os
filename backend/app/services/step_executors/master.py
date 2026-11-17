@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.services import zoho
-from app.services.goal_primitives import format_inr, merge_unique_str_list
+from app.services.goal_primitives import PAYMENT_TRACK_STAGES, format_inr, merge_unique_str_list
 from app.services.step_executors.common import _format_customer_order_display_name, sanitize_iso_date
 from app.services.step_executors.production import transition_project_pipeline
 
@@ -396,6 +396,7 @@ def update_order_metadata(
     *,
     project_id: str,
     quoted_total: float | None = None,
+    paid_cache_inr: float | None = None,
     promised_delivery_date: str | None = None,
     rough_scope: str | None = None,
     site_area_landmark: str | None = None,
@@ -404,8 +405,9 @@ def update_order_metadata(
     boq_scope_note: str | None = None,
     specs_notes: str | None = None,
     uploaded_gcs_paths: list[str] | None = None,
+    payment_stage: str | None = None,
 ) -> dict[str, Any]:
-    """Update Order metadata (deal value ₹, delivery date, scope, area, phone, BOQ note) with Undo snapshot."""
+    """Update Order metadata (deal value ₹, paid ₹, payment status, delivery, scope, area, phone) with Undo snapshot."""
     rows = sb.table("projects").select("*").eq("id", project_id).limit(1).execute().data or []
     if not rows:
         return {"ok": False, "error_kind": "validation_400", "error": {"message": "Order not found."}}
@@ -413,6 +415,7 @@ def update_order_metadata(
 
     prior_snapshot = {
         "quoted_total": cur.get("quoted_total"),
+        "paid_cache_inr": cur.get("paid_cache_inr"),
         "promised_delivery_date": cur.get("promised_delivery_date"),
         "rough_scope": cur.get("rough_scope"),
         "site_area_landmark": cur.get("site_area_landmark"),
@@ -426,7 +429,7 @@ def update_order_metadata(
     changes_desc: list[str] = []
 
     if quoted_total is not None:
-        new_q = round(float(quoted_total), 2)
+        new_q = max(0.0, round(float(quoted_total), 2))
         if new_q != round(float(cur.get("quoted_total") or 0), 2):
             patch["quoted_total"] = new_q
             changes_desc.append(f"Deal Value → *{format_inr(new_q)}*")
@@ -435,6 +438,26 @@ def update_order_metadata(
                 patch["payment_stage"] = "payment_complete"
             elif paid > 0 and cur.get("payment_stage") == "payment_complete" and paid < new_q:
                 patch["payment_stage"] = "partial_paid"
+    if paid_cache_inr is not None:
+        new_paid = max(0.0, round(float(paid_cache_inr), 2))
+        if new_paid != round(float(cur.get("paid_cache_inr") or 0), 2):
+            patch["paid_cache_inr"] = new_paid
+            changes_desc.append(f"Paid → *{format_inr(new_paid)}*")
+            if payment_stage is None:
+                eff_q = float(patch.get("quoted_total", cur.get("quoted_total") or 0))
+                cur_ps = str(cur.get("payment_stage") or "advance_pending")
+                if new_paid <= 0:
+                    patch["payment_stage"] = "advance_pending"
+                elif eff_q > 0 and new_paid >= eff_q:
+                    patch["payment_stage"] = "payment_complete"
+                elif cur_ps == "advance_pending":
+                    patch["payment_stage"] = "advance_in"
+                elif cur_ps == "payment_complete" and eff_q > 0 and new_paid < eff_q:
+                    patch["payment_stage"] = "partial_paid"
+    if payment_stage is not None and payment_stage in PAYMENT_TRACK_STAGES:
+        if payment_stage != cur.get("payment_stage"):
+            patch["payment_stage"] = payment_stage
+            changes_desc.append(f"Payment → *{payment_stage.replace('_', ' ').title()}*")
     if promised_delivery_date is not None:
         raw_d = str(promised_delivery_date).strip()
         if raw_d == "":

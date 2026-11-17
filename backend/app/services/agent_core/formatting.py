@@ -139,7 +139,19 @@ def _format_confirmation_summary(
             cat_line = "\n• Type: *AR Settlement (Against Invoice)*"
         elif op == "vendor_payment":
             cat_line = "\n• Type: *AP Settlement (Against Bill)*"
-        return f"{badge}: *{amt}*\n• Party/To: *{party}*{match_tag}{cat_line}\n• Account: `{acc}`\n• Note: _{slots.get('notes') or slots.get('summary_title') or '-'}_"
+        order_line = ""
+        if is_inflow and slots.get("project_id"):
+            if row.get("project_code"):
+                adv_hint = (
+                    " _(→ Site Sizing / BOQ)_"
+                    if slots.get("is_explicit_advance")
+                    and row.get("pipeline_stage") in ("lead", "design", "estimating", "quoted_awaiting_advance")
+                    else ""
+                )
+                order_line = f"\n• Order: *#{row['project_code']} — {row.get('customer_name') or party}*{adv_hint}"
+            else:
+                order_line = f"\n• Order ID: `{slots['project_id']}`"
+        return f"{badge}: *{amt}*\n• Party/To: *{party}*{match_tag}{order_line}{cat_line}\n• Account: `{acc}`\n• Note: _{slots.get('notes') or slots.get('summary_title') or '-'}_"
     if op == "supplier_draft_bill":
         amt = format_inr(float(slots.get("amount_inr") or 0))
         match_tag = " _(🆕 New Vendor)_" if slots.get("is_new_payee") is True else (" _(✅ Matched)_" if slots.get("is_new_payee") is False or slots.get("zoho_contact_id") or slots.get("vendor_id") else "")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import json
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -12,7 +13,7 @@ import pytest
 
 from app.config import Settings
 from app.routers import telegram as tg_router
-from app.services import agent_core, attachment_memory, storage, zoho
+from app.services import agent_core, attachment_memory, step_executors, storage, zoho
 from conftest import seed_goal_intelligence_sb
 
 
@@ -573,5 +574,217 @@ async def test_same_name_customer_vendor_zoho_collision_auto_suffixes():
     assert ("Suresh Ji (Customer)", "customer") in posted_names
     assert ("Sunil", "vendor") in posted_names
     assert ("Sunil (Vendor)", "vendor") in posted_names
+
+
+@pytest.mark.asyncio
+async def test_payment_order_link_prompt_explicit_advance_pipeline_and_manual_paid_patch():
+    """Orders link via 1-tap buttons, explicit 'advance' moves pre-sizing orders, and manual Paid override is additive."""
+    sb = seed_goal_intelligence_sb()
+    sb.store["payment_accounts"].append(
+        {
+            "id": "acc-rgb",
+            "code": "rgb",
+            "display_name": "RGB (Gramin Bank)",
+            "account_kind": "bank",
+            "zoho_account_id": "za-rgb",
+            "aliases": ["rgb"],
+            "is_active": True,
+        }
+    )
+    sb.store["projects"][0]["pipeline_stage"] = "quoted_awaiting_advance"
+    sb.store["projects"][0]["payment_stage"] = "advance_pending"
+    sb.store["projects"][0]["paid_cache_inr"] = 0.0
+
+    # 1. Surname + "advance" even when LLM guessed project_id without PRJ-101 in text -> pauses for 1-tap link!
+    t_adv1 = SimpleNamespace(
+        id="int_ord_adv1",
+        steps=[
+            SimpleNamespace(
+                type="function_call",
+                id="fc_ord_adv1",
+                name="stage_financial_entry",
+                arguments={
+                    "entry_kind": "customer_receipt",
+                    "amount_inr": 50000,
+                    "party_name": "Ambure",
+                    "project_id": "prj-ambure",
+                    "payment_account_code": "rgb",
+                    "notes": "Received advance",
+                },
+            )
+        ],
+        output_text=None,
+    )
+    t_adv2 = SimpleNamespace(id="int_ord_adv2", steps=[], output_text="")
+
+    # 2. Payment WITHOUT "advance" -> still prompts link, updates paid_cache_inr, does NOT move pipeline_stage
+    t_pay1 = SimpleNamespace(
+        id="int_ord_pay1",
+        steps=[
+            SimpleNamespace(
+                type="function_call",
+                id="fc_ord_pay1",
+                name="stage_financial_entry",
+                arguments={
+                    "entry_kind": "customer_receipt",
+                    "amount_inr": 25000,
+                    "party_name": "Ambure",
+                    "payment_account_code": "cash_galla",
+                    "notes": "Part payment",
+                },
+            )
+        ],
+        output_text=None,
+    )
+    t_pay2 = SimpleNamespace(id="int_ord_pay2", steps=[], output_text="")
+
+    # 3. Walk-in override -> clears project_id & leaves order untouched
+    t_walk1 = SimpleNamespace(
+        id="int_ord_walk1",
+        steps=[
+            SimpleNamespace(
+                type="function_call",
+                id="fc_ord_walk1",
+                name="stage_financial_entry",
+                arguments={
+                    "entry_kind": "customer_receipt",
+                    "amount_inr": 10000,
+                    "party_name": "Ambure",
+                    "payment_account_code": "cash_galla",
+                    "notes": "Separate chair purchase",
+                },
+            )
+        ],
+        output_text=None,
+    )
+    t_walk2 = SimpleNamespace(id="int_ord_walk2", steps=[], output_text="")
+
+    fake_c = MagicMock()
+    fake_c.interactions.create.side_effect = [t_adv1, t_adv2, t_pay1, t_pay2, t_walk1, t_walk2]
+
+    with (
+        patch("app.services.agent_core.get_settings", return_value=Settings(gemini_api_key="test-key")),
+        patch("app.services.agent_core._get_interactions_client", return_value=fake_c),
+        patch("app.services.zoho.get_settings", return_value=Settings(_env_file=None)),
+    ):
+        out_adv = await agent_core.run_agent_turn(
+            sb,
+            owner_person_id="p-shreyansh",
+            actor_label="Shreyansh",
+            source_channel="telegram",
+            domain_scope="munim",
+            text="Received 50,000 advance from Ambure in RGB",
+        )
+        g_adv = out_adv["goals"][0]
+        assert g_adv["status"] == "gathering_info"
+        assert [c["label"] for c in g_adv["choices"]] == [
+            "🔗 Ambure Ji (Jaipur) (#PRJ-41)",
+            "🚶 Separate / Walk-in Sale",
+        ]
+
+        # Tap 🔗 Ambure Ji (Jaipur) (#PRJ-41) -> shows Order line + Sizing preview on Confirm card
+        link_patch = json.loads(g_adv["choices"][0]["slot_patch_json"])
+        resumed = await agent_core.apply_slot_patch_and_resume(
+            sb,
+            goal_id=g_adv["goal_id"],
+            slot_patch=link_patch,
+            actor_person_id="p-shreyansh",
+            actor_label="Shreyansh",
+            source_channel="telegram",
+        )
+        assert resumed["status"] == "awaiting_confirmation"
+        assert "#PRJ-41" in resumed["prompt"]
+        assert "Site Sizing / BOQ" in resumed["prompt"]
+
+        # Confirm explicit advance -> updates paid_cache_inr, payment_stage AND pipeline_stage
+        exec_adv = await agent_core.confirm_and_execute_goal(
+            sb,
+            goal_id=g_adv["goal_id"],
+            actor_person_id="p-shreyansh",
+            actor_label="Shreyansh",
+        )
+        assert exec_adv["status"] == "completed"
+        assert sb.store["projects"][0]["paid_cache_inr"] == 50000.0
+        assert sb.store["projects"][0]["payment_stage"] == "advance_in"
+        assert sb.store["projects"][0]["pipeline_stage"] == "site_sizing_boq"
+
+        # Reset order to quoted_awaiting_advance and test a linked payment WITHOUT "advance"
+        sb.store["projects"][0]["pipeline_stage"] = "quoted_awaiting_advance"
+        out_pay = await agent_core.run_agent_turn(
+            sb,
+            owner_person_id="p-shreyansh",
+            actor_label="Shreyansh",
+            source_channel="telegram",
+            domain_scope="munim",
+            text="25,000 received from Ambure cash",
+        )
+        g_pay = out_pay["goals"][0]
+        assert g_pay["status"] == "gathering_info"
+        await agent_core.apply_slot_patch_and_resume(
+            sb,
+            goal_id=g_pay["goal_id"],
+            slot_patch=json.loads(g_pay["choices"][0]["slot_patch_json"]),
+            actor_person_id="p-shreyansh",
+            actor_label="Shreyansh",
+        )
+        exec_pay = await agent_core.confirm_and_execute_goal(
+            sb,
+            goal_id=g_pay["goal_id"],
+            actor_person_id="p-shreyansh",
+            actor_label="Shreyansh",
+        )
+        assert exec_pay["status"] == "completed"
+        assert sb.store["projects"][0]["paid_cache_inr"] == 75000.0
+        assert sb.store["projects"][0]["payment_stage"] == "partial_paid"
+        assert sb.store["projects"][0]["pipeline_stage"] == "quoted_awaiting_advance"  # NOT moved without "advance"
+
+        # Walk-in tap -> leaves order untouched
+        out_walk = await agent_core.run_agent_turn(
+            sb,
+            owner_person_id="p-shreyansh",
+            actor_label="Shreyansh",
+            source_channel="telegram",
+            domain_scope="munim",
+            text="10,000 cash received from Ambure for separate chair",
+        )
+        g_walk = out_walk["goals"][0]
+        res_walk_card = await agent_core.apply_slot_patch_and_resume(
+            sb,
+            goal_id=g_walk["goal_id"],
+            slot_patch=json.loads(g_walk["choices"][1]["slot_patch_json"]),
+            actor_person_id="p-shreyansh",
+            actor_label="Shreyansh",
+        )
+        assert not res_walk_card["collected_slots"].get("project_id")
+        await agent_core.confirm_and_execute_goal(
+            sb,
+            goal_id=g_walk["goal_id"],
+            actor_person_id="p-shreyansh",
+            actor_label="Shreyansh",
+        )
+        assert sb.store["projects"][0]["paid_cache_inr"] == 75000.0
+
+        # Manual Edit Order sets offline base Paid ₹ and future Munim payment adds on top
+        upd_res = step_executors.update_order_metadata(
+            sb,
+            project_id="prj-ambure",
+            paid_cache_inr=100000.0,
+        )
+        assert upd_res["ok"] is True
+        assert sb.store["projects"][0]["paid_cache_inr"] == 100000.0
+        add_res = await step_executors.execute_munim_financial_step(
+            sb,
+            goal_id="g-add-50k",
+            step_index=0,
+            entry_kind="customer_receipt",
+            amount_inr=50000.0,
+            payment_account_id="acc-rgb",
+            party_name="Ambure Ji",
+            project_id="prj-ambure",
+            notes="Second installment",
+        )
+        assert add_res["ok"] is True
+        assert sb.store["projects"][0]["paid_cache_inr"] == 150000.0
+
 
 

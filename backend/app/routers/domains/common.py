@@ -91,6 +91,7 @@ class OrderPatchRequest(BaseModel):
     rough_scope: str | None = None
     phone: str | None = None
     quoted_total: float | None = None
+    paid_cache_inr: float | None = None
     promised_delivery_date: str | None = None
     boq_scope_changed: bool | None = None
     boq_scope_note: str | None = None

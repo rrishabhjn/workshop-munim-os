@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from app.services.draft_cart import (
@@ -534,6 +535,12 @@ def _build_candidates_from_tool(
         op = normalize_financial_entry_kind(
             raw_op, args.get("notes"), args.get("party_name"), user_text, heard_transcript
         )
+        adv_blob = " ".join(str(x or "") for x in (user_text, heard_transcript, args.get("notes")))
+        is_adv = (
+            bool(re.search(r"\b(?:advance|adv)\b", adv_blob, re.IGNORECASE))
+            if op in ("customer_receipt", "customer_payment")
+            else None
+        )
         line_items = args.get("bill_line_items") or []
         return [
             GoalIntentItem(
@@ -544,6 +551,7 @@ def _build_candidates_from_tool(
                 to_payment_account_code=args.get("to_payment_account_code"),
                 party_name=args.get("party_name"),
                 project_id=args.get("project_id"),
+                is_explicit_advance=is_adv,
                 expense_category=args.get("expense_category"),
                 invoice_no=args.get("invoice_no"),
                 bill_line_items_json=json.dumps(line_items, ensure_ascii=False) if line_items else None,
@@ -556,9 +564,11 @@ def _build_candidates_from_tool(
     if name == "resolve_open_goal":
         gid = str(args.get("goal_id") or "")
         op_kind = "new_lead"
+        prior_slots: dict[str, Any] = {}
         g_rows = sb.table("agent_goals").select("collected_slots").eq("id", gid).limit(1).execute().data or []
         if g_rows:
-            op_kind = str((g_rows[0].get("collected_slots") or {}).get("operation_kind") or "new_lead")
+            prior_slots = dict(g_rows[0].get("collected_slots") or {})
+            op_kind = str(prior_slots.get("operation_kind") or "new_lead")
         if args.get("entry_kind"):
             op_kind = normalize_financial_entry_kind(
                 str(args["entry_kind"]), args.get("notes"), args.get("party_name"), user_text, heard_transcript
@@ -569,6 +579,11 @@ def _build_candidates_from_tool(
             for k, v in args.items()
             if k not in _ACTION_META_KEYS and k not in special_keys and v is not None
         }
+        for carry_key in ("order_link_confirmed", "skip_order_link", "is_explicit_advance"):
+            if carry_key in prior_slots and carry_key not in patch_fields:
+                patch_fields[carry_key] = prior_slots[carry_key]
+        if patch_fields.get("project_id"):
+            patch_fields["order_link_confirmed"] = True
         if args.get("materials"):
             patch_fields["material_lines_json"] = json.dumps(args["materials"], ensure_ascii=False)
         if args.get("items"):
@@ -645,8 +660,9 @@ async def execute_action_tool(
     missing_report: list[dict[str, Any]] = []
     matched_parties: list[str] = []
 
+    effective_heard = (cart.heard_transcript if cart is not None else None) or heard_transcript
     for idx, cand in enumerate(candidates):
-        await enrich_candidate_entities(sb, cand)
+        await enrich_candidate_entities(sb, cand, user_text=user_text, heard_transcript=effective_heard)
         if cart is not None:
             did, saved_cand, missing, _, blocked_dup = cart.upsert(
                 sb,

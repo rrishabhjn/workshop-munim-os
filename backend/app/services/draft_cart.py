@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import re
 from typing import Any
 
 _FIN_FAMILY = frozenset(
@@ -207,7 +209,13 @@ class TurnDraftCart:
         return new_did, cand, missing, resolved_slots, False
 
 
-async def enrich_candidate_entities(sb: Any, cand: Any) -> None:
+async def enrich_candidate_entities(
+    sb: Any,
+    cand: Any,
+    *,
+    user_text: str | None = None,
+    heard_transcript: str | None = None,
+) -> None:
     """Deterministically match payees & customer orders inside action tools (Upgrade B)."""
     from app.services import zoho
     from app.services.agent_core.schemas import DisambiguationChoice
@@ -235,21 +243,110 @@ async def enrich_candidate_entities(sb: Any, cand: Any) -> None:
         elif m.get("status") == "new":
             cand.is_new_payee = True
 
+    if op in ("customer_receipt", "customer_payment"):
+        if cand.skip_order_link:
+            cand.project_id = None
+        elif not cand.order_link_confirmed:
+            matched_orders: list[dict[str, Any]] = []
+            if cand.project_id:
+                if _accept_id(sb, cand.project_id, "projects"):
+                    matched_orders = [
+                        r
+                        for r in (
+                            sb.table("projects")
+                            .select("id,project_code,customer_id,customer_name,site_area_landmark,status")
+                            .eq("id", cand.project_id)
+                            .limit(1)
+                            .execute()
+                            .data
+                            or []
+                        )
+                        if r.get("status", "active") == "active"
+                    ]
+                else:
+                    matched_orders = zoho.find_matching_active_orders(sb, str(cand.project_id))
+            if not matched_orders and cand.party_name:
+                matched_orders = zoho.find_matching_active_orders(sb, cand.party_name)
+
+            msg_blob = f"{user_text or ''} {heard_transcript or ''}"
+            code_explicit = (
+                len(matched_orders) == 1
+                and bool(matched_orders[0].get("project_code"))
+                and bool(
+                    re.search(
+                        rf"(?<![A-Za-z0-9]){re.escape(str(matched_orders[0]['project_code']))}(?![A-Za-z0-9])",
+                        msg_blob,
+                        re.IGNORECASE,
+                    )
+                )
+            )
+            if code_explicit:
+                p = matched_orders[0]
+                cand.project_id = p["id"]
+                cand.order_link_confirmed = True
+                if p.get("customer_id"):
+                    cand.customer_id = p["customer_id"]
+                if p.get("customer_name"):
+                    cand.party_name = p["customer_name"]
+                cand.is_new_payee = False
+            elif matched_orders:
+                cand.project_id = None
+                cand.is_ambiguous = True
+                cand.is_new_payee = False
+                choices: list[DisambiguationChoice] = []
+                for idx, p in enumerate(matched_orders[:3]):
+                    cname = str(p.get("customer_name") or "").strip()[:26]
+                    lbl = f"🔗 {cname} (#{p.get('project_code') or ''})"[:48]
+                    patch_obj: dict[str, Any] = {
+                        "project_id": p["id"],
+                        "order_link_confirmed": True,
+                        "is_ambiguous": False,
+                        "is_new_payee": False,
+                    }
+                    if p.get("customer_id"):
+                        patch_obj["customer_id"] = p["customer_id"]
+                    if p.get("customer_name"):
+                        patch_obj["party_name"] = p["customer_name"]
+                    choices.append(
+                        DisambiguationChoice(
+                            choice_id=f"order_{idx}",
+                            label=lbl,
+                            slot_patch_json=json.dumps(patch_obj, ensure_ascii=False),
+                        )
+                    )
+                choices.append(
+                    DisambiguationChoice(
+                        choice_id="order_walkin",
+                        label="🚶 Separate / Walk-in Sale",
+                        slot_patch_json=json.dumps(
+                            {"project_id": None, "skip_order_link": True, "is_ambiguous": False},
+                            ensure_ascii=False,
+                        ),
+                    )
+                )
+                cand.choices = choices
+                if len(matched_orders) == 1:
+                    p0 = matched_orders[0]
+                    cand.clarification_question = (
+                        f"🔗 *{p0.get('customer_name')}* is in your Orders list "
+                        f"(`#{p0.get('project_code')}`). Link this payment to that order?"
+                    )
+                else:
+                    cand.clarification_question = (
+                        f"🔗 Multiple active orders match *{cand.party_name}* — kaunse order se link karein?"
+                    )
+
     if op in (
         "pipeline_stage_move",
         "material_stage_move",
         "item_upsert_or_move",
         "item_material_upsert",
         "update_order_details",
-        "customer_receipt",
-        "customer_payment",
         "customer_draft_invoice",
     ):
         has_valid_pid = bool(cand.project_id and _accept_id(sb, cand.project_id, "projects"))
         hint = (cand.project_id if (cand.project_id and not has_valid_pid) else None) or (
-            cand.party_name
-            if op in ("customer_receipt", "customer_payment", "customer_draft_invoice") and not has_valid_pid
-            else None
+            cand.party_name if op == "customer_draft_invoice" and not has_valid_pid else None
         )
         if hint:
             om = zoho.match_existing_order_or_customer(sb, hint)
@@ -257,30 +354,31 @@ async def enrich_candidate_entities(sb: Any, cand: Any) -> None:
                 cand.project_id = om["project_id"]
                 if om.get("customer_id"):
                     cand.customer_id = om["customer_id"]
-                if op in ("customer_receipt", "customer_payment", "customer_draft_invoice") and om.get("customer_name"):
+                if op == "customer_draft_invoice" and om.get("customer_name"):
                     cand.party_name = om["customer_name"]
                     cand.is_new_payee = False
             elif om.get("status") == "ambiguous":
                 cand.is_ambiguous = True
                 cand.choices = [DisambiguationChoice(**c) for c in (om.get("choices") or [])]
                 cand.clarification_question = om.get("question")
-        if (
-            op in ("customer_receipt", "customer_payment", "customer_draft_invoice")
-            and not cand.project_id
-            and not cand.is_ambiguous
-            and cand.party_name
-        ):
-            cm = await zoho.match_existing_customer(sb, cand.party_name)
-            if cm.get("status") == "matched":
-                cand.party_name = cm["canonical_name"]
-                cand.is_new_payee = False
-                if cm.get("customer_id"):
-                    cand.customer_id = cm["customer_id"]
-                if cm.get("zoho_contact_id"):
-                    cand.zoho_contact_id = cm["zoho_contact_id"]
-            elif cm.get("status") == "ambiguous":
-                cand.is_ambiguous = True
-                cand.choices = [DisambiguationChoice(**c) for c in (cm.get("choices") or [])]
-                cand.clarification_question = cm.get("question")
-            elif cm.get("status") == "new" and cand.is_new_payee is None:
-                cand.is_new_payee = True
+
+    if (
+        op in ("customer_receipt", "customer_payment", "customer_draft_invoice")
+        and not cand.project_id
+        and not cand.is_ambiguous
+        and cand.party_name
+    ):
+        cm = await zoho.match_existing_customer(sb, cand.party_name)
+        if cm.get("status") == "matched":
+            cand.party_name = cm["canonical_name"]
+            cand.is_new_payee = False
+            if cm.get("customer_id"):
+                cand.customer_id = cm["customer_id"]
+            if cm.get("zoho_contact_id"):
+                cand.zoho_contact_id = cm["zoho_contact_id"]
+        elif cm.get("status") == "ambiguous":
+            cand.is_ambiguous = True
+            cand.choices = [DisambiguationChoice(**c) for c in (cm.get("choices") or [])]
+            cand.clarification_question = cm.get("question")
+        elif cm.get("status") == "new" and cand.is_new_payee is None:
+            cand.is_new_payee = True

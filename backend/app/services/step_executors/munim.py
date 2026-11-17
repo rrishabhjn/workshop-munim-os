@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 from typing import Any
 
@@ -31,6 +32,7 @@ async def execute_munim_financial_step(
     notes: str = "",
     actor_label: str = "Munim",
     expense_category: str | None = None,
+    is_explicit_advance: bool = False,
 ) -> dict[str, Any]:
     """Idempotent Munim -> Zoho Books Standard push + Smart Auto-Bridge Payment Track sync."""
     ref_no = make_zoho_reference_number(goal_id, step_index)
@@ -60,7 +62,7 @@ async def execute_munim_financial_step(
     if entry_kind in ("customer_receipt", "customer_payment") and project_id:
         p_rows = (
             sb.table("projects")
-            .select("id,quoted_total,paid_cache_inr,payment_stage")
+            .select("id,quoted_total,paid_cache_inr,payment_stage,pipeline_stage")
             .eq("id", project_id)
             .limit(1)
             .execute()
@@ -78,11 +80,24 @@ async def execute_munim_financial_step(
             else:
                 new_pstage = "partial_paid" if new_paid > 0 else p.get("payment_stage")
 
+            prj_patch: dict[str, Any] = {}
             if new_pstage in PAYMENT_TRACK_STAGES:
-                sb.table("projects").update(
-                    {"paid_cache_inr": new_paid, "payment_stage": new_pstage}
-                ).eq("id", project_id).execute()
+                prj_patch["paid_cache_inr"] = new_paid
+                prj_patch["payment_stage"] = new_pstage
                 pay_stage_note = f" · Order Payment → *{new_pstage.replace('_', ' ').title()}*"
+
+            if is_explicit_advance and p.get("pipeline_stage") in (
+                "lead",
+                "design",
+                "estimating",
+                "quoted_awaiting_advance",
+            ):
+                prj_patch["pipeline_stage"] = "site_sizing_boq"
+                prj_patch["pipeline_stage_at"] = datetime.now(timezone.utc).isoformat()
+                pay_stage_note += " · Pipeline → *Site Sizing / BOQ*"
+
+            if prj_patch:
+                sb.table("projects").update(prj_patch).eq("id", project_id).execute()
 
     acc_row = sb.table("payment_accounts").select("display_name").eq("id", payment_account_id).limit(1).execute().data
     acc_label = acc_row[0]["display_name"] if acc_row else "Account"

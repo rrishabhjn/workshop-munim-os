@@ -6,6 +6,7 @@ import asyncio
 from datetime import datetime, timezone
 import json
 import logging
+import re
 import sys
 from typing import Any
 
@@ -91,6 +92,11 @@ async def confirm_and_execute_goal(
         else:
             step_slots = slots
 
+        digest_blob = " ".join(
+            str(d.get("user") or "")
+            for d in (claimed.get("turn_digest") or [])
+            if isinstance(d, dict)
+        )
         res = await pkg._run_single_step(
             sb,
             goal_id=goal_id,
@@ -101,6 +107,8 @@ async def confirm_and_execute_goal(
             actor_label=actor_label,
             source_channel=source_channel,
             heard_transcript=heard,
+            goal_domain_scope=claimed.get("domain_scope"),
+            turn_digest_text=" ".join(filter(None, [digest_blob, str(claimed.get("summary_title") or "")])),
         )
 
         if res.get("ok"):
@@ -275,6 +283,8 @@ async def _run_single_step(
     actor_label: str,
     source_channel: str,
     heard_transcript: str | None,
+    goal_domain_scope: str | None = None,
+    turn_digest_text: str | None = None,
 ) -> dict[str, Any]:
     src = "telegram" if source_channel == "telegram" else "web"
     if op == "pipeline_stage_move":
@@ -480,6 +490,22 @@ async def _run_single_step(
             note=slots.get("notes"),
         )
     if op in ("customer_receipt", "customer_payment", "vendor_payment", "expense", "float_transfer"):
+        is_explicit_advance = False
+        if op in ("customer_receipt", "customer_payment"):
+            adv_text = " ".join(
+                str(x or "")
+                for x in (
+                    slots.get("notes"),
+                    slots.get("summary_title"),
+                    heard_transcript,
+                    turn_digest_text,
+                )
+            )
+            has_adv_word = bool(re.search(r"\b(?:advance|adv)\b", adv_text, re.IGNORECASE))
+            in_munim = goal_domain_scope in (None, "munim", "shared")
+            is_explicit_advance = bool(
+                in_munim and (slots.get("is_explicit_advance") is True or has_adv_word)
+            )
         return await step_executors.execute_munim_financial_step(
             sb,
             goal_id=goal_id,
@@ -495,6 +521,7 @@ async def _run_single_step(
             notes=str(slots.get("notes") or ""),
             actor_label=actor_label,
             expense_category=slots.get("expense_category"),
+            is_explicit_advance=is_explicit_advance,
         )
     if op in ("supplier_draft_bill", "customer_draft_invoice"):
         return await step_executors.execute_munim_draft_doc_step(
@@ -595,6 +622,8 @@ async def apply_slot_patch_and_resume(
     prior_slots = dict(g.get("collected_slots") or {})
     explicit_op = str(slot_patch["operation_kind"]).strip() if slot_patch.get("operation_kind") else None
     merged_slots = _sanitize_gemini_nulls({**prior_slots, **slot_patch})
+    if "project_id" in slot_patch and slot_patch["project_id"] is None:
+        merged_slots.pop("project_id", None)
     _backfill_financial_slots_from_text(
         sb,
         merged_slots,
@@ -632,6 +661,8 @@ async def apply_slot_patch_and_resume(
                 "pending_prompt": next_prompt,
                 "repair_options": next_choices,
                 "steps": steps,
+                "project_id": merged_slots.get("project_id"),
+                "customer_id": merged_slots.get("customer_id"),
                 "status": "gathering_info",
             }
         ).eq("id", goal_id).execute()
@@ -660,6 +691,8 @@ async def apply_slot_patch_and_resume(
                 "pending_prompt": confirm_card_text,
                 "repair_options": [],
                 "steps": steps,
+                "project_id": merged_slots.get("project_id"),
+                "customer_id": merged_slots.get("customer_id"),
                 "status": "awaiting_confirmation",
             }
         ).eq("id", goal_id).execute()
@@ -678,6 +711,8 @@ async def apply_slot_patch_and_resume(
             "collected_slots": merged_slots,
             "missing_slots": [],
             "steps": steps,
+            "project_id": merged_slots.get("project_id"),
+            "customer_id": merged_slots.get("customer_id"),
             "status": "awaiting_confirmation",
         }
     ).eq("id", goal_id).execute()

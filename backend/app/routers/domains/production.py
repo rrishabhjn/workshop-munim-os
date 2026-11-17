@@ -173,20 +173,20 @@ async def patch_production_order(
         sb,
         project_id=project_id,
         quoted_total=body.quoted_total,
+        paid_cache_inr=body.paid_cache_inr,
         promised_delivery_date=body.promised_delivery_date,
         rough_scope=body.rough_scope,
         site_area_landmark=body.site_area_landmark,
         phone=body.phone,
         boq_scope_changed=body.boq_scope_changed,
         boq_scope_note=body.boq_scope_note,
+        payment_stage=body.payment_stage,
     )
     if not res.get("ok"):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
     extra_patch: dict[str, Any] = {}
     if body.customer_name is not None and body.customer_name.strip():
         extra_patch["customer_name"] = body.customer_name.strip()
-    if body.payment_stage is not None:
-        extra_patch["payment_stage"] = body.payment_stage
     if extra_patch:
         upd = sb.table("projects").update(extra_patch).eq("id", project_id).execute().data
         if upd:
