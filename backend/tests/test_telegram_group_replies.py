@@ -173,9 +173,9 @@ async def test_context_aware_decisions_triage_and_social_chatter_guard():
 
     assert sb.store["telegram_inbox_buffer"][0]["status"] == "ignored"
     mock_agent_run.assert_not_awaited()
-    assert fake_dec_client.decisions.create.call_count == 1
+    assert fake_dec_client.decisions.create.call_count == 0
 
-    # Case B: Delayed 'Jaipur' (message_id=40, >2 gap and >45m old) hits Decisions API WITH PendingOpenGoals context
+    # Case B: Delayed 'Jaipur' (message_id=40, >2 gap and >45m old) routes straight to AgentCore (zero Decisions drop risk!)
     sb.store["telegram_inbox_buffer"] = [
         {
             "id": "buf-jaipur-40",
@@ -199,14 +199,10 @@ async def test_context_aware_decisions_triage_and_social_chatter_guard():
         }
     ]
     fake_dec_client.decisions.create.reset_mock()
-    fake_dec_client.decisions.create.return_value = SimpleNamespace(
-        answers={"is_workshop_relevant": SimpleNamespace(noul=0.92)}
-    )
     mock_agent_run = AsyncMock(return_value={"kind": "direct_reply", "reply_text": "Noted.", "goals": []})
     with (
         patch("app.routers.telegram.get_supabase_admin", return_value=sb),
         patch("app.routers.telegram.get_settings", return_value=Settings(telegram_burst_debounce_seconds=0.0)),
-        patch("app.services.decisions_triage.get_settings", return_value=Settings(gemini_api_key="test-key")),
         patch("app.services.decisions_triage._get_decisions_client", return_value=fake_dec_client),
         patch("app.routers.telegram.agent_core.run_agent_turn", mock_agent_run),
         patch("app.routers.telegram.telegram_api.send_message", AsyncMock(return_value={"result": {"message_id": 41}})),
@@ -215,10 +211,7 @@ async def test_context_aware_decisions_triage_and_social_chatter_guard():
 
     assert sb.store["telegram_inbox_buffer"][0]["status"] == "processed"
     mock_agent_run.assert_awaited_once()
-    dec_input = fake_dec_client.decisions.create.call_args.kwargs["input"]
-    assert "PendingOpenGoals:" in dec_input
-    assert "missing=[area_landmark]" in dec_input
-    assert "Site Area / Landmark" in dec_input
+    assert fake_dec_client.decisions.create.call_count == 0
 
 
 @pytest.mark.asyncio

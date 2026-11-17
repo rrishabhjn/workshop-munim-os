@@ -527,7 +527,20 @@ async def test_expense_categorization_salary_routing_and_zoho_coa_selection():
     agent_core._backfill_financial_slots_from_text(
         sb, vendor_slots, user_text="Paid 12,000 to Doorset from Axis", heard_transcript=None
     )
-    assert vendor_slots["operation_kind"] == "vendor_payment"
+    # Cash-first informal rule: routine payouts become immediate Expenses; explicit settlement stays vendor_payment
+    assert vendor_slots["operation_kind"] == "expense"
+
+    settle_slots = {
+        "operation_kind": "vendor_payment",
+        "party_name": "Doorset",
+        "amount_inr": 12000,
+        "payment_account_code": "axis",
+        "summary_title": "Settled Doorset pending bill",
+    }
+    agent_core._backfill_financial_slots_from_text(
+        sb, settle_slots, user_text="Settled pending bill 12,000 to Doorset from Axis", heard_transcript=None
+    )
+    assert settle_slots["operation_kind"] == "vendor_payment"
 
     # 3. Confirmation card includes human Category line
     confirm_txt = agent_core._format_confirmation_summary("expense", karigar_slots)
@@ -725,6 +738,8 @@ async def test_zoho_ledger_reader_endpoint_and_ai_tool():
                     ]
                 },
             )
+        if path == "/salesreceipts":
+            return httpx.Response(200, json={"sales_receipts": []})
         if path == "/customerpayments":
             return httpx.Response(
                 200,
@@ -789,6 +804,8 @@ async def test_zoho_ledger_reader_endpoint_and_ai_tool():
             )
         if path == "/bills":
             return httpx.Response(200, json={"bills": []})
+        if path == "/invoices":
+            return httpx.Response(200, json={"invoices": []})
         raise AssertionError(f"Unexpected path: {path}")
 
     app.dependency_overrides[get_current_user] = lambda: CurrentUser(

@@ -29,8 +29,7 @@ from app.services.goal_primitives import (
     format_voice_receipt_header,
     merge_buffered_telegram_burst,
     rank_open_goals_for_turn,
-    should_bypass_group_triage_for_open_goal,
-    should_run_decisions_front_door,
+    should_ignore_pure_chatter,
 )
 
 router = APIRouter(tags=["telegram"])
@@ -452,39 +451,19 @@ async def process_debounced_burst(
             max_goals=4,
         )
 
-        # Surgical Decisions API group-chatter filter (text-only unaddressed group messages)
+        # Rec #1: Deterministic pure-chatter check on allowlisted operator channels (never silently drop replies!)
         if (
             is_group
             and not is_reply_to_bot
             and not has_media
             and not has_voice
-            and should_run_decisions_front_door(
-                is_group_chat=True,
-                is_bot_mentioned_or_reply=("@" in combined_text or combined_text.startswith("/")),
-                has_photo_or_pdf=False,
-                domain_channel=domain_channel,
-            )
+            and not ("@" in combined_text or combined_text.startswith("/"))
+            and should_ignore_pure_chatter(combined_text, relevant_open_goals)
         ):
-            bypass_for_goal = should_bypass_group_triage_for_open_goal(
-                text=combined_text,
-                incoming_message_id=merged["latest_message_id"],
-                reply_to_message_id=merged["reply_to_message_id"],
-                actor_person_id=actor_person_id,
-                chat_id=chat_id,
-                open_goals=relevant_open_goals,
-            )
-            if not bypass_for_goal:
-                is_rel = await asyncio.to_thread(
-                    decisions_triage.is_group_message_relevant,
-                    combined_text,
-                    domain_channel,
-                    relevant_open_goals,
-                )
-                if not is_rel:
-                    sb.table("telegram_inbox_buffer").update(
-                        {"status": "ignored", "processed_at": datetime.now(timezone.utc).isoformat()}
-                    ).in_("id", row_ids).execute()
-                    return
+            sb.table("telegram_inbox_buffer").update(
+                {"status": "ignored", "processed_at": datetime.now(timezone.utc).isoformat()}
+            ).in_("id", row_ids).execute()
+            return
 
         voice_clips: list[tuple[bytes, str]] = []
         for vfid in merged["voice_file_ids"]:
@@ -519,6 +498,22 @@ async def process_debounced_burst(
 
         heard_hdr = format_voice_receipt_header(turn_res.get("heard_transcript"))
         reply_to = merged["latest_message_id"]
+
+        # Rec #3: Strip inline buttons from superseded / resolved Telegram cards before posting updated cards
+        superseded_mids: list[int] = [int(x) for x in (turn_res.get("retired_bot_msg_ids") or []) if x]
+        for g_out in turn_res.get("goals") or []:
+            if g_out.get("superseded_bot_msg_id"):
+                superseded_mids.append(int(g_out["superseded_bot_msg_id"]))
+        for old_mid in dict.fromkeys(superseded_mids):
+            try:
+                await telegram_api.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=old_mid,
+                    text="⤵️ _Updated below_",
+                    reply_markup={"inline_keyboard": []},
+                )
+            except Exception as exc:
+                logger.warning("Could not retire superseded Telegram card msg=%s: %s", old_mid, exc)
 
         if not turn_res.get("goals"):
             await telegram_api.send_message(

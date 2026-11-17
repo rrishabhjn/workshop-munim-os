@@ -181,11 +181,13 @@ async def list_recent_ledger_transactions(
         "all": "",
         "receipt": "customer_receipt",
         "receipts": "customer_receipt",
+        "sales": "customer_receipt",
         "expenses": "expense",
         "payments": "vendor_payment",
         "transfer": "float_transfer",
         "transfers": "float_transfer",
         "bills": "bill",
+        "invoices": "invoice",
     }
     et_clean = et_map.get(entry_type.strip().lower(), entry_type.strip().lower())
 
@@ -248,12 +250,15 @@ async def list_recent_ledger_transactions(
             async with httpx.AsyncClient(timeout=12.0) as client:
                 reqs = [
                     pkg._zoho_request(client, "GET", "/expenses", params={"per_page": 100}),
+                    pkg._zoho_request(client, "GET", "/salesreceipts", params={"per_page": 100}),
                     pkg._zoho_request(client, "GET", "/customerpayments", params={"per_page": 100}),
                     pkg._zoho_request(client, "GET", "/vendorpayments", params={"per_page": 100}),
                     pkg._zoho_request(client, "GET", "/banktransactions", params={"per_page": 100}),
                 ]
                 if et_clean in ("", "bill"):
                     reqs.append(pkg._zoho_request(client, "GET", "/bills", params={"per_page": 60}))
+                if et_clean in ("", "invoice", "bill"):
+                    reqs.append(pkg._zoho_request(client, "GET", "/invoices", params={"per_page": 60}))
                 resps = await asyncio.gather(*reqs, return_exceptions=True)
 
             def _items(idx: int, key: str) -> list[dict[str, Any]]:
@@ -289,7 +294,31 @@ async def list_recent_ledger_transactions(
                     }
                 )
 
-            for x in _items(1, "customerpayments"):
+            for x in _items(1, "sales_receipts"):
+                srid = str(x.get("sales_receipt_id") or "")
+                if srid:
+                    seen_ids.add(srid)
+                cname = str(x.get("customer_name") or "").strip()
+                raw_rows.append(
+                    {
+                        "id": srid,
+                        "date": str(x.get("date") or ""),
+                        "created_time": str(x.get("created_time") or ""),
+                        "entry_type": "customer_receipt",
+                        "direction": "in",
+                        "amount_inr": round(float(x.get("total") or x.get("bcy_total") or 0), 2),
+                        "account_name": str(x.get("deposit_to_account_name") or ""),
+                        "_account_id": str(x.get("deposit_to_account_id") or ""),
+                        "category_or_offset": "Sales",
+                        "party_name": cname,
+                        "customer_name": cname,
+                        "description": str(x.get("notes") or x.get("salesreceipt_number") or ""),
+                        "reference_number": str(x.get("reference_number") or x.get("salesreceipt_number") or ""),
+                        "status": str(x.get("status") or "paid"),
+                    }
+                )
+
+            for x in _items(2, "customerpayments"):
                 pid = str(x.get("payment_id") or "")
                 if pid:
                     seen_ids.add(pid)
@@ -304,7 +333,7 @@ async def list_recent_ledger_transactions(
                         "amount_inr": round(float(x.get("amount") or x.get("bcy_amount") or 0), 2),
                         "account_name": str(x.get("account_name") or x.get("deposit_to_account_name") or ""),
                         "_account_id": str(x.get("account_id") or x.get("deposit_to_account_id") or ""),
-                        "category_or_offset": "Customer Receipt",
+                        "category_or_offset": "Customer Payment",
                         "party_name": cname,
                         "customer_name": cname,
                         "description": str(x.get("description") or ""),
@@ -313,7 +342,7 @@ async def list_recent_ledger_transactions(
                     }
                 )
 
-            for x in _items(2, "vendorpayments"):
+            for x in _items(3, "vendorpayments"):
                 vpid = str(x.get("payment_id") or "")
                 if vpid:
                     seen_ids.add(vpid)
@@ -336,7 +365,7 @@ async def list_recent_ledger_transactions(
                     }
                 )
 
-            for x in _items(3, "banktransactions"):
+            for x in _items(4, "banktransactions"):
                 tid = str(x.get("transaction_id") or "")
                 if not tid or tid in seen_ids:
                     continue
@@ -377,26 +406,51 @@ async def list_recent_ledger_transactions(
                     }
                 )
 
-            for x in _items(4, "bills"):
-                bid = str(x.get("bill_id") or "")
-                raw_rows.append(
-                    {
-                        "id": bid,
-                        "date": str(x.get("date") or ""),
-                        "created_time": str(x.get("created_time") or ""),
-                        "entry_type": "bill",
-                        "direction": "bill",
-                        "amount_inr": round(float(x.get("total") or x.get("bcy_total") or 0), 2),
-                        "account_name": "",
-                        "_account_id": "",
-                        "category_or_offset": f"Supplier Bill ({x.get('status') or 'draft'})",
-                        "party_name": str(x.get("vendor_name") or "").strip(),
-                        "customer_name": "",
-                        "description": f"Bill #{x.get('bill_number') or ''} {x.get('notes') or ''}".strip(),
-                        "reference_number": str(x.get("reference_number") or x.get("bill_number") or ""),
-                        "status": str(x.get("status") or "draft"),
-                    }
-                )
+            bill_idx = 5 if et_clean in ("", "bill") else -1
+            inv_idx = (6 if et_clean in ("", "bill") else 5) if et_clean in ("", "invoice", "bill") else -1
+            if bill_idx >= 0:
+                for x in _items(bill_idx, "bills"):
+                    bid = str(x.get("bill_id") or "")
+                    raw_rows.append(
+                        {
+                            "id": bid,
+                            "date": str(x.get("date") or ""),
+                            "created_time": str(x.get("created_time") or ""),
+                            "entry_type": "bill",
+                            "direction": "bill",
+                            "amount_inr": round(float(x.get("total") or x.get("bcy_total") or 0), 2),
+                            "account_name": "",
+                            "_account_id": "",
+                            "category_or_offset": f"Supplier Bill ({x.get('status') or 'draft'})",
+                            "party_name": str(x.get("vendor_name") or "").strip(),
+                            "customer_name": "",
+                            "description": f"Bill #{x.get('bill_number') or ''} {x.get('notes') or ''}".strip(),
+                            "reference_number": str(x.get("reference_number") or x.get("bill_number") or ""),
+                            "status": str(x.get("status") or "draft"),
+                        }
+                    )
+            if inv_idx >= 0:
+                for x in _items(inv_idx, "invoices"):
+                    iid = str(x.get("invoice_id") or "")
+                    cname = str(x.get("customer_name") or "").strip()
+                    raw_rows.append(
+                        {
+                            "id": iid,
+                            "date": str(x.get("date") or ""),
+                            "created_time": str(x.get("created_time") or ""),
+                            "entry_type": "invoice",
+                            "direction": "invoice",
+                            "amount_inr": round(float(x.get("total") or x.get("bcy_total") or 0), 2),
+                            "account_name": "",
+                            "_account_id": "",
+                            "category_or_offset": f"Customer Invoice ({x.get('status') or 'draft'})",
+                            "party_name": cname,
+                            "customer_name": cname,
+                            "description": f"Inv #{x.get('invoice_number') or ''} {x.get('notes') or ''}".strip(),
+                            "reference_number": str(x.get("reference_number") or x.get("invoice_number") or ""),
+                            "status": str(x.get("status") or "draft"),
+                        }
+                    )
         except httpx.HTTPError as exc:
             logger.warning("list_recent_ledger_transactions Zoho fetch failed: %s", exc)
             return []
@@ -416,13 +470,25 @@ async def list_recent_ledger_transactions(
             slots = g.get("collected_slots") or {}
             steps = g.get("steps") or []
             op = str(slots.get("operation_kind") or (steps[0].get("operation") if steps else "") or "expense")
-            if op not in ("customer_receipt", "vendor_payment", "expense", "float_transfer", "supplier_draft_bill"):
+            if op not in (
+                "customer_receipt",
+                "customer_payment",
+                "vendor_payment",
+                "expense",
+                "float_transfer",
+                "supplier_draft_bill",
+                "customer_draft_invoice",
+            ):
                 continue
-            mapped_type = "bill" if op == "supplier_draft_bill" else op
+            mapped_type = (
+                "bill"
+                if op == "supplier_draft_bill"
+                else ("invoice" if op == "customer_draft_invoice" else op)
+            )
             direction = (
                 "in"
-                if op == "customer_receipt"
-                else ("transfer" if op == "float_transfer" else ("bill" if op == "supplier_draft_bill" else "out"))
+                if op in ("customer_receipt", "customer_payment")
+                else ("transfer" if op == "float_transfer" else (mapped_type if mapped_type in ("bill", "invoice") else "out"))
             )
             acc_label = (
                 local_acc_names.get(str(slots.get("payment_account_id") or ""))
@@ -438,14 +504,14 @@ async def list_recent_ledger_transactions(
                     "entry_type": mapped_type,
                     "direction": direction,
                     "amount_inr": round(float(slots.get("amount_inr") or 0), 2),
-                    "account_name": "" if mapped_type == "bill" else acc_label,
+                    "account_name": "" if mapped_type in ("bill", "invoice") else acc_label,
                     "_account_id": "",
                     "category_or_offset": str(slots.get("expense_category") or mapped_type.replace("_", " ").title()),
                     "party_name": party,
-                    "customer_name": party if mapped_type == "customer_receipt" else "",
+                    "customer_name": party if mapped_type in ("customer_receipt", "customer_payment", "invoice") else "",
                     "description": str(slots.get("notes") or g.get("summary_title") or ""),
                     "reference_number": str((steps[0].get("result") or {}).get("reference_number") if steps else ""),
-                    "status": "draft" if mapped_type == "bill" else "completed",
+                    "status": "draft" if mapped_type in ("bill", "invoice") else "completed",
                 }
             )
 
@@ -454,7 +520,7 @@ async def list_recent_ledger_transactions(
         if et_clean and r["entry_type"] != et_clean:
             continue
         if account_needles or account_zoho_ids:
-            if r["entry_type"] == "bill" and et_clean != "bill":
+            if r["entry_type"] in ("bill", "invoice") and et_clean not in ("bill", "invoice"):
                 continue
             acc_hay = r["account_name"].lower()
             if r["entry_type"] == "float_transfer":

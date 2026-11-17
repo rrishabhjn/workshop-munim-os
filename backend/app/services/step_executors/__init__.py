@@ -33,7 +33,10 @@ from app.services.step_executors.materials import (
     sync_order_material_track_from_items,
     update_item_materials_rows,
 )
-from app.services.step_executors.munim import execute_munim_financial_step
+from app.services.step_executors.munim import (
+    execute_munim_draft_doc_step,
+    execute_munim_financial_step,
+)
 from app.services.step_executors.production import (
     create_customer_and_lead,
     enrich_whos_doing_what_rows,
@@ -51,6 +54,7 @@ __all__ = [
     "create_standalone_customer",
     "delete_item_material_row",
     "enrich_whos_doing_what_rows",
+    "execute_munim_draft_doc_step",
     "execute_munim_financial_step",
     "get_default_person_id",
     "infer_material_category",

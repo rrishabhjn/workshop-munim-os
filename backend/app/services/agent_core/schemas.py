@@ -156,10 +156,12 @@ class GoalIntentItem(BaseModel):
         "item_upsert_or_move",
         "item_material_upsert",
         "customer_receipt",
+        "customer_payment",
         "vendor_payment",
         "expense",
         "float_transfer",
         "supplier_draft_bill",
+        "customer_draft_invoice",
         "add_person_or_vendor",
     ]
     summary_title: str = Field(description="Crisp 1-line summary in Hinglish/English.")

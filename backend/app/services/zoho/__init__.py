@@ -1,7 +1,7 @@
 """Zoho Books India integration package (Standard Plan, GST-Off Management Ledger)."""
 
 from app.config import get_settings
-from app.services.zoho.bills import check_duplicate_bill, create_draft_bill
+from app.services.zoho.bills import check_duplicate_bill, create_draft_bill, create_draft_invoice
 from app.services.zoho.bridge import (
     _extract_zoho_doc_project_keys,
     _find_existing_by_reference,
@@ -60,6 +60,7 @@ __all__ = [
     "_zoho_request",
     "check_duplicate_bill",
     "create_draft_bill",
+    "create_draft_invoice",
     "create_zoho_contact",
     "ensure_project_zoho_bridge",
     "get_settings",

@@ -141,7 +141,9 @@ def triage_media_upload(
     settings = get_settings()
     if not settings.gemini_api_key:
         fallback_kind: MediaKind = (
-            "supplier_bill" if mime_type == "application/pdf" else "design_or_site_photo"
+            ("supplier_bill" if domain_scope == "munim" else "sizing_sheet")
+            if mime_type == "application/pdf"
+            else "design_or_site_photo"
         )
         return MediaTriageResult(
             media_kind=fallback_kind,
@@ -213,7 +215,9 @@ def triage_media_upload(
     except Exception as exc:
         logger.warning("Decisions API media triage fallback: %s", exc)
         fallback: MediaKind = (
-            "supplier_bill" if mime_type == "application/pdf" else "design_or_site_photo"
+            ("supplier_bill" if domain_scope == "munim" else "sizing_sheet")
+            if mime_type == "application/pdf"
+            else "design_or_site_photo"
         )
         return MediaTriageResult(
             media_kind=fallback,

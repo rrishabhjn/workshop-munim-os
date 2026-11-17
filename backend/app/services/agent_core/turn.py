@@ -11,7 +11,14 @@ import re
 import sys
 from typing import Any, Literal
 
-from app.services import action_tools, agent_tools, decisions_triage, goal_intelligence, storage
+from app.services import (
+    action_tools,
+    agent_tools,
+    attachment_memory,
+    decisions_triage,
+    goal_intelligence,
+    storage,
+)
 from app.services.agent_core.formatting import (
     _build_steps_for_slots,
     _default_missing_question,
@@ -72,6 +79,25 @@ async def run_agent_turn(
     """Execute one complete omnichannel AgentCore turn and return structured UI/Telegram response."""
     pkg = _pkg()
     settings = pkg.get_settings()
+
+    # 0. Restore recent unclaimed attachment (captionless hold or "above pdf" 15m memory)
+    uploaded_gcs_paths: list[str] = []
+    retired_bot_msg_ids: list[int] = []
+    from_cached_attachments = False
+    if not media_files and (text or audio_bytes or extra_audio_files):
+        restored_files, restored_paths, retired_ids = attachment_memory.resolve_recent_unclaimed_attachments(
+            sb,
+            text=text,
+            owner_person_id=owner_person_id,
+            telegram_chat_id=telegram_chat_id,
+            domain_scope=domain_scope,
+        )
+        if restored_files:
+            media_files = restored_files
+            uploaded_gcs_paths = restored_paths
+            retired_bot_msg_ids = retired_ids
+            from_cached_attachments = True
+
     grounding_json, acc_code_to_id = _build_compact_grounding(
         sb,
         owner_person_id=owner_person_id,
@@ -93,10 +119,11 @@ async def run_agent_turn(
             open_goals_count=open_goals_count,
         )
     )
-    uploaded_gcs_paths: list[str] = []
     media_triage_notes: list[str] = []
+    triage_kinds: list[str] = []
+    uploaded_mimes: list[str] = [m for _, m in (media_files or [])]
 
-    if media_files:
+    if media_files and not from_cached_attachments:
         now_ts = int(datetime.now(timezone.utc).timestamp())
         for idx, (m_bytes, m_mime) in enumerate(media_files):
             triage = await asyncio.to_thread(
@@ -118,20 +145,39 @@ async def run_agent_turn(
             elif triage.recommended_thinking == "medium" and thinking_level == "low":
                 thinking_level = "medium"
 
+            triage_kinds.append(triage.media_kind)
             ext = "pdf" if m_mime == "application/pdf" else "webp"
             folder = "supplier_bills" if triage.media_kind == "supplier_bill" else "projects/inbox"
             obj_path = f"{folder}/{now_ts}_{idx}.{ext}"
+            storage._remember_local_blob(obj_path, m_bytes)
+            uploaded_gcs_paths.append(obj_path)
             try:
                 if ext == "webp":
                     storage.upload_image_as_webp(obj_path, m_bytes)
                 else:
                     storage.upload_bytes(obj_path, m_bytes, content_type=m_mime)
-                uploaded_gcs_paths.append(obj_path)
             except Exception as exc:
                 logger.warning("GCS upload skipped in local/dev mode: %s", exc)
 
             media_triage_notes.append(
                 f"Attachment #{idx + 1}: classified={triage.media_kind}, ocr_difficulty={triage.ocr_difficulty:.2f}"
+            )
+
+        if attachment_memory.should_hold_captionless_upload(
+            text=text,
+            has_audio=bool(audio_bytes or extra_audio_files),
+            media_kinds=triage_kinds,
+            domain_scope=domain_scope,
+        ):
+            return attachment_memory.save_captionless_attachment_hold(
+                sb,
+                owner_person_id=owner_person_id,
+                source_channel=source_channel,
+                domain_scope=domain_scope,
+                telegram_chat_id=telegram_chat_id,
+                ui_context=ui_context,
+                uploaded_gcs_paths=uploaded_gcs_paths,
+                uploaded_mimes=uploaded_mimes,
             )
 
     # 2. Build Interactions API Multimodal Input
@@ -565,6 +611,7 @@ async def run_agent_turn(
         "reply_text": envelope.direct_reply_text,
         "goals": processed_goals,
         "parked_goal_nudge": parked_nudge,
+        "retired_bot_msg_ids": retired_bot_msg_ids,
     }
 
 
@@ -592,6 +639,7 @@ async def _process_goal_intent_item(
     prior_missing_slots: list[str] = []
     existing_goal_id: str | None = None
     existing_owner_person_id: str | None = None
+    prior_bot_msg_id: int | None = None
 
     effective_open_id = item.target_open_goal_id or pinned_goal_id
     if effective_open_id and _accept_id(sb, effective_open_id, "agent_goals"):
@@ -610,24 +658,27 @@ async def _process_goal_intent_item(
             prior_slots = dict(g_rows[0].get("collected_slots") or {})
             prior_summary = str(g_rows[0].get("summary_title") or "")
             prior_missing_slots = list(g_rows[0].get("missing_slots") or [])
+            prior_bot_msg_id = g_rows[0].get("telegram_bot_msg_id")
 
     if not existing_goal_id and reply_to_bot_msg_id is not None:
         pinned_rows = (
             sb.table("agent_goals")
             .select("*")
-            .in_("status", ["gathering_info", "needs_error_fix"])
+            .in_("status", ["gathering_info", "awaiting_confirmation", "needs_error_fix"])
             .eq("telegram_bot_msg_id", int(reply_to_bot_msg_id))
             .execute()
             .data
             or []
         )
-        expected_gtype = _map_op_to_db_goal_type(item.operation_kind)
-        matched_pinned = [
+        chat_pinned = [
             r
             for r in pinned_rows
-            if (telegram_chat_id is None or r.get("telegram_chat_id") in (None, telegram_chat_id))
-            and r.get("goal_type") == expected_gtype
+            if telegram_chat_id is None or r.get("telegram_chat_id") in (None, telegram_chat_id)
         ]
+        expected_gtype = _map_op_to_db_goal_type(item.operation_kind)
+        matched_pinned = [r for r in chat_pinned if r.get("goal_type") == expected_gtype]
+        if not matched_pinned and len(chat_pinned) == 1:
+            matched_pinned = chat_pinned
         if len(matched_pinned) == 1:
             g_pin = matched_pinned[0]
             existing_goal_id = g_pin["id"]
@@ -635,6 +686,7 @@ async def _process_goal_intent_item(
             prior_slots = dict(g_pin.get("collected_slots") or {})
             prior_summary = str(g_pin.get("summary_title") or "")
             prior_missing_slots = list(g_pin.get("missing_slots") or [])
+            prior_bot_msg_id = g_pin.get("telegram_bot_msg_id")
 
     # Merge non-null slots from current turn over prior_slots
     new_slots = {
@@ -757,6 +809,7 @@ async def _process_goal_intent_item(
             "missing_slots": missing,
             "project_id": slots.get("project_id"),
             "collected_slots": slots,
+            **({"superseded_bot_msg_id": prior_bot_msg_id} if prior_bot_msg_id else {}),
         }
 
     # Fetch existing row for Master Spine / Order updates so sensitivity & Before->After diff are exact
@@ -793,15 +846,18 @@ async def _process_goal_intent_item(
             customer_id=slots.get("customer_id"),
             user_message=user_text or heard_transcript,
         )
-        return await pkg.confirm_and_execute_goal(
+        res_b = await pkg.confirm_and_execute_goal(
             sb,
             goal_id=str(goal_row["id"]),
             actor_person_id=owner_person_id,
             actor_label=actor_label,
             source_channel=source_channel,
         )
+        if prior_bot_msg_id:
+            res_b["superseded_bot_msg_id"] = prior_bot_msg_id
+        return res_b
 
-    # Case C: Money, Zoho Draft Bills, New Entities, Soft-Archives & High-Sensitivity Edits -> MANDATORY CONFIRM!
+    # Case C: Money, Zoho Draft Bills/Invoices, New Entities, Soft-Archives & High-Sensitivity Edits -> MANDATORY CONFIRM!
     confirm_card_text = _format_confirmation_summary(op, slots, target_before_row)
     steps = _build_steps_for_slots(op, slots)
     goal_row = _upsert_goal_row(
@@ -809,7 +865,7 @@ async def _process_goal_intent_item(
         goal_id=existing_goal_id,
         owner_person_id=goal_owner_id,
         source_channel=source_channel,
-        domain_scope="munim" if op in ("customer_receipt", "vendor_payment", "expense", "float_transfer", "supplier_draft_bill") else domain_scope,
+        domain_scope="munim" if op in ("customer_receipt", "customer_payment", "vendor_payment", "expense", "float_transfer", "supplier_draft_bill", "customer_draft_invoice") else domain_scope,
         telegram_chat_id=telegram_chat_id,
         ui_context=ui_context,
         goal_type=_map_op_to_db_goal_type(op),
@@ -834,4 +890,5 @@ async def _process_goal_intent_item(
         "choices": [],
         "project_id": slots.get("project_id"),
         "collected_slots": slots,
+        **({"superseded_bot_msg_id": prior_bot_msg_id} if prior_bot_msg_id else {}),
     }

@@ -12,6 +12,7 @@ from app.services.agent_core.schemas import _NULL_STRINGS
 from app.services.goal_primitives import (
     MATERIAL_TRACK_STAGES,
     compute_missing_customer_onboarding_slots,
+    normalize_financial_entry_kind,
     normalize_or_infer_expense_category,
 )
 
@@ -21,17 +22,8 @@ _MAT_UNIT_RE = (
 
 _NON_AREA_PARENS: frozenset[str] = frozenset(
     {
-        "lead",
-        "new lead",
-        "execution",
-        "design",
-        "estimating",
-        "completed",
-        "material to order",
-        "check stock",
-        "ordered",
-        "in shop",
-        "packed",
+        "lead", "new lead", "execution", "design", "estimating",
+        "completed", "material to order", "check stock", "ordered", "in shop", "packed",
     }
 )
 
@@ -50,10 +42,12 @@ def _map_op_to_db_goal_type(op: str) -> str:
         "item_upsert_or_move": "stage_update",
         "item_material_upsert": "stage_update",
         "customer_receipt": "financial_txn",
+        "customer_payment": "financial_txn",
         "vendor_payment": "financial_txn",
         "expense": "financial_txn",
         "float_transfer": "float_transfer",
         "supplier_draft_bill": "supplier_bill",
+        "customer_draft_invoice": "financial_txn",
         "add_person_or_vendor": "entity_onboarding",
     }
     return mapping.get(op, "stage_update")
@@ -214,19 +208,27 @@ def _backfill_financial_slots_from_text(
 ) -> None:
     """Ensure amount_inr, payment_account_code, expense_category, and party_name are populated cleanly."""
     op = str(slots.get("operation_kind") or "")
-    if op not in ("customer_receipt", "vendor_payment", "expense", "float_transfer"):
+    if op not in (
+        "customer_receipt",
+        "customer_payment",
+        "vendor_payment",
+        "expense",
+        "float_transfer",
+        "supplier_draft_bill",
+        "customer_draft_invoice",
+    ):
         return
     if slots.get("amount_inr") in (None, "", 0, 0.0):
         amt = _extract_inr_amount_from_text(user_text, heard_transcript, slots.get("summary_title"))
         if amt is not None:
             slots["amount_inr"] = amt
-    if not slots.get("payment_account_code"):
+    if not slots.get("payment_account_code") and op not in ("supplier_draft_bill", "customer_draft_invoice"):
         acc_code = _extract_payment_account_code_from_text(
             sb, user_text, heard_transcript, slots.get("summary_title")
         )
         if acc_code:
             slots["payment_account_code"] = acc_code
-    if not slots.get("party_name") and slots.get("project_id") and op == "customer_receipt":
+    if not slots.get("party_name") and slots.get("project_id") and op in ("customer_receipt", "customer_payment", "customer_draft_invoice"):
         p_rows = (
             sb.table("projects")
             .select("customer_name")
@@ -245,6 +247,19 @@ def _backfill_financial_slots_from_text(
                 if r and r[0].get(ncol):
                     slots["party_name"] = r[0][ncol]
                     break
+    if not slots.get("party_name") and op in ("customer_receipt", "customer_payment", "customer_draft_invoice"):
+        for raw_txt in (user_text, heard_transcript, slots.get("summary_title")):
+            m_buy = re.search(
+                r"\b(?:sales?\s+to|sold\s+to|from|via)\s+([a-z][a-z\s]{1,32}?)(?=\s+(?:for|in|via|on|ka|ki|ke|se|rs|₹|\d|owes)|$)",
+                str(raw_txt or ""),
+                re.IGNORECASE,
+            )
+            if m_buy:
+                slots["party_name"] = " ".join(m_buy.group(1).split()).title()
+                break
+
+    op = normalize_financial_entry_kind(op, user_text, heard_transcript, slots.get("notes"), slots.get("summary_title"))
+    slots["operation_kind"] = op
 
     matched_person_kind = _match_person_kind_for_party(sb, slots.get("party_name"))
     combined_cues = " ".join(
@@ -414,6 +429,8 @@ def _sanitize_and_resolve_slot_ids(sb: Any, slots: dict[str, Any]) -> None:
         "item_material_upsert",
         "update_order_details",
         "customer_receipt",
+        "customer_payment",
+        "customer_draft_invoice",
     ):
         hint = slots.get("party_name") or slots.get("full_name")
         resolved_pid = _resolve_project_id_by_hint(sb, hint)
@@ -781,16 +798,16 @@ def _compute_missing_slots_for_op(op: str, slots: dict[str, Any]) -> list[str]:
             missing.append("project_id")
         elif not slots.get("material_lines_json") and not slots.get("material_status"):
             missing.append("material_lines_json")
-    elif op in ("customer_receipt", "vendor_payment", "expense", "float_transfer"):
+    elif op in ("customer_receipt", "customer_payment", "vendor_payment", "expense", "float_transfer"):
         if not slots.get("amount_inr") or float(slots.get("amount_inr") or 0) <= 0:
             missing.append("amount_inr")
         if not slots.get("payment_account_id"):
             missing.append("payment_account_code")
         if op == "float_transfer" and not slots.get("to_payment_account_id"):
             missing.append("to_payment_account_code")
-        if op in ("customer_receipt", "vendor_payment") and not slots.get("party_name") and not slots.get("project_id"):
+        if op in ("customer_receipt", "customer_payment", "vendor_payment") and not slots.get("party_name") and not slots.get("project_id"):
             missing.append("party_name")
-    elif op == "supplier_draft_bill":
+    elif op in ("supplier_draft_bill", "customer_draft_invoice"):
         if not slots.get("party_name"):
             missing.append("party_name")
         if slots.get("amount_inr") is None:
@@ -818,62 +835,31 @@ def _build_default_missing_slot_choices(
 ) -> list[dict[str, Any]]:
     """Build 1-tap quick-pick choices for single-slot prompts with predictable workshop defaults."""
     if missing_slot == "area_landmark":
-        cities = ("Beawar", "Jaipur", "Ajmer", "Chittorgarh")
         return [
-            {
-                "choice_id": f"area_{city.lower()}",
-                "label": f"📍 {city}",
-                "slot_patch_json": json.dumps({"area_landmark": city}),
-            }
-            for city in cities
+            {"choice_id": f"area_{city.lower()}", "label": f"📍 {city}", "slot_patch_json": json.dumps({"area_landmark": city})}
+            for city in ("Beawar", "Jaipur", "Ajmer", "Chittorgarh")
         ]
 
     if missing_slot in ("payment_account_code", "to_payment_account_code"):
-        acc_rows = (
-            sb.table("payment_accounts")
-            .select("code,display_name,account_kind,sort_order")
-            .eq("is_active", True)
-            .order("sort_order")
-            .execute()
-            .data
-            or []
-        )
-        preferred_order = ("cash_galla", "axis", "rgb", "float_ansh")
-        pref_rank = {c: idx for idx, c in enumerate(preferred_order)}
+        acc_rows = sb.table("payment_accounts").select("code,display_name,account_kind,sort_order").eq("is_active", True).order("sort_order").execute().data or []
+        pref_rank = {c: idx for idx, c in enumerate(("cash_galla", "axis", "rgb", "float_ansh"))}
         ordered = sorted(
             [a for a in acc_rows if a.get("code")],
-            key=lambda a: (
-                pref_rank.get(str(a["code"]).strip().lower(), len(preferred_order)),
-                int(a.get("sort_order") or 999),
-                str(a["code"]),
-            ),
+            key=lambda a: (pref_rank.get(str(a["code"]).strip().lower(), 4), int(a.get("sort_order") or 999), str(a["code"])),
         )
         return [
             {
                 "choice_id": f"acc_{a['code']}",
-                "label": _format_quick_account_label(
-                    str(a["code"]),
-                    str(a.get("display_name") or a["code"]),
-                    str(a.get("account_kind") or ""),
-                ),
+                "label": _format_quick_account_label(str(a["code"]), str(a.get("display_name") or a["code"]), str(a.get("account_kind") or "")),
                 "slot_patch_json": json.dumps({missing_slot: str(a["code"])}),
             }
             for a in ordered[:4]
         ]
 
     if missing_slot == "to_stage" and op == "material_stage_move":
-        mat_stages = (
-            ("check_stock", "📦 Check Stock"),
-            ("ordered_pending", "🚚 Ordered"),
-            ("all_in_shop", "✅ All In Shop"),
-        )
         return [
-            {
-                "choice_id": f"mat_{stage_code}",
-                "label": label,
-                "slot_patch_json": json.dumps({"to_stage": stage_code}),
-            }
-            for stage_code, label in mat_stages
+            {"choice_id": f"mat_{sc}", "label": lbl, "slot_patch_json": json.dumps({"to_stage": sc})}
+            for sc, lbl in (("check_stock", "📦 Check Stock"), ("ordered_pending", "🚚 Ordered"), ("all_in_shop", "✅ All In Shop"))
         ]
 
     return []

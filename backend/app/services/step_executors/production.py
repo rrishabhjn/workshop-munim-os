@@ -12,6 +12,7 @@ from app.services.goal_primitives import (
     MATERIAL_TRACK_STAGES,
     PROJECT_PIPELINE_STAGES,
     build_stage_undo_snapshot,
+    merge_unique_str_list,
 )
 from app.services.step_executors.common import (
     _compute_duration_hours,
@@ -244,6 +245,7 @@ async def upsert_or_transition_item(
     actor_person_id: str | None = None,
     source_channel: str = "web",
     heard_transcript: str | None = None,
+    uploaded_gcs_paths: list[str] | None = None,
 ) -> dict[str, Any]:
     to_stage = normalize_stage_code_for_op("item_upsert_or_move", to_stage) or "in_shop"
     if to_stage not in ITEM_EXECUTION_STAGES:
@@ -253,10 +255,17 @@ async def upsert_or_transition_item(
             "error": {"message": f"Invalid item stage '{to_stage}'."},
         }
 
-    prj_rows = sb.table("projects").select("id,project_code,customer_name,payment_stage").eq("id", project_id).limit(1).execute().data or []
+    prj_rows = sb.table("projects").select("id,project_code,customer_name,payment_stage,metadata").eq("id", project_id).limit(1).execute().data or []
     if not prj_rows:
         return {"ok": False, "error_kind": "validation_400", "error": {"message": "Parent order not found."}}
     prj = prj_rows[0]
+
+    if uploaded_gcs_paths:
+        cur_meta = dict(prj.get("metadata") or {})
+        merged_paths = merge_unique_str_list(cur_meta.get("uploaded_gcs_paths"), uploaded_gcs_paths)
+        if merged_paths != list(cur_meta.get("uploaded_gcs_paths") or []):
+            cur_meta["uploaded_gcs_paths"] = merged_paths
+            sb.table("projects").update({"metadata": cur_meta}).eq("id", project_id).execute()
 
     def _person_name(pid: str | None) -> str:
         if not pid:

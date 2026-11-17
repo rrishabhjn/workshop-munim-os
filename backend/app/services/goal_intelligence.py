@@ -349,11 +349,11 @@ def _verify_single_step(
             return "Neither vendor_id nor person_id was returned by onboarding step."
         return None
 
-    if op in ("customer_receipt", "vendor_payment", "expense", "float_transfer"):
+    if op in ("customer_receipt", "customer_payment", "vendor_payment", "expense", "float_transfer"):
         ref_no = str(res.get("reference_number") or "")
         if not ref_no.startswith("MUNIM-"):
             return f"Financial entry missing deterministic MUNIM-* reference_number (got '{ref_no}')."
-        if op == "customer_receipt" and merged.get("project_id") and float(merged.get("amount_inr") or 0) > 0:
+        if op in ("customer_receipt", "customer_payment") and merged.get("project_id") and float(merged.get("amount_inr") or 0) > 0:
             prj = _fetch_one(sb, "projects", merged.get("project_id"))
             if not prj:
                 return f"Linked project '{merged.get('project_id')}' missing during receipt verification."
@@ -361,7 +361,7 @@ def _verify_single_step(
                 return "Customer receipt did not advance Order Payment Track past 'advance_pending'."
         return None
 
-    if op == "supplier_draft_bill":
+    if op in ("supplier_draft_bill", "customer_draft_invoice"):
         draft_status = str(res.get("draft_status") or "draft").strip().lower()
         if draft_status != "draft":
             return f"Safety invariant violation: supplier bill status must remain 'draft', got '{draft_status}'."

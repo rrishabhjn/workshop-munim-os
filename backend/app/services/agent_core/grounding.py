@@ -71,19 +71,23 @@ def _build_compact_grounding(
         or []
     )
 
-    raw_open_rows = (
-        sb.table("agent_goals")
-        .select(
-            "id,owner_person_id,telegram_chat_id,telegram_bot_msg_id,domain_scope,"
-            "goal_type,status,summary_title,missing_slots,pending_prompt,collected_slots,updated_at,created_at"
+    raw_open_rows = [
+        r
+        for r in (
+            sb.table("agent_goals")
+            .select(
+                "id,owner_person_id,telegram_chat_id,telegram_bot_msg_id,domain_scope,"
+                "goal_type,status,summary_title,missing_slots,pending_prompt,collected_slots,updated_at,created_at"
+            )
+            .in_("status", ["gathering_info", "awaiting_confirmation", "needs_error_fix"])
+            .order("updated_at", desc=True)
+            .limit(30)
+            .execute()
+            .data
+            or []
         )
-        .in_("status", ["gathering_info", "awaiting_confirmation", "needs_error_fix"])
-        .order("updated_at", desc=True)
-        .limit(30)
-        .execute()
-        .data
-        or []
-    )
+        if not (r.get("collected_slots") or {}).get("is_attachment_hold")
+    ]
     open_rows = rank_open_goals_for_turn(
         raw_open_rows,
         owner_person_id=owner_person_id,
@@ -224,11 +228,12 @@ def _build_system_instruction(grounding_json: str) -> str:
         "(never create a second duplicate draft!). Only set `confirm_separate_duplicate_entry=true` if the user explicitly requested two identical-amount payments. "
         "When an action tool succeeds (`staged: true`), simply finish with a blank reply (or `HEARD: <transcript>` if audio) — Python renders the Confirm/Receipt card. "
         "Answer Q&A questions or WhatsApp drafts directly in clean plain-text Hinglish/English (never output raw JSON!).\n"
-        "2. COMPOUND REPLIES & OPEN GOALS: Check `open_goals_tray` in CONTEXT. A single user message "
-        "may answer an open goal (`resolve_open_goal(goal_id=...)`) AND also stage a brand-new update via an action tool. Never drop either half! "
-        "If an item in `open_goals_tray` has `replied_directly=true`, or its `missing_slots` / `pending_prompt` "
-        "matches the user's short reply (e.g. 'Jaipur', an amount, an account, or a mistri name), call `resolve_open_goal` with `goal_id` "
-        "and populate the exact field(s) named in `missing_slots` — NEVER answer an open clarification with plain text alone!\n"
+        "2. COMPOUND REPLIES, CORRECTIONS & OPEN GOALS: Check `open_goals_tray` in CONTEXT. A single user message "
+        "may answer a pending prompt OR edit an `awaiting_confirmation` / `needs_error_fix` card (`resolve_open_goal(goal_id=...)`) "
+        "AND/OR stage a brand-new update via an action tool. Never drop either half! "
+        "If an item in `open_goals_tray` has `replied_directly=true`, or the user gives a short reply or correction "
+        "(e.g. 'Jaipur', 'Axis se nahi RGB se', 'amount 5500 hai', an account, or a mistri name), ALWAYS call `resolve_open_goal` with `goal_id` "
+        "and populate the updated/missing slot(s) — NEVER answer an open clarification or card correction with plain text alone!\n"
         "3. NEW CUSTOMER ONBOARDING (X, Y, Z): If a customer is brand-new, require ALL 3 of: "
         "`full_name`, `area_landmark` (locality/city like Civil Lines, Ajmer Road, Jaipur), and `rough_scope` "
         "(items/rooms). A standalone city name (e.g. 'Jaipur', 'Beawar', 'Ajmer', 'Chittorgarh') is 100% sufficient for "
@@ -239,15 +244,18 @@ def _build_system_instruction(grounding_json: str) -> str:
         "`'ordered_pending'`, `'all_in_shop'`) when requested. "
         "If homonyms exist, set `is_ambiguous=true`, populate `choices` "
         "(1: Existing Active Order, 2: Repeat Customer New Lead, 3: Brand-New Customer), and ask in `clarification_question`.\n"
-        "4. MUNIM FINANCIAL RULES (Zoho 100% Management Ledger, GST-Off): Every receipt, expense, "
-        "vendor payment, or float transfer MUST populate the JSON fields `amount_inr` (number) AND `payment_account_code` "
-        "(from `payment_accounts`, e.g., `cash_galla`, `axis`, `float_ansh`), plus `party_name`. "
-        "For staff/karigar salary or salary advance payouts use `operation_kind='expense'` with `expense_category='salary_wages'` (never `vendor_payment`); "
-        "for all `expense` entries populate `expense_category` (`salary_wages` | `contractor_labor` | `raw_materials` | `transport_freight` | `food_tea_mess` | `rent` | `utilities_office` | `repairs_maintenance` | `other_expense`). "
-        "CRITICAL: Never put the amount or account ONLY inside `summary_title` or `direct_reply_text` — always fill "
-        "`amount_inr` and `payment_account_code` in `goal_items`. If account or party is truly missing, ask for ALL "
-        "missing fields in ONE consolidated `clarification_question`. "
-        "Never put a Supabase UUID into `zoho_contact_id`.\n"
+        "4. MUNIM CASH-FIRST INFORMAL BOOKKEEPING (Zoho 100% Management Ledger, GST-Off): "
+        "Do NOT hunt for pending bills or tie every cash transaction to a Production project.\n"
+        "   - ALL Money OUT (`paid`, `diya`, `spent`, supplier payment, mistri/painter/contractor payout, OR staff salary/salary-advance) -> "
+        "call `stage_financial_entry` with `entry_kind='expense'` right away, populate `expense_category` (`salary_wages` for staff/salary advance, "
+        "`contractor_labor` for mistri/painter/contractor, `raw_materials` for ply/laminate/hardware, `transport_freight`, `food_tea_mess`, `rent`, "
+        "`utilities_office`, `repairs_maintenance`, `other_expense`), and preserve the user's info verbatim in `notes` (e.g. 'Salary advance').\n"
+        "   - ALL Money IN (`received`, `mila`, customer advance OR walk-in/counter material sale like '1,05,000 cash sales to Chiranji Lal for door and laminate sales') -> "
+        "call `stage_financial_entry` with `entry_kind='customer_receipt'` (books to Zoho Sales Revenue). Attach `project_id` ONLY if an active Production order matches — never force a fake Production project for counter sales!\n"
+        "   - Explicit Receivables ('X owes us ₹...', 'baki lena hai') -> `entry_kind='customer_draft_invoice'` (creates Zoho Draft Invoice AR; no account needed).\n"
+        "   - Explicit Payables ('we owe Y ₹...', 'udhaar bill', or an unpaid supplier bill photo/PDF) -> `entry_kind='supplier_draft_bill'` (creates Zoho Draft Bill AP).\n"
+        "   - Use `vendor_payment` / `customer_payment` ONLY if the user explicitly says 'settled bill' / 'udhaar chukaya' / 'against pending invoice'.\n"
+        "   - Always populate `amount_inr` (number), `payment_account_code` (for inflows/expenses/transfers), and `party_name`; preserve extra context in `notes`. Never put a Supabase UUID into `zoho_contact_id`.\n"
         "5. PRODUCTION LIFECYCLE STAGES & ITEM RAW MATERIALS:\n"
         "   - Project `pipeline_stage_move`: `lead` -> `design` -> `estimating` -> `quoted_awaiting_advance` -> `site_sizing_boq` -> `execution` -> `completed`.\n"
         "   - Ansh `material_stage_move`: `check_stock` -> `ordered_pending` -> `all_in_shop`.\n"

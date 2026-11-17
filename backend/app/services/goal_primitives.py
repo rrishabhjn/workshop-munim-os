@@ -208,7 +208,7 @@ def select_hydrogen_thinking_level(
     return "low"
 
 
-_PURE_SOCIAL_CHATTER: frozenset[str] = frozenset(
+_GREETING_OR_THANKS_CHATTER: frozenset[str] = frozenset(
     {
         "good morning",
         "gm",
@@ -218,8 +218,20 @@ _PURE_SOCIAL_CHATTER: frozenset[str] = frozenset(
         "jai jinendra",
         "jai shree krishna",
         "happy diwali",
+        "thanks",
+        "thank you",
+        "👍",
+        "🙏",
+    }
+)
+
+_PURE_SOCIAL_CHATTER: frozenset[str] = _GREETING_OR_THANKS_CHATTER | frozenset(
+    {
         "ok",
         "okay",
+        "ok done",
+        "done",
+        "noted",
         "k",
         "kk",
         "hmm",
@@ -227,12 +239,44 @@ _PURE_SOCIAL_CHATTER: frozenset[str] = frozenset(
         "accha",
         "thik hai",
         "theek hai",
-        "thanks",
-        "thank you",
-        "👍",
-        "🙏",
     }
 )
+
+
+def should_ignore_pure_chatter(
+    text: str | None, open_goals: list[dict[str, Any]] | None
+) -> bool:
+    """Ignore trivial social messages on allowlisted channels without waking Decisions or Hydrogen."""
+    clean = re.sub(r"[.!,\s]+$", "", (text or "").strip().lower()).strip()
+    if not clean:
+        return False
+    if clean in _GREETING_OR_THANKS_CHATTER:
+        return True
+    if open_goals:
+        return False
+    return clean in _PURE_SOCIAL_CHATTER
+
+
+EXPLICIT_SETTLEMENT_RE = re.compile(
+    r"(?:\b(?:settled?|settlement|against\s+(?:bill|invoice|due|pending)|"
+    r"bill\s+(?:payment|clear|settled?)|invoice\s+clear|"
+    r"udha+r\s+(?:chukaya|clear|settle)|baki\s+chukaya|pending\s+bill)\b)",
+    re.IGNORECASE,
+)
+
+
+def normalize_financial_entry_kind(entry_kind: str | None, *texts: str | None) -> str:
+    """Enforce cash-first informal bookkeeping: payouts -> expense, inflows -> sales receipt
+    unless user explicitly states they are settling an earlier payable/receivable bill or due.
+    """
+    op = str(entry_kind or "expense").strip()
+    combined = " ".join(str(t).strip() for t in texts if t and str(t).strip())
+    is_explicit_settlement = bool(combined and EXPLICIT_SETTLEMENT_RE.search(combined))
+    if op == "vendor_payment" and not is_explicit_settlement:
+        return "expense"
+    if op == "customer_payment" and not is_explicit_settlement:
+        return "customer_receipt"
+    return op
 
 
 def _parse_goal_utc(raw: Any) -> datetime | None:
@@ -698,7 +742,7 @@ EXPENSE_CATEGORIES: dict[str, dict[str, Any]] = {
     "contractor_labor": {
         "label": "Contractor / Site Labor",
         "zoho_names": ["subcontractor", "labor", "job costing", "consultant expense"],
-        "pattern": r"\b(majdoori|mazdoori|labour|labor|theka|contractor|fitting\s+charge|polish\s+labour|unloading\s+labour|loading\s+labour|cushioning\s+charge)\b",
+        "pattern": r"\b(majdoori|mazdoori|labour|labor|theka|contractor|painter|carpenter|polisher|mistri|fitting\s+charge|polish\s+labour|unloading\s+labour|loading\s+labour|cushioning\s+charge)\b",
     },
     "transport_freight": {
         "label": "Transport & Freight",

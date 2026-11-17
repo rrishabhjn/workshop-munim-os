@@ -314,6 +314,7 @@ async def _run_single_step(
             actor_person_id=actor_person_id,
             source_channel=src,
             heard_transcript=heard_transcript,
+            uploaded_gcs_paths=slots.get("uploaded_gcs_paths"),
         )
     if op == "item_material_upsert":
         project_id = str(slots["project_id"])
@@ -478,7 +479,7 @@ async def _run_single_step(
             source_channel=src,
             note=slots.get("notes"),
         )
-    if op in ("customer_receipt", "vendor_payment", "expense", "float_transfer"):
+    if op in ("customer_receipt", "customer_payment", "vendor_payment", "expense", "float_transfer"):
         return await step_executors.execute_munim_financial_step(
             sb,
             goal_id=goal_id,
@@ -495,69 +496,14 @@ async def _run_single_step(
             actor_label=actor_label,
             expense_category=slots.get("expense_category"),
         )
-    if op == "supplier_draft_bill":
-        vendor_name = str(slots.get("party_name") or "")
-        amt = float(slots.get("amount_inr") or 0)
-        inv_no = slots.get("invoice_no")
-        dup = await zoho.check_duplicate_bill(sb, vendor_name, inv_no, amt)
-        if dup and not slots.get("force_ignore_duplicate"):
-            return {
-                "ok": False,
-                "error_kind": "validation_400",
-                "error": {
-                    "code": "DUPLICATE_BILL",
-                    "message": f"Bill `{inv_no}` for `{vendor_name}` ({format_inr(amt)}) already exists in {dup['source']}.",
-                },
-            }
-        line_items: list[dict[str, Any]] = []
-        if slots.get("bill_line_items_json"):
-            try:
-                line_items = json.loads(str(slots["bill_line_items_json"]))
-            except json.JSONDecodeError:
-                line_items = []
-        if not line_items:
-            line_items = [{"description": slots.get("notes") or "Workshop Material", "quantity": 1, "rate": amt, "amount": amt}]
-        payee = await zoho.resolve_payee_zoho_vendor(sb, vendor_name, allow_adhoc_create=True)
-        if payee.get("error") and not payee.get("contact_id") and goal_intelligence.is_transient_zoho_error_message(
-            str(payee.get("error") or "")
-        ):
-            return {
-                "ok": False,
-                "error_kind": "transient_5xx",
-                "error": {"message": payee.get("error")},
-            }
-        draft_res = await zoho.create_draft_bill(
-            supplier_name=payee.get("canonical_name") or vendor_name,
-            invoice_no=inv_no,
-            bill_date=slots.get("txn_date"),
-            line_items=line_items,
-            notes=str(slots.get("notes") or ""),
-            vendor_id=payee.get("contact_id"),
-            reference_number=make_zoho_reference_number(goal_id, step_index),
-            project_id=slots.get("project_id"),
-            sb=sb,
+    if op in ("supplier_draft_bill", "customer_draft_invoice"):
+        return await step_executors.execute_munim_draft_doc_step(
+            sb,
+            goal_id=goal_id,
+            step_index=step_index,
+            op=op,
+            slots=slots,
         )
-        if draft_res.get("error"):
-            err_msg = str(draft_res["error"])
-            return {
-                "ok": False,
-                "error_kind": (
-                    "transient_5xx"
-                    if goal_intelligence.is_transient_zoho_error_message(err_msg)
-                    else "validation_400"
-                ),
-                "error": {"message": err_msg},
-            }
-        draft_status = str(
-            draft_res.get("status")
-            or (draft_res.get("bill") or {}).get("status")
-            or "draft"
-        )
-        return {
-            "ok": True,
-            "draft_status": draft_status,
-            "receipt": f"🧾 Zoho *Draft Bill* saved: *{vendor_name}* (`{inv_no or 'Draft'}`) · *{format_inr(amt)}*",
-        }
     if op == "add_person_or_vendor":
         kind = str(slots.get("person_or_vendor_kind") or "salaried_karigar")
         name = str(slots.get("full_name") or slots.get("party_name") or "").strip()

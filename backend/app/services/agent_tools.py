@@ -100,7 +100,7 @@ _READ_TOOLS_SCHEMA: list[dict[str, Any]] = [
                 "account": {"type": "string", "description": "Optional account name or code (e.g. 'Cash Galla', 'axis', 'rgb')"},
                 "entry_type": {
                     "type": "string",
-                    "enum": ["all", "customer_receipt", "expense", "vendor_payment", "float_transfer", "bill"],
+                    "enum": ["all", "customer_receipt", "expense", "vendor_payment", "float_transfer", "bill", "invoice"],
                 },
                 "limit": {"type": "integer", "description": "Number of transactions to return (default 15, max 50)"},
             },

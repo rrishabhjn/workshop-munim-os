@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 import re
 import sys
 from typing import Any
@@ -10,6 +11,7 @@ import httpx
 
 from app.services.goal_primitives import (
     EXPENSE_CATEGORIES,
+    IST,
     build_zoho_standard_order_tags,
     classify_external_error,
     get_expense_category_label,
@@ -196,10 +198,29 @@ def _pick_zoho_expense_account(
     return active_exp[0]
 
 
+def _pick_zoho_income_account(accounts: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Select active Zoho Books Income account ('Sales' first, then 'General Income')."""
+    active_inc = [
+        a
+        for a in accounts
+        if a.get("account_type") in ("income", "other_income") and a.get("is_active", True)
+    ]
+    if not active_inc:
+        return None
+    for preferred in ("sales", "general income"):
+        exact = next(
+            (a for a in active_inc if (a.get("account_name") or "").strip().lower() == preferred),
+            None,
+        )
+        if exact:
+            return exact
+    return active_inc[0]
+
+
 async def push_management_entry_to_zoho(
     sb: Any,
     *,
-    entry_kind: str,  # 'customer_receipt' | 'vendor_payment' | 'expense' | 'float_transfer'
+    entry_kind: str,  # 'customer_receipt' | 'customer_payment' | 'vendor_payment' | 'expense' | 'float_transfer'
     amount_inr: float,
     payment_account_id: str,
     to_payment_account_id: str | None = None,
@@ -238,19 +259,22 @@ async def push_management_entry_to_zoho(
     bridge: dict[str, Any] = {}
     if project_id:
         bridge = await pkg.ensure_project_zoho_bridge(sb, project_id)
-        if not zoho_contact_id and entry_kind == "customer_receipt":
+        if not zoho_contact_id and entry_kind in ("customer_receipt", "customer_payment"):
             zoho_contact_id = bridge.get("zoho_contact_id")
 
     if not settings.zoho_enabled:
+        z_type = "sales_receipt" if entry_kind == "customer_receipt" else entry_kind
         stub_out: dict[str, Any] = {
             "ok": True,
             "stubbed": True,
             "status_code": 200,
             "error_kind": "none",
-            "zoho_type": entry_kind,
+            "zoho_type": z_type,
             "zoho_id": f"STUB-{reference_number}",
             "account_name": from_acc["display_name"],
         }
+        if entry_kind == "customer_receipt":
+            stub_out["income_account_name"] = "Sales"
         if entry_kind == "expense":
             inferred_cat = normalize_or_infer_expense_category(expense_category, party_name, notes)
             stub_out["expense_category"] = inferred_cat
@@ -347,6 +371,77 @@ async def push_management_entry_to_zoho(
                 }
 
             if entry_kind == "customer_receipt":
+                existing_id = await pkg._find_existing_by_reference(
+                    client, "/salesreceipts", "sales_receipts", "sales_receipt_id", reference_number
+                )
+                if existing_id:
+                    return {
+                        "ok": True,
+                        "status_code": 200,
+                        "error_kind": "none",
+                        "zoho_type": "sales_receipt",
+                        "zoho_id": existing_id,
+                        "deduped": True,
+                    }
+                if not zoho_contact_id:
+                    c_res = await pkg.resolve_or_create_contact(
+                        sb, party_name or "Walk-in Customer", "customer"
+                    )
+                    zoho_contact_id = c_res.get("contact_id")
+                if not zoho_contact_id:
+                    return {
+                        "ok": False,
+                        "status_code": 400,
+                        "error_kind": "validation_400",
+                        "error": {"message": f"Customer '{party_name or 'Walk-in Customer'}' could not be resolved in Zoho Books."},
+                    }
+                coa_resp = await pkg._zoho_request(client, "GET", "/chartofaccounts")
+                accounts = coa_resp.json().get("chartofaccounts", []) if coa_resp.is_success else []
+                sales_coa = _pick_zoho_income_account(accounts)
+                line_tags = {"tags": order_tags["tags"]} if order_tags.get("tags") else {}
+                item_label = (notes or f"Sales — {party_name or 'Customer'}").strip()[:95]
+                sr_payload = {
+                    "customer_id": zoho_contact_id,
+                    "deposit_to_account_id": from_zoho_acc,
+                    "payment_mode": "cash" if from_acc["account_kind"] in ("cash_galla", "supervisor_float") else "bank_transfer",
+                    "date": txn_date or datetime.now(IST).date().isoformat(),
+                    "reference_number": reference_number,
+                    "is_inclusive_tax": False,
+                    "notes": desc,
+                    "line_items": [
+                        {
+                            "name": item_label,
+                            "description": desc,
+                            "rate": round(float(amount_inr), 2),
+                            "quantity": 1,
+                            **({"account_id": sales_coa["account_id"]} if sales_coa else {}),
+                            **line_tags,
+                        }
+                    ],
+                    **order_tags,
+                }
+                resp = await _post_zoho_with_order_tag_fallback(
+                    client, "/salesreceipts", sr_payload, has_order_tags=bool(order_tags)
+                )
+                if resp.is_success:
+                    rj = resp.json()
+                    sr_obj = rj.get("salesreceipt") or rj.get("sales_receipt") or {}
+                    return {
+                        "ok": True,
+                        "status_code": resp.status_code,
+                        "error_kind": "none",
+                        "zoho_type": "sales_receipt",
+                        "zoho_id": sr_obj.get("sales_receipt_id"),
+                        "income_account_name": (sales_coa or {}).get("account_name") or "Sales",
+                    }
+                return {
+                    "ok": False,
+                    "status_code": resp.status_code,
+                    "error_kind": classify_external_error(resp.status_code),
+                    "error": resp.json() if "json" in resp.headers.get("content-type", "") else {"message": resp.text[:240]},
+                }
+
+            if entry_kind == "customer_payment":
                 existing_id = await pkg._find_existing_by_reference(
                     client, "/customerpayments", "customerpayments", "payment_id", reference_number
                 )

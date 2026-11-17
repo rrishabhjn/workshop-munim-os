@@ -118,30 +118,45 @@ def _format_confirmation_summary(
             diffs.append(f"• Scope: _{slots['rough_scope']}_")
         diff_body = "\n".join(diffs) if diffs else f"• {slots.get('summary_title') or op}"
         return f"✏️ *Confirm Update — {label}*\n{diff_body}"
-    if op in ("customer_receipt", "vendor_payment", "expense", "float_transfer"):
+    if op in ("customer_receipt", "customer_payment", "vendor_payment", "expense", "float_transfer"):
         amt = format_inr(float(slots.get("amount_inr") or 0))
         acc = (slots.get("payment_account_code") or "").upper()
-        badge = "🟢 PAISA AAYA (IN)" if op == "customer_receipt" else ("🔄 TRANSFER" if op == "float_transfer" else "🔴 PAISA GAYA (OUT)")
+        is_inflow = op in ("customer_receipt", "customer_payment")
+        badge = "🟢 PAISA AAYA (IN)" if is_inflow else ("🔄 TRANSFER" if op == "float_transfer" else "🔴 PAISA GAYA (OUT)")
         party = slots.get("party_name") or slots.get("to_payment_account_code") or op
         match_tag = ""
         if op != "float_transfer" and slots.get("party_name"):
             if slots.get("is_new_payee") is True:
-                match_tag = " _(🆕 New Customer)_" if op == "customer_receipt" else " _(🆕 New Vendor)_"
+                match_tag = " _(🆕 New Customer)_" if is_inflow else " _(🆕 New Vendor)_"
             elif slots.get("is_new_payee") is False or any(slots.get(k) for k in ("zoho_contact_id", "vendor_id", "person_id")):
                 match_tag = " _(✅ Matched)_"
-        cat_line = (
-            f"\n• Category: *{get_expense_category_label(slots.get('expense_category'))}*"
-            if op == "expense"
-            else ""
-        )
+        cat_line = ""
+        if op == "expense":
+            cat_line = f"\n• Category: *{get_expense_category_label(slots.get('expense_category'))}*"
+        elif op == "customer_receipt":
+            cat_line = "\n• Type: *Sales / Revenue (Zoho Sales Receipt)*"
+        elif op == "customer_payment":
+            cat_line = "\n• Type: *AR Settlement (Against Invoice)*"
+        elif op == "vendor_payment":
+            cat_line = "\n• Type: *AP Settlement (Against Bill)*"
         return f"{badge}: *{amt}*\n• Party/To: *{party}*{match_tag}{cat_line}\n• Account: `{acc}`\n• Note: _{slots.get('notes') or slots.get('summary_title') or '-'}_"
     if op == "supplier_draft_bill":
         amt = format_inr(float(slots.get("amount_inr") or 0))
         match_tag = " _(🆕 New Vendor)_" if slots.get("is_new_payee") is True else (" _(✅ Matched)_" if slots.get("is_new_payee") is False or slots.get("zoho_contact_id") or slots.get("vendor_id") else "")
         return (
-            f"🧾 *Confirm Zoho Draft Bill*\n"
+            f"🧾 *Confirm Zoho Draft Bill (Payable)*\n"
             f"• Vendor: *{slots.get('party_name')}*{match_tag}\n"
             f"• Invoice: `{slots.get('invoice_no') or 'Auto'}` · Total: *{amt}*\n"
+            f"_(Strictly saved as Draft in Zoho Books for Clerk review)_"
+        )
+    if op == "customer_draft_invoice":
+        amt = format_inr(float(slots.get("amount_inr") or 0))
+        match_tag = " _(🆕 New Customer)_" if slots.get("is_new_payee") is True else (" _(✅ Matched)_" if slots.get("is_new_payee") is False or slots.get("zoho_contact_id") or slots.get("customer_id") else "")
+        return (
+            f"📄 *Confirm Zoho Draft Invoice (Receivable)*\n"
+            f"• Customer: *{slots.get('party_name')}*{match_tag}\n"
+            f"• Amount Due: *{amt}*\n"
+            f"• Note: _{slots.get('notes') or slots.get('summary_title') or '-'}_\n"
             f"_(Strictly saved as Draft in Zoho Books for Clerk review)_"
         )
     return f"📝 *Confirm*: {slots.get('summary_title') or op}"
@@ -151,7 +166,7 @@ def _build_steps_for_slots(op: str, slots: dict[str, Any]) -> list[dict[str, Any
     steps: list[dict[str, Any]] = [
         CheckpointedStep(
             step_index=0,
-            target="zoho" if op in ("customer_receipt", "vendor_payment", "expense", "float_transfer", "supplier_draft_bill") else "supabase",
+            target="zoho" if op in ("customer_receipt", "customer_payment", "vendor_payment", "expense", "float_transfer", "supplier_draft_bill", "customer_draft_invoice") else "supabase",
             operation=op,
             payload=slots,
         ).model_dump()
