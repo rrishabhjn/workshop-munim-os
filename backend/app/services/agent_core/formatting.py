@@ -134,7 +134,7 @@ def _format_confirmation_summary(
         if op == "expense":
             cat_line = f"\n• Category: *{get_expense_category_label(slots.get('expense_category'))}*"
         elif op == "customer_receipt":
-            cat_line = "\n• Type: *Sales / Revenue (Zoho Sales Receipt)*"
+            cat_line = "\n• Type: *Sales / Revenue (Zoho Sales)*"
         elif op == "customer_payment":
             cat_line = "\n• Type: *AR Settlement (Against Invoice)*"
         elif op == "vendor_payment":

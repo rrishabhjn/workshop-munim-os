@@ -180,9 +180,10 @@ def has_complex_turn_cues(
     if not txt:
         return False
     low = txt.lower()
+    non_numeric_commas = re.sub(r"(?<=\d),(?=\d)", "", txt).count(",")
     if (
         len(txt) >= 120
-        or txt.count(",") >= 2
+        or non_numeric_commas >= 2
         or ";" in txt
         or "+" in txt
         or txt.count("\n") >= 2

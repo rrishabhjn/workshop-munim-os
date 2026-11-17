@@ -21,9 +21,9 @@ _READ_TOOLS_SCHEMA: list[dict[str, Any]] = [
         "name": "search_customers",
         "description": (
             "Search existing customers (active + past completed orders) and Zoho Contacts "
-            "by name, surname, locality/area, or phone. ALWAYS call this before creating a "
-            "new lead/customer or logging a customer receipt to detect homonyms (e.g. two Sharma Jis) "
-            "or repeat clients."
+            "by name, surname, locality/area, or phone. ALWAYS call this before `stage_new_order` "
+            "(to catch past/completed homonyms), directory edits, or Q&A. Do NOT call this before "
+            "`stage_financial_entry` — financial tools already match customers and orders automatically."
         ),
         "parameters": {
             "type": "object",
@@ -55,7 +55,9 @@ _READ_TOOLS_SCHEMA: list[dict[str, Any]] = [
         "name": "search_people_and_vendors",
         "description": (
             "Search office operators (Shreyansh, Ansh, Estimators), workshop/site Mistris, "
-            "worker proxy payout aliases (e.g. 'Ruksar Bano' -> Lala Ji), and material/contractor Vendors."
+            "worker proxy payout aliases (e.g. 'Ruksar Bano' -> Lala Ji), and material/contractor Vendors. "
+            "Use for directory edits or Q&A — do NOT call this before `stage_financial_entry` "
+            "(it already matches payees and Zoho vendors automatically)."
         ),
         "parameters": {
             "type": "object",

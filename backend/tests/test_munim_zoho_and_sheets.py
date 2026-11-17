@@ -738,8 +738,6 @@ async def test_zoho_ledger_reader_endpoint_and_ai_tool():
                     ]
                 },
             )
-        if path == "/salesreceipts":
-            return httpx.Response(200, json={"sales_receipts": []})
         if path == "/customerpayments":
             return httpx.Response(
                 200,

@@ -250,7 +250,6 @@ async def list_recent_ledger_transactions(
             async with httpx.AsyncClient(timeout=12.0) as client:
                 reqs = [
                     pkg._zoho_request(client, "GET", "/expenses", params={"per_page": 100}),
-                    pkg._zoho_request(client, "GET", "/salesreceipts", params={"per_page": 100}),
                     pkg._zoho_request(client, "GET", "/customerpayments", params={"per_page": 100}),
                     pkg._zoho_request(client, "GET", "/vendorpayments", params={"per_page": 100}),
                     pkg._zoho_request(client, "GET", "/banktransactions", params={"per_page": 100}),
@@ -294,31 +293,7 @@ async def list_recent_ledger_transactions(
                     }
                 )
 
-            for x in _items(1, "sales_receipts"):
-                srid = str(x.get("sales_receipt_id") or "")
-                if srid:
-                    seen_ids.add(srid)
-                cname = str(x.get("customer_name") or "").strip()
-                raw_rows.append(
-                    {
-                        "id": srid,
-                        "date": str(x.get("date") or ""),
-                        "created_time": str(x.get("created_time") or ""),
-                        "entry_type": "customer_receipt",
-                        "direction": "in",
-                        "amount_inr": round(float(x.get("total") or x.get("bcy_total") or 0), 2),
-                        "account_name": str(x.get("deposit_to_account_name") or ""),
-                        "_account_id": str(x.get("deposit_to_account_id") or ""),
-                        "category_or_offset": "Sales",
-                        "party_name": cname,
-                        "customer_name": cname,
-                        "description": str(x.get("notes") or x.get("salesreceipt_number") or ""),
-                        "reference_number": str(x.get("reference_number") or x.get("salesreceipt_number") or ""),
-                        "status": str(x.get("status") or "paid"),
-                    }
-                )
-
-            for x in _items(2, "customerpayments"):
+            for x in _items(1, "customerpayments"):
                 pid = str(x.get("payment_id") or "")
                 if pid:
                     seen_ids.add(pid)
@@ -342,7 +317,7 @@ async def list_recent_ledger_transactions(
                     }
                 )
 
-            for x in _items(3, "vendorpayments"):
+            for x in _items(2, "vendorpayments"):
                 vpid = str(x.get("payment_id") or "")
                 if vpid:
                     seen_ids.add(vpid)
@@ -365,7 +340,7 @@ async def list_recent_ledger_transactions(
                     }
                 )
 
-            for x in _items(4, "banktransactions"):
+            for x in _items(3, "banktransactions"):
                 tid = str(x.get("transaction_id") or "")
                 if not tid or tid in seen_ids:
                     continue
@@ -374,6 +349,9 @@ async def list_recent_ledger_transactions(
                 ref = str(x.get("reference_number") or "")
                 dt = str(x.get("date") or "")
                 offset_name = str(x.get("offset_account_name") or "").strip()
+                party_resolved = str(x.get("payee") or "").strip() or _extract_party_from_desc(
+                    str(x.get("description") or "")
+                )
                 if "transfer" in ttype:
                     xfer_key = (ref or dt, amt)
                     if xfer_key in seen_transfers:
@@ -381,11 +359,17 @@ async def list_recent_ledger_transactions(
                     seen_transfers.add(xfer_key)
                     mapped_type, direction = "float_transfer", "transfer"
                     cat = f"Transfer -> {offset_name}".strip(" ->") or "Float Transfer"
+                    cust_name = ""
                 else:
                     is_out = str(x.get("debit_or_credit") or "").lower() == "credit"
                     mapped_type = "expense" if is_out else "customer_receipt"
                     direction = "out" if is_out else "in"
-                    cat = str(x.get("transaction_type_formatted") or offset_name or "Bank Entry")
+                    cat = (
+                        offset_name or str(x.get("transaction_type_formatted") or "Sales")
+                        if not is_out
+                        else str(x.get("transaction_type_formatted") or offset_name or "Bank Entry")
+                    )
+                    cust_name = "" if is_out else party_resolved
                 raw_rows.append(
                     {
                         "id": tid,
@@ -397,17 +381,16 @@ async def list_recent_ledger_transactions(
                         "account_name": str(x.get("account_name") or ""),
                         "_account_id": str(x.get("account_id") or ""),
                         "category_or_offset": cat,
-                        "party_name": str(x.get("payee") or "").strip()
-                        or _extract_party_from_desc(str(x.get("description") or "")),
-                        "customer_name": "",
+                        "party_name": party_resolved,
+                        "customer_name": cust_name,
                         "description": str(x.get("description") or ""),
                         "reference_number": ref,
                         "status": str(x.get("status") or ""),
                     }
                 )
 
-            bill_idx = 5 if et_clean in ("", "bill") else -1
-            inv_idx = (6 if et_clean in ("", "bill") else 5) if et_clean in ("", "invoice", "bill") else -1
+            bill_idx = 4 if et_clean in ("", "bill") else -1
+            inv_idx = (5 if et_clean in ("", "bill") else 4) if et_clean in ("", "invoice", "bill") else -1
             if bill_idx >= 0:
                 for x in _items(bill_idx, "bills"):
                     bid = str(x.get("bill_id") or "")

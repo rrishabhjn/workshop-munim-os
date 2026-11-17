@@ -640,3 +640,128 @@ def match_existing_order_or_customer(sb: Any, hint: str | None) -> dict[str, Any
             "question": f"Multiple active orders match *{raw}* — kaunsa order select karein?",
         }
     return {"status": "none"}
+
+
+async def match_existing_customer(sb: Any, raw_name: str | None) -> dict[str, Any]:
+    """Read-only deterministic matcher across Supabase customers & Zoho Customers."""
+    raw = (raw_name or "").strip()
+    if not raw or raw.lower() in NON_PAYEE_WORDS:
+        return {"status": "none"}
+
+    raw_low = raw.lower()
+    core_tokens = _core_name_tokens(raw)
+    pool: list[dict[str, Any]] = []
+
+    if sb is not None:
+        for c in (
+            sb.table("customers")
+            .select("id,full_name,area_landmark,aliases,zoho_contact_id,is_active")
+            .eq("is_active", True)
+            .execute()
+            .data
+            or []
+        ):
+            fname = str(c.get("full_name") or "").strip()
+            if not fname:
+                continue
+            area = str(c.get("area_landmark") or "").strip()
+            all_names = [fname, *(str(a).strip() for a in (c.get("aliases") or []) if str(a).strip())]
+            pool.append(
+                {
+                    "canonical_name": fname,
+                    "customer_id": str(c["id"]),
+                    "zoho_contact_id": str(c["zoho_contact_id"]) if c.get("zoho_contact_id") else None,
+                    "area": area,
+                    "all_names": all_names,
+                }
+            )
+
+    pkg = _pkg()
+    if pkg.get_settings().zoho_enabled and core_tokens:
+        z_hits = await pkg.search_zoho_contacts(" ".join(core_tokens), "customer")
+        for z in z_hits:
+            zid = str(z.get("contact_id") or "").strip()
+            zname = str(z.get("contact_name") or "").strip()
+            if not zname:
+                continue
+            existing = next(
+                (
+                    it
+                    for it in pool
+                    if (zid and it["zoho_contact_id"] == zid)
+                    or it["canonical_name"].lower() == zname.lower()
+                ),
+                None,
+            )
+            if existing:
+                if zid and not existing["zoho_contact_id"]:
+                    existing["zoho_contact_id"] = zid
+                continue
+            pool.append(
+                {
+                    "canonical_name": zname,
+                    "customer_id": None,
+                    "zoho_contact_id": zid or None,
+                    "area": "",
+                    "all_names": [zname],
+                }
+            )
+
+    def _to_matched(it: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "status": "matched",
+            "canonical_name": it["canonical_name"],
+            "customer_id": it["customer_id"],
+            "zoho_contact_id": it["zoho_contact_id"],
+        }
+
+    exact_hits = [it for it in pool if any(n.lower() == raw_low for n in it["all_names"])]
+    if len(exact_hits) == 1:
+        return _to_matched(exact_hits[0])
+
+    candidates = exact_hits if len(exact_hits) >= 2 else []
+    if not candidates and core_tokens:
+        for it in pool:
+            for nm in it["all_names"]:
+                c_toks = _core_name_tokens(nm)
+                if c_toks == core_tokens or (len(c_toks) >= len(core_tokens) and c_toks[: len(core_tokens)] == core_tokens):
+                    candidates.append(it)
+                    break
+
+    if len(candidates) == 1:
+        return _to_matched(candidates[0])
+
+    if len(candidates) >= 2:
+        choices: list[dict[str, Any]] = []
+        for idx, it in enumerate(candidates[:3]):
+            area_tag = f" ({it['area']})" if it.get("area") else ""
+            patch_obj: dict[str, Any] = {
+                "party_name": it["canonical_name"],
+                "is_ambiguous": False,
+                "is_new_payee": False,
+            }
+            if it["customer_id"]:
+                patch_obj["customer_id"] = it["customer_id"]
+            if it["zoho_contact_id"]:
+                patch_obj["zoho_contact_id"] = it["zoho_contact_id"]
+            choices.append(
+                {
+                    "choice_id": f"cust_{idx}",
+                    "label": f"{it['canonical_name']}{area_tag}"[:42],
+                    "slot_patch_json": json.dumps(patch_obj, ensure_ascii=False),
+                }
+            )
+        choices.append(
+            {
+                "choice_id": "cust_new",
+                "label": f"🆕 New: {raw[:32]}",
+                "slot_patch_json": json.dumps({"party_name": raw, "is_ambiguous": False, "is_new_payee": True}, ensure_ascii=False),
+            }
+        )
+        return {
+            "status": "ambiguous",
+            "choices": choices,
+            "question": f"Multiple customers match *{raw}* — kaunsa select karein?",
+        }
+
+    return {"status": "new", "canonical_name": raw}

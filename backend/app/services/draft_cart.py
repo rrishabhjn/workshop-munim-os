@@ -266,18 +266,21 @@ async def enrich_candidate_entities(sb: Any, cand: Any) -> None:
                 cand.clarification_question = om.get("question")
         if (
             op in ("customer_receipt", "customer_payment", "customer_draft_invoice")
+            and not cand.project_id
+            and not cand.is_ambiguous
             and cand.party_name
-            and cand.is_new_payee is None
-            and sb is not None
         ):
-            c_hits = (
-                sb.table("customers")
-                .select("id")
-                .ilike("full_name", cand.party_name.strip())
-                .eq("is_active", True)
-                .limit(2)
-                .execute()
-                .data
-                or []
-            )
-            cand.is_new_payee = len(c_hits) == 0
+            cm = await zoho.match_existing_customer(sb, cand.party_name)
+            if cm.get("status") == "matched":
+                cand.party_name = cm["canonical_name"]
+                cand.is_new_payee = False
+                if cm.get("customer_id"):
+                    cand.customer_id = cm["customer_id"]
+                if cm.get("zoho_contact_id"):
+                    cand.zoho_contact_id = cm["zoho_contact_id"]
+            elif cm.get("status") == "ambiguous":
+                cand.is_ambiguous = True
+                cand.choices = [DisambiguationChoice(**c) for c in (cm.get("choices") or [])]
+                cand.clarification_question = cm.get("question")
+            elif cm.get("status") == "new" and cand.is_new_payee is None:
+                cand.is_new_payee = True

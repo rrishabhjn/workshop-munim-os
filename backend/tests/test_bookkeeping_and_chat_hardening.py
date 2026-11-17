@@ -18,7 +18,7 @@ from conftest import seed_goal_intelligence_sb
 
 @pytest.mark.asyncio
 async def test_sales_receipts_walkin_counter_and_active_project_payment_track():
-    """Walk-in counter sales book Zoho /salesreceipts without project_id; active orders update Payment Track."""
+    """Walk-in counter sales book Zoho /banktransactions -> Sales without project_id; active orders update Payment Track."""
     sb = seed_goal_intelligence_sb()
     sb.store["customers"].append(
         {"id": "c-chiranji", "full_name": "Chiranji Lal", "zoho_contact_id": "zc-chir", "is_active": True}
@@ -40,11 +40,11 @@ async def test_sales_receipts_walkin_counter_and_active_project_payment_track():
     sb.store["projects"][0]["zoho_contact_id"] = "zc-amb"
     sb.store["entity_dictionary"] = []
 
-    posted_sr: list[dict[str, Any]] = []
+    posted_bt: list[dict[str, Any]] = []
 
     async def fake_zoho_req(client, method, path, *, params=None, json_body=None):
-        if method == "GET" and path == "/salesreceipts":
-            return httpx.Response(200, json={"sales_receipts": []})
+        if method == "GET" and path == "/banktransactions":
+            return httpx.Response(200, json={"banktransactions": []})
         if method == "GET" and path == "/chartofaccounts":
             return httpx.Response(
                 200,
@@ -55,9 +55,12 @@ async def test_sales_receipts_walkin_counter_and_active_project_payment_track():
                     ]
                 },
             )
-        if method == "POST" and path == "/salesreceipts":
-            posted_sr.append(dict(json_body or {}))
-            return httpx.Response(200, json={"salesreceipt": {"sales_receipt_id": f"sr-{len(posted_sr)}"}})
+        if method == "POST" and path == "/banktransactions":
+            body = dict(json_body or {})
+            if len(posted_bt) >= 1 and body.get("transaction_type") == "sales_without_invoices":
+                return httpx.Response(400, json={"code": 1002, "message": "Invalid transaction_type"})
+            posted_bt.append(body)
+            return httpx.Response(200, json={"banktransaction": {"transaction_id": f"bt-{len(posted_bt)}"}})
         if method == "GET" and path == "/contacts":
             return httpx.Response(200, json={"contacts": [{"contact_id": "zc-chir", "contact_name": "Chiranji Lal"}]})
         raise AssertionError(f"Unexpected Zoho call: {method} {path}")
@@ -103,7 +106,7 @@ async def test_sales_receipts_walkin_counter_and_active_project_payment_track():
     g_counter = out_counter["goals"][0]
     assert g_counter["status"] == "awaiting_confirmation"
     assert not g_counter["collected_slots"].get("project_id")
-    assert "Sales Receipt" in g_counter["prompt"]
+    assert "Zoho Sales" in g_counter["prompt"]
 
     fake_settings = Settings(zoho_client_id="c", zoho_client_secret="s", zoho_refresh_token="r", zoho_org_id="o")
     with (
@@ -118,14 +121,15 @@ async def test_sales_receipts_walkin_counter_and_active_project_payment_track():
             actor_label="Shreyansh",
         )
         assert exec_counter["status"] == "completed"
-        assert "Zoho `sales_receipt`" in exec_counter["receipt"]
-        assert posted_sr[0]["customer_id"] == "zc-chir"
-        assert posted_sr[0]["deposit_to_account_id"] == "za-cash"
-        assert posted_sr[0]["line_items"][0]["account_id"] == "inc-sales"
-        assert posted_sr[0]["line_items"][0]["rate"] == 105000.0
+        assert "Zoho `sales_deposit`" in exec_counter["receipt"]
+        assert posted_bt[0]["customer_id"] == "zc-chir"
+        assert posted_bt[0]["from_account_id"] == "inc-sales"
+        assert posted_bt[0]["to_account_id"] == "za-cash"
+        assert posted_bt[0]["amount"] == 105000.0
+        assert posted_bt[0]["transaction_type"] == "sales_without_invoices"
         assert len(sb.store["projects"]) == 1  # Never creates a fake project!
 
-        # 2. Active project receipt pushes /salesreceipts AND advances Payment Track
+        # 2. Active project receipt pushes /banktransactions AND advances Payment Track
         res_proj = await agent_core.step_executors.execute_munim_financial_step(
             sb,
             goal_id="g-amb-50k",
@@ -140,7 +144,9 @@ async def test_sales_receipts_walkin_counter_and_active_project_payment_track():
     assert res_proj["ok"] is True
     assert sb.store["projects"][0]["payment_stage"] == "advance_in"
     assert sb.store["projects"][0]["paid_cache_inr"] == 50000.0
-    assert posted_sr[1]["deposit_to_account_id"] == "za-rgb"
+    assert posted_bt[1]["from_account_id"] == "inc-sales"
+    assert posted_bt[1]["to_account_id"] == "za-rgb"
+    assert posted_bt[1]["transaction_type"] == "other_income"
 
 
 @pytest.mark.asyncio
@@ -408,3 +414,86 @@ async def test_rec3_in_place_edit_awaiting_confirmation_and_retires_old_telegram
     assert mock_edit.await_args.kwargs["message_id"] == 105
     assert mock_edit.await_args.kwargs["reply_markup"] == {"inline_keyboard": []}
     assert "RGB" in mock_send.await_args.kwargs["text"]
+
+
+@pytest.mark.asyncio
+async def test_latency_optimizations_1_to_4():
+    """Verify early-exit loop (#1), INR comma filter (#2), customer matcher (#3), and slim Munim grounding (#4)."""
+    from app.services.agent_core.grounding import _build_compact_grounding
+    from app.services.goal_primitives import has_complex_turn_cues
+
+    # Fix #2: Numeric grouping commas (1,05,000) stay low thinking; real multi-item lists stay medium
+    assert has_complex_turn_cues("1,05,000 cash sales to chiranji lal for door and laminates") is False
+    assert has_complex_turn_cues("1,05,000, 50,000") is False
+    assert has_complex_turn_cues("ply, laminate, fevicol") is True
+
+    sb = seed_goal_intelligence_sb()
+    sb.store["customers"].append(
+        {
+            "id": "c-chir",
+            "full_name": "Chiranji Lal",
+            "area_landmark": "Beawar",
+            "aliases": ["Chiranji"],
+            "zoho_contact_id": "zc-chir-9",
+            "is_active": True,
+        }
+    )
+
+    # Fix #4: Munim grounding omits bulky project_items; Production preserves them
+    munim_ctx_raw, _ = _build_compact_grounding(
+        sb, owner_person_id="p-shreyansh", domain_scope="munim", ui_context=None
+    )
+    prod_ctx_raw, _ = _build_compact_grounding(
+        sb, owner_person_id="p-shreyansh", domain_scope="production", ui_context=None
+    )
+    import json
+
+    munim_ctx = json.loads(munim_ctx_raw)
+    prod_ctx = json.loads(prod_ctx_raw)
+    assert "items" not in munim_ctx["active_orders_index"][0]
+    assert "items" in prod_ctx["active_orders_index"][0]
+
+    # Fix #1 + #3: Single Gemini round-trip early-exits on staged:true & deterministically matches customer alias
+    t_single = SimpleNamespace(
+        id="int_fast1",
+        steps=[
+            SimpleNamespace(
+                type="function_call",
+                id="fc_fast1",
+                name="stage_financial_entry",
+                arguments={
+                    "entry_kind": "customer_receipt",
+                    "amount_inr": 105000,
+                    "party_name": "Chiranji",
+                    "payment_account_code": "cash_galla",
+                    "notes": "Door and laminates",
+                },
+            )
+        ],
+        output_text=None,
+    )
+    fake_c = MagicMock()
+    fake_c.interactions.create.return_value = t_single
+
+    with (
+        patch("app.services.agent_core.get_settings", return_value=Settings(gemini_api_key="test-key")),
+        patch("app.services.agent_core._get_interactions_client", return_value=fake_c),
+        patch("app.services.zoho.get_settings", return_value=Settings(_env_file=None)),
+    ):
+        out = await agent_core.run_agent_turn(
+            sb,
+            owner_person_id="p-shreyansh",
+            actor_label="Shreyansh",
+            source_channel="telegram",
+            domain_scope="munim",
+            text="1,05,000 cash sales to chiranji for door and laminates",
+        )
+
+    assert fake_c.interactions.create.call_count == 1  # Zero wasted Round 2!
+    assert fake_c.interactions.create.call_args.kwargs["generation_config"]["thinking_level"] == "low"
+    slots = out["goals"][0]["collected_slots"]
+    assert slots["party_name"] == "Chiranji Lal"
+    assert slots["customer_id"] == "c-chir"
+    assert slots["zoho_contact_id"] == "zc-chir-9"
+    assert slots["is_new_payee"] is False
+

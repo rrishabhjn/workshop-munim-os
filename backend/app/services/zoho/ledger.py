@@ -263,7 +263,7 @@ async def push_management_entry_to_zoho(
             zoho_contact_id = bridge.get("zoho_contact_id")
 
     if not settings.zoho_enabled:
-        z_type = "sales_receipt" if entry_kind == "customer_receipt" else entry_kind
+        z_type = "sales_deposit" if entry_kind == "customer_receipt" else entry_kind
         stub_out: dict[str, Any] = {
             "ok": True,
             "stubbed": True,
@@ -372,73 +372,81 @@ async def push_management_entry_to_zoho(
 
             if entry_kind == "customer_receipt":
                 existing_id = await pkg._find_existing_by_reference(
-                    client, "/salesreceipts", "sales_receipts", "sales_receipt_id", reference_number
+                    client, "/banktransactions", "banktransactions", "transaction_id", reference_number
                 )
                 if existing_id:
                     return {
                         "ok": True,
                         "status_code": 200,
                         "error_kind": "none",
-                        "zoho_type": "sales_receipt",
+                        "zoho_type": "sales_deposit",
                         "zoho_id": existing_id,
                         "deduped": True,
                     }
-                if not zoho_contact_id:
+                if not zoho_contact_id and party_name:
                     c_res = await pkg.resolve_or_create_contact(
-                        sb, party_name or "Walk-in Customer", "customer"
+                        sb, party_name, "customer"
                     )
                     zoho_contact_id = c_res.get("contact_id")
-                if not zoho_contact_id:
+                coa_resp = await pkg._zoho_request(client, "GET", "/chartofaccounts")
+                accounts = coa_resp.json().get("chartofaccounts", []) if coa_resp.is_success else []
+                sales_coa = _pick_zoho_income_account(accounts)
+                if not sales_coa:
                     return {
                         "ok": False,
                         "status_code": 400,
                         "error_kind": "validation_400",
-                        "error": {"message": f"Customer '{party_name or 'Walk-in Customer'}' could not be resolved in Zoho Books."},
+                        "error": {"message": "No active Sales / Income account found in Zoho Books Chart of Accounts."},
                     }
-                coa_resp = await pkg._zoho_request(client, "GET", "/chartofaccounts")
-                accounts = coa_resp.json().get("chartofaccounts", []) if coa_resp.is_success else []
-                sales_coa = _pick_zoho_income_account(accounts)
-                line_tags = {"tags": order_tags["tags"]} if order_tags.get("tags") else {}
-                item_label = (notes or f"Sales — {party_name or 'Customer'}").strip()[:95]
-                sr_payload = {
-                    "customer_id": zoho_contact_id,
-                    "deposit_to_account_id": from_zoho_acc,
-                    "payment_mode": "cash" if from_acc["account_kind"] in ("cash_galla", "supervisor_float") else "bank_transfer",
-                    "date": txn_date or datetime.now(IST).date().isoformat(),
-                    "reference_number": reference_number,
-                    "is_inclusive_tax": False,
-                    "notes": desc,
-                    "line_items": [
-                        {
-                            "name": item_label,
-                            "description": desc,
-                            "rate": round(float(amount_inr), 2),
-                            "quantity": 1,
-                            **({"account_id": sales_coa["account_id"]} if sales_coa else {}),
-                            **line_tags,
-                        }
-                    ],
-                    **order_tags,
-                }
-                resp = await _post_zoho_with_order_tag_fallback(
-                    client, "/salesreceipts", sr_payload, has_order_tags=bool(order_tags)
+                payment_mode = (
+                    "Cash"
+                    if from_acc["account_kind"] in ("cash_galla", "supervisor_float")
+                    else "Bank Transfer"
                 )
-                if resp.is_success:
+                resp = None
+                for tx_type in ("sales_without_invoices", "other_income", "deposit"):
+                    bt_payload: dict[str, Any] = {
+                        "transaction_type": tx_type,
+                        "from_account_id": sales_coa["account_id"],
+                        "to_account_id": from_zoho_acc,
+                        "amount": round(float(amount_inr), 2),
+                        "date": txn_date or datetime.now(IST).date().isoformat(),
+                        "payment_mode": payment_mode,
+                        "reference_number": reference_number,
+                        "description": desc,
+                        **({"customer_id": zoho_contact_id} if zoho_contact_id else {}),
+                        **order_tags,
+                    }
+                    resp = await _post_zoho_with_order_tag_fallback(
+                        client, "/banktransactions", bt_payload, has_order_tags=bool(order_tags)
+                    )
+                    if not resp.is_success and resp.status_code == 400 and zoho_contact_id and "customer" in resp.text.lower():
+                        no_cust = {k: v for k, v in bt_payload.items() if k != "customer_id"}
+                        resp = await _post_zoho_with_order_tag_fallback(
+                            client, "/banktransactions", no_cust, has_order_tags=bool(order_tags)
+                        )
+                    if resp.is_success or resp.status_code != 400:
+                        break
+                if resp is not None and resp.is_success:
                     rj = resp.json()
-                    sr_obj = rj.get("salesreceipt") or rj.get("sales_receipt") or {}
+                    bt_obj = rj.get("banktransaction") or {}
                     return {
                         "ok": True,
                         "status_code": resp.status_code,
                         "error_kind": "none",
-                        "zoho_type": "sales_receipt",
-                        "zoho_id": sr_obj.get("sales_receipt_id"),
-                        "income_account_name": (sales_coa or {}).get("account_name") or "Sales",
+                        "zoho_type": "sales_deposit",
+                        "zoho_id": bt_obj.get("transaction_id"),
+                        "income_account_name": sales_coa.get("account_name") or "Sales",
                     }
                 return {
                     "ok": False,
-                    "status_code": resp.status_code,
-                    "error_kind": classify_external_error(resp.status_code),
-                    "error": resp.json() if "json" in resp.headers.get("content-type", "") else {"message": resp.text[:240]},
+                    "status_code": resp.status_code if resp is not None else 400,
+                    "error_kind": classify_external_error(resp.status_code) if resp is not None else "validation_400",
+                    "error": (
+                        resp.json()
+                        if resp is not None and "json" in resp.headers.get("content-type", "")
+                        else {"message": resp.text[:240] if resp is not None else "Bank transaction failed"}
+                    ),
                 }
 
             if entry_kind == "customer_payment":

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import json
 import sys
@@ -38,56 +39,128 @@ def _build_compact_grounding(
     telegram_chat_id: int | None = None,
     reply_to_bot_msg_id: int | None = None,
 ) -> tuple[str, dict[str, str]]:
-    """Build O(1) <1,200-token static + open-goals context (relying on tools for search)."""
+    """Build O(1) compact static + open-goals context with parallel Supabase reads."""
     today_ist = datetime.now(IST).date().isoformat()
-    accounts = (
-        sb.table("payment_accounts")
-        .select("id,code,display_name,account_kind,aliases")
-        .eq("is_active", True)
-        .order("sort_order")
-        .execute()
-        .data
-        or []
-    )
-    acc_code_to_id = {a["code"]: a["id"] for a in accounts}
+    include_order_items = domain_scope != "munim" or bool(ui_context and ui_context.get("viewing_project_id"))
 
-    people = (
-        sb.table("people")
-        .select("id,full_name,person_type,role_tags,aliases,payout_aliases,is_default_purchase,is_default_qc")
-        .eq("is_active", True)
-        .limit(60)
-        .execute()
-        .data
-        or []
-    )
-    rules = (
-        sb.table("workshop_memory")
-        .select("category,rule_text")
-        .eq("is_active", True)
-        .order("created_at", desc=True)
-        .limit(20)
-        .execute()
-        .data
-        or []
-    )
-
-    raw_open_rows = [
-        r
-        for r in (
-            sb.table("agent_goals")
-            .select(
-                "id,owner_person_id,telegram_chat_id,telegram_bot_msg_id,domain_scope,"
-                "goal_type,status,summary_title,missing_slots,pending_prompt,collected_slots,updated_at,created_at"
-            )
-            .in_("status", ["gathering_info", "awaiting_confirmation", "needs_error_fix"])
-            .order("updated_at", desc=True)
-            .limit(30)
+    def _q_accounts() -> list[dict[str, Any]]:
+        return (
+            sb.table("payment_accounts")
+            .select("id,code,display_name,account_kind,aliases")
+            .eq("is_active", True)
+            .order("sort_order")
             .execute()
             .data
             or []
         )
-        if not (r.get("collected_slots") or {}).get("is_attachment_hold")
-    ]
+
+    def _q_people() -> list[dict[str, Any]]:
+        return (
+            sb.table("people")
+            .select("id,full_name,person_type,role_tags,aliases,payout_aliases,is_default_purchase,is_default_qc")
+            .eq("is_active", True)
+            .limit(60)
+            .execute()
+            .data
+            or []
+        )
+
+    def _q_rules() -> list[dict[str, Any]]:
+        return (
+            sb.table("workshop_memory")
+            .select("category,rule_text")
+            .eq("is_active", True)
+            .order("created_at", desc=True)
+            .limit(20)
+            .execute()
+            .data
+            or []
+        )
+
+    def _q_goals() -> list[dict[str, Any]]:
+        return [
+            r
+            for r in (
+                sb.table("agent_goals")
+                .select(
+                    "id,owner_person_id,telegram_chat_id,telegram_bot_msg_id,domain_scope,"
+                    "goal_type,status,summary_title,missing_slots,pending_prompt,collected_slots,updated_at,created_at"
+                )
+                .in_("status", ["gathering_info", "awaiting_confirmation", "needs_error_fix"])
+                .order("updated_at", desc=True)
+                .limit(30)
+                .execute()
+                .data
+                or []
+            )
+            if not (r.get("collected_slots") or {}).get("is_attachment_hold")
+        ]
+
+    def _q_orders() -> list[dict[str, Any]]:
+        return (
+            sb.table("projects")
+            .select(
+                "id,project_code,customer_id,customer_name,site_area_landmark,rough_scope,"
+                "quoted_total,paid_cache_inr,pipeline_stage,material_stage,payment_stage"
+            )
+            .eq("project_type", "customer")
+            .eq("status", "active")
+            .order("updated_at", desc=True)
+            .limit(35)
+            .execute()
+            .data
+            or []
+        )
+
+    def _q_ui_prj() -> dict[str, Any] | None:
+        if not (ui_context and ui_context.get("viewing_project_id")):
+            return None
+        p_rows = (
+            sb.table("projects")
+            .select("id,project_code,customer_name,pipeline_stage,material_stage,payment_stage")
+            .eq("id", ui_context["viewing_project_id"])
+            .limit(1)
+            .execute()
+            .data
+        )
+        if not p_rows:
+            return None
+        items = (
+            sb.table("project_items")
+            .select("id,item_name,stage,production_mistri_id,assembly_mistri_id")
+            .eq("project_id", p_rows[0]["id"])
+            .execute()
+            .data
+            or []
+        )
+        return {**p_rows[0], "items": items}
+
+    def _q_recent() -> list[dict[str, Any]]:
+        return goal_intelligence.load_rolling_conversation_context(
+            sb,
+            owner_person_id=owner_person_id,
+            source_channel=source_channel,
+            telegram_chat_id=telegram_chat_id,
+        )
+
+    if hasattr(sb, "store"):
+        accounts, people, rules, raw_open_rows, active_orders_raw, ui_prj, recent_turns = (
+            _q_accounts(), _q_people(), _q_rules(), _q_goals(), _q_orders(), _q_ui_prj(), _q_recent(),
+        )
+    else:
+        with ThreadPoolExecutor(max_workers=7) as pool:
+            f_acc = pool.submit(_q_accounts)
+            f_ppl = pool.submit(_q_people)
+            f_rul = pool.submit(_q_rules)
+            f_gol = pool.submit(_q_goals)
+            f_ord = pool.submit(_q_orders)
+            f_uip = pool.submit(_q_ui_prj)
+            f_rec = pool.submit(_q_recent)
+            accounts, people, rules, raw_open_rows, active_orders_raw, ui_prj, recent_turns = (
+                f_acc.result(), f_ppl.result(), f_rul.result(), f_gol.result(), f_ord.result(), f_uip.result(), f_rec.result(),
+            )
+
+    acc_code_to_id = {a["code"]: a["id"] for a in accounts}
     open_rows = rank_open_goals_for_turn(
         raw_open_rows,
         owner_person_id=owner_person_id,
@@ -97,42 +170,7 @@ def _build_compact_grounding(
         max_goals=10,
     )
 
-    ui_prj = None
-    if ui_context and ui_context.get("viewing_project_id"):
-        p_rows = (
-            sb.table("projects")
-            .select("id,project_code,customer_name,pipeline_stage,material_stage,payment_stage")
-            .eq("id", ui_context["viewing_project_id"])
-            .limit(1)
-            .execute()
-            .data
-        )
-        if p_rows:
-            items = (
-                sb.table("project_items")
-                .select("id,item_name,stage,production_mistri_id,assembly_mistri_id")
-                .eq("project_id", p_rows[0]["id"])
-                .execute()
-                .data
-                or []
-            )
-            ui_prj = {**p_rows[0], "items": items}
-
-    active_orders_raw = (
-        sb.table("projects")
-        .select(
-            "id,project_code,customer_id,customer_name,site_area_landmark,rough_scope,"
-            "quoted_total,paid_cache_inr,pipeline_stage,material_stage,payment_stage"
-        )
-        .eq("project_type", "customer")
-        .eq("status", "active")
-        .order("updated_at", desc=True)
-        .limit(35)
-        .execute()
-        .data
-        or []
-    )
-    active_order_ids = [o["id"] for o in active_orders_raw]
+    active_order_ids = [o["id"] for o in active_orders_raw] if include_order_items else []
     active_items_raw = (
         sb.table("project_items")
         .select("id,project_id,item_name,stage,production_mistri_id,assembly_mistri_id")
@@ -148,30 +186,23 @@ def _build_compact_grounding(
     for o in active_orders_raw:
         quoted_f = float(o.get("quoted_total") or 0.0)
         paid_f = float(o.get("paid_cache_inr") or 0.0)
-        active_orders_index.append(
-            {
-                "project_id": o["id"],
-                "project_code": o["project_code"],
-                "customer_id": o.get("customer_id"),
-                "customer_name": o["customer_name"],
-                "area": o.get("site_area_landmark"),
-                "rough_scope": o.get("rough_scope"),
-                "quoted_total": quoted_f,
-                "paid_inr": paid_f,
-                "balance_pending_inr": round(max(quoted_f - paid_f, 0.0), 2),
-                "pipeline_stage": o["pipeline_stage"],
-                "material_stage": o["material_stage"],
-                "payment_stage": o["payment_stage"],
-                "items": items_by_pid.get(o["id"], []),
-            }
-        )
-
-    recent_turns = goal_intelligence.load_rolling_conversation_context(
-        sb,
-        owner_person_id=owner_person_id,
-        source_channel=source_channel,
-        telegram_chat_id=telegram_chat_id,
-    )
+        entry_o: dict[str, Any] = {
+            "project_id": o["id"],
+            "project_code": o["project_code"],
+            "customer_id": o.get("customer_id"),
+            "customer_name": o["customer_name"],
+            "area": o.get("site_area_landmark"),
+            "rough_scope": o.get("rough_scope"),
+            "quoted_total": quoted_f,
+            "paid_inr": paid_f,
+            "balance_pending_inr": round(max(quoted_f - paid_f, 0.0), 2),
+            "pipeline_stage": o["pipeline_stage"],
+            "material_stage": o["material_stage"],
+            "payment_stage": o["payment_stage"],
+        }
+        if include_order_items:
+            entry_o["items"] = items_by_pid.get(o["id"], [])
+        active_orders_index.append(entry_o)
 
     ctx = {
         "today_ist": today_ist,
@@ -214,10 +245,11 @@ def _build_system_instruction(grounding_json: str) -> str:
         "CORE PERSONAL-ASSISTANT RULES:\n"
         "1. FAST GROUNDING FIRST, TOOLS WHEN NEEDED: Check `active_orders_index`, `team_and_mistri_roster`, "
         "and `payment_accounts` in CONTEXT first! "
-        "Call `search_customers` before creating a NEW lead/customer (to catch past/completed homonyms), and call "
-        "`search_people_and_vendors` or `search_projects_and_items` for vendors, completed orders, or anything not in CONTEXT. "
-        "IMPORTANT: `active_orders_index` lists only the 35 most recently updated active orders — if a customer or order name is "
-        "NOT in `active_orders_index`, ALWAYS call `search_projects_and_items` (and `search_customers`) before concluding it does not exist. "
+        "Call `search_customers` before `stage_new_order` (to catch past/completed homonyms), and call "
+        "`search_people_and_vendors` or `search_projects_and_items` for directory edits, completed orders, or item details not in CONTEXT "
+        "(index caps at 35 recent active orders — use search_projects_and_items for older/completed orders). "
+        "IMPORTANT: For money entries (`stage_financial_entry`), call `stage_financial_entry` DIRECTLY in Round 1 — do NOT call "
+        "`search_customers` or `search_people_and_vendors` first because `stage_financial_entry` matches customers, orders, vendors, staff, and Zoho contacts automatically! "
         "Whenever asked about recent transactions, passbook entries, or payout/receipt history for a worker, vendor, customer, or account "
         "(e.g. 'last 5 transactions', 'how much advance did Rajesh Ji take'), ALWAYS call `list_recent_transactions`.\n"
         "1b. PURE TOOL-BASED ACTIONS & STATEFUL DRAFTS (`D1`, `D2`): Action tools "

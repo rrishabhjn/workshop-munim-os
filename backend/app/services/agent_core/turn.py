@@ -12,44 +12,21 @@ import sys
 from typing import Any, Literal
 
 from app.services import (
-    action_tools,
-    agent_tools,
-    attachment_memory,
-    decisions_triage,
-    goal_intelligence,
-    storage,
+    action_tools, agent_tools, attachment_memory, decisions_triage, goal_intelligence, storage, turn_cache,
 )
 from app.services.agent_core.formatting import (
-    _build_steps_for_slots,
-    _default_missing_question,
-    _format_confirmation_summary,
-    _upsert_goal_row,
+    _build_steps_for_slots, _default_missing_question, _format_confirmation_summary, _upsert_goal_row,
 )
 from app.services.agent_core.grounding import _build_compact_grounding, _build_system_instruction
-from app.services.agent_core.schemas import (
-    AgentTurnEnvelope,
-    GoalIntentItem,
-    _strip_json_fences,
-)
+from app.services.agent_core.schemas import AgentTurnEnvelope, GoalIntentItem, _strip_json_fences
 from app.services.agent_core.slot_resolvers import (
-    _accept_id,
-    _backfill_financial_slots_from_text,
-    _backfill_item_slots_from_title_and_text,
-    _backfill_material_slots_from_text,
-    _backfill_onboarding_and_open_goal_slots,
-    _build_default_missing_slot_choices,
-    _compute_missing_slots_for_op,
-    _fetch_target_row_for_slots,
-    _is_valid_uuid,
-    _map_op_to_db_goal_type,
-    _sanitize_and_resolve_slot_ids,
-    parse_initial_items_slot,
+    _accept_id, _backfill_financial_slots_from_text, _backfill_item_slots_from_title_and_text,
+    _backfill_material_slots_from_text, _backfill_onboarding_and_open_goal_slots,
+    _build_default_missing_slot_choices, _compute_missing_slots_for_op, _fetch_target_row_for_slots,
+    _is_valid_uuid, _map_op_to_db_goal_type, _sanitize_and_resolve_slot_ids, parse_initial_items_slot,
 )
 from app.services.goal_primitives import (
-    ThinkingLevel,
-    has_complex_turn_cues,
-    is_high_sensitivity_master_mutation,
-    select_hydrogen_thinking_level,
+    ThinkingLevel, has_complex_turn_cues, is_high_sensitivity_master_mutation, select_hydrogen_thinking_level,
 )
 
 logger = logging.getLogger(__name__)
@@ -79,6 +56,7 @@ async def run_agent_turn(
     """Execute one complete omnichannel AgentCore turn and return structured UI/Telegram response."""
     pkg = _pkg()
     settings = pkg.get_settings()
+    sb = turn_cache.wrap_turn_read_cache(sb)
 
     # 0. Restore recent unclaimed attachment (captionless hold or "above pdf" 15m memory)
     uploaded_gcs_paths: list[str] = []
@@ -233,38 +211,31 @@ async def run_agent_turn(
             return (m_h.group(1).strip().strip('"').strip("'") or None), "\n".join(lines[1:]).strip()
         return None, clean
 
-    async def _run_tool_calls(fn_calls: list[Any], *, cur_heard: str | None) -> list[dict[str, Any]]:
+    async def _run_tool_calls(fn_calls: list[Any], *, cur_heard: str | None) -> tuple[list[dict[str, Any]], bool]:
         nonlocal read_tools_called
         results: list[dict[str, Any]] = []
+        all_staged_cleanly = bool(fn_calls)
         for fc in fn_calls:
             raw_args = getattr(fc, "arguments", None) or {}
             args_dict = raw_args if isinstance(raw_args, dict) else json.loads(str(raw_args))
             if action_tools.is_action_tool(fc.name):
                 tool_out = await action_tools.execute_action_tool(
-                    sb,
-                    fc.name,
-                    args_dict,
-                    cart=cart,
-                    acc_code_to_id=acc_code_to_id,
-                    ui_context=ui_context,
-                    user_text=text,
-                    heard_transcript=cur_heard,
-                    reply_to_bot_msg_id=reply_to_bot_msg_id,
-                    telegram_chat_id=telegram_chat_id,
-                    pinned_goal_id=pinned_goal_id,
+                    sb, fc.name, args_dict, cart=cart, acc_code_to_id=acc_code_to_id, ui_context=ui_context,
+                    user_text=text, heard_transcript=cur_heard, reply_to_bot_msg_id=reply_to_bot_msg_id,
+                    telegram_chat_id=telegram_chat_id, pinned_goal_id=pinned_goal_id,
                 )
+                try:
+                    parsed_out = json.loads(tool_out)
+                    if not (parsed_out.get("ok") and parsed_out.get("staged")):
+                        all_staged_cleanly = False
+                except Exception:
+                    all_staged_cleanly = False
             else:
+                all_staged_cleanly = False
                 read_tools_called += 1
                 tool_out = await agent_tools.execute_read_tool(sb, fc.name, args_dict)
-            results.append(
-                {
-                    "type": "function_result",
-                    "call_id": fc.id,
-                    "name": fc.name,
-                    "result": [{"type": "text", "text": tool_out}],
-                }
-            )
-        return results
+            results.append({"type": "function_result", "call_id": fc.id, "name": fc.name, "result": [{"type": "text", "text": tool_out}]})
+        return results, all_staged_cleanly
 
     interaction = await asyncio.to_thread(
         client.interactions.create,
@@ -275,14 +246,17 @@ async def run_agent_turn(
         generation_config={"thinking_level": thinking_level},
     )
 
+    has_question_cue = "?" in (text or "") or bool(
+        re.search(r"\b(kitna|kitne|kaun|kya|balance|batao|dikhao|how much|what is)\b", (text or ""), re.I)
+    )
     for _round in range(4):
-        fn_calls = [
-            s for s in (getattr(interaction, "steps", None) or [])
-            if getattr(s, "type", None) == "function_call"
-        ]
+        fn_calls = [s for s in (getattr(interaction, "steps", None) or []) if getattr(s, "type", None) == "function_call"]
         if not fn_calls:
             break
-        fn_results = await _run_tool_calls(fn_calls, cur_heard=None)
+        fn_results, all_staged_cleanly = await _run_tool_calls(fn_calls, cur_heard=None)
+        audio_needs_transcript = bool(all_audio_files) and not bool(cart.heard_transcript)
+        if all_staged_cleanly and cart.has_items() and not has_question_cue and not audio_needs_transcript:
+            break
         interaction = await asyncio.to_thread(
             client.interactions.create,
             model=settings.gemini_live_model,

@@ -546,7 +546,7 @@ async def test_upgrade_c_no_response_format_plain_text_qa_and_inline_needs_info_
         }
     )
 
-    # 1. Interactions call omits response_format; cart ignores trailing noisy JSON echo; audio HEARD extracted
+    # 1. Interactions call omits response_format; Fix #1 early-exits in 1 round when staged & audio heard present!
     t_act = SimpleNamespace(
         id="int_c1",
         steps=[
@@ -564,18 +564,13 @@ async def test_upgrade_c_no_response_format_plain_text_qa_and_inline_needs_info_
                 },
             )
         ],
-        output_text=None,
-    )
-    t_echo = SimpleNamespace(
-        id="int_c2",
-        steps=[],
         output_text='{"intent_category":"goal_actions","goal_items":[{"operation_kind":"expense","summary_title":"duplicate echo"}]}',
     )
     # 2. Native plain-text Q&A (no JSON response_format)
     t_qa = SimpleNamespace(id="int_qa1", steps=[], output_text="HEARD: Cash balance kya hai?\nCash Galla balance ₹10,000 hai.")
 
     fake_c = MagicMock()
-    fake_c.interactions.create.side_effect = [t_act, t_echo, t_qa]
+    fake_c.interactions.create.side_effect = [t_act, t_qa]
 
     with (
         patch("app.services.agent_core.get_settings", return_value=Settings(gemini_api_key="test-key")),
