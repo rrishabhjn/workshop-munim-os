@@ -553,6 +553,228 @@ async def apply_salaried_staff_openings(
     }
 
 
+def _match_payment_account(
+    accounts: list[dict[str, Any]], query: str
+) -> dict[str, Any] | None:
+    needle = (query or "").strip().lower()
+    compact_needle = re.sub(r"\s+", "", needle)
+    if not needle:
+        return None
+    for acc in accounts:
+        candidates = [
+            str(acc.get("code") or ""),
+            str(acc.get("code") or "").replace("_", " "),
+            str(acc.get("display_name") or ""),
+            *(acc.get("aliases") or []),
+        ]
+        for cand in candidates:
+            c_low = str(cand).strip().lower()
+            if not c_low:
+                continue
+            if c_low == needle or re.sub(r"\s+", "", c_low) == compact_needle:
+                return acc
+    return None
+
+
+async def _resolve_default_location_id(
+    client: httpx.AsyncClient, ob_obj: dict[str, Any]
+) -> str | None:
+    for grp in ob_obj.get("accounts") or []:
+        for row in grp.get("accounts_list") or []:
+            if row.get("location_id"):
+                return str(row["location_id"])
+    for path, key in (("/locations", "locations"), ("/branches", "branches")):
+        resp = await zoho._zoho_request(client, "GET", path)
+        if resp.is_success:
+            rows = resp.json().get(key) or []
+            primary = next((r for r in rows if r.get("is_primary") or r.get("is_default")), None) or (rows[0] if rows else None)
+            if primary:
+                loc_id = primary.get("location_id") or primary.get("branch_id")
+                if loc_id:
+                    return str(loc_id)
+    return None
+
+
+async def apply_account_opening_balances(
+    sb: Any,
+    balances_data: list[dict[str, Any]],
+    *,
+    cutover_date: str,
+    execute: bool,
+    skip_zoho: bool = False,
+) -> dict[str, Any]:
+    """Set Zoho Books Bank/Cash/OD Opening Balances and sync Supabase Owner Pulse."""
+    if not balances_data:
+        return {"processed": 0, "updated": 0, "pulse_synced": 0, "errors": [], "items": []}
+
+    local_accs = (
+        sb.table("payment_accounts")
+        .select("*")
+        .eq("is_active", True)
+        .order("sort_order")
+        .execute()
+        .data
+        or []
+    )
+    items: list[dict[str, Any]] = []
+    errors: list[str] = []
+    desired_by_code: dict[str, float] = {}
+
+    for entry in balances_data:
+        raw_acc = str(entry.get("account") or entry.get("code") or "").strip()
+        raw_bal = entry.get("balance_inr") if entry.get("balance_inr") is not None else entry.get("balance")
+        if raw_bal is None:
+            errors.append(f"Account '{raw_acc}' missing balance_inr")
+            continue
+        matched = _match_payment_account(local_accs, raw_acc)
+        if not matched:
+            errors.append(f"Active payment_account '{raw_acc}' not found")
+            continue
+        bal = round(float(raw_bal), 2)
+        code = str(matched["code"])
+        desired_by_code[code] = bal
+        items.append(
+            {
+                "code": code,
+                "display_name": matched.get("display_name") or code,
+                "balance_inr": bal,
+                "debit_or_credit": "credit" if bal < 0 else "debit",
+                "status": "pending",
+            }
+        )
+
+    settings = zoho.get_settings()
+    if not execute or skip_zoho or not settings.zoho_enabled or not items:
+        for it in items:
+            it["status"] = "dry_run" if not execute else "zoho_skipped_or_stubbed"
+        return {"processed": len(items), "updated": 0, "pulse_synced": 0, "errors": errors, "items": items}
+
+    pulse_synced = 0
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        ba_resp = await zoho._zoho_request(client, "GET", "/bankaccounts")
+        if not ba_resp.is_success:
+            return {
+                "processed": len(items),
+                "updated": 0,
+                "pulse_synced": 0,
+                "errors": [*errors, f"GET /bankaccounts failed ({ba_resp.status_code}): {ba_resp.text[:160]}"],
+                "items": items,
+            }
+        zoho_accs = ba_resp.json().get("bankaccounts") or []
+        zoho_by_id = {
+            str(b["account_id"]): b
+            for b in zoho_accs
+            if b.get("account_id") and b.get("is_active") is not False
+        }
+        claimed_ids = {
+            str(la["zoho_account_id"])
+            for la in local_accs
+            if la.get("zoho_account_id") and str(la["zoho_account_id"]) in zoho_by_id
+        }
+        code_to_zoho_id: dict[str, str] = {}
+        for la in local_accs:
+            zid = str(la.get("zoho_account_id") or "")
+            if not zid or zid not in zoho_by_id:
+                hit = zoho._pick_matching_zoho_bank_account(la, zoho_accs, claimed_ids)
+                if hit and hit.get("account_id"):
+                    zid = str(hit["account_id"])
+                    claimed_ids.add(zid)
+            if zid:
+                code_to_zoho_id[str(la["code"])] = zid
+
+        for it in items:
+            if it["code"] not in code_to_zoho_id:
+                errors.append(f"Account '{it['display_name']}' is not mapped in Zoho Books")
+
+        # Preserve existing bank/cash opening balances for untouched active accounts.
+        ok_bt, btxns = await zoho._list_all_zoho_docs(client, "/banktransactions", "banktransactions", max_pages=10)
+        non_ob_txns = [
+            t for t in (btxns if ok_bt else [])
+            if str(t.get("transaction_type") or "").strip().lower() != "opening_balance"
+        ]
+        existing_signed_by_zid: dict[str, float] = {}
+        for t in (btxns if ok_bt else []):
+            if str(t.get("transaction_type") or "").strip().lower() != "opening_balance":
+                continue
+            tid_acc = str(t.get("account_id") or "").strip()
+            if not tid_acc:
+                continue
+            amt = round(float(t.get("amount") or 0), 2)
+            dc = str(t.get("debit_or_credit") or "debit").strip().lower()
+            existing_signed_by_zid[tid_acc] = -amt if dc == "credit" else amt
+        if ok_bt and not non_ob_txns:
+            for zid in code_to_zoho_id.values():
+                if zid not in existing_signed_by_zid and zid in zoho_by_id:
+                    bal = round(float(zoho_by_id[zid].get("balance") or 0), 2)
+                    if abs(bal) >= 0.01:
+                        existing_signed_by_zid[zid] = bal
+
+        merged_signed_by_zid = dict(existing_signed_by_zid)
+        for code, bal in desired_by_code.items():
+            zid = code_to_zoho_id.get(code)
+            if zid:
+                merged_signed_by_zid[zid] = bal
+
+        accounts_payload: list[dict[str, Any]] = []
+        for zid, signed_bal in merged_signed_by_zid.items():
+            amt = round(abs(float(signed_bal)), 2)
+            if amt < 0.01:
+                continue
+            acc_entry: dict[str, Any] = {
+                "account_id": zid,
+                "debit_or_credit": "debit" if signed_bal > 0 else "credit",
+                "bcy_amount": amt,
+                "amount": amt,
+            }
+            cur_id = str((zoho_by_id.get(zid) or {}).get("currency_id") or "").strip()
+            if cur_id:
+                acc_entry["currency_id"] = cur_id
+                acc_entry["exchange_rate"] = 1.0
+            accounts_payload.append(acc_entry)
+
+        ob_get = await zoho._zoho_request(client, "GET", "/settings/openingbalances")
+        ob_obj = (ob_get.json().get("opening_balance") or {}) if ob_get.is_success else {}
+        primary_method = "PUT" if ob_obj.get("opening_balance_id") else "POST"
+        fallback_method = "POST" if primary_method == "PUT" else "PUT"
+
+        ob_payload: dict[str, Any] = {"date": cutover_date, "accounts": accounts_payload}
+        resp = await zoho._zoho_request(client, primary_method, "/settings/openingbalances", json_body=ob_payload)
+        if not resp.is_success and resp.status_code in (400, 404, 405):
+            err_txt = resp.text.lower()
+            if "location" in err_txt or "branch" in err_txt:
+                loc_id = await _resolve_default_location_id(client, ob_obj)
+                if loc_id:
+                    ob_payload["accounts"] = [{**row, "location_id": loc_id} for row in accounts_payload]
+                    resp = await zoho._zoho_request(client, primary_method, "/settings/openingbalances", json_body=ob_payload)
+            if not resp.is_success:
+                resp = await zoho._zoho_request(client, fallback_method, "/settings/openingbalances", json_body=ob_payload)
+                if not resp.is_success and ("location" in resp.text.lower() or "branch" in resp.text.lower()):
+                    loc_id = await _resolve_default_location_id(client, ob_obj)
+                    if loc_id:
+                        ob_payload["accounts"] = [{**row, "location_id": loc_id} for row in accounts_payload]
+                        resp = await zoho._zoho_request(client, fallback_method, "/settings/openingbalances", json_body=ob_payload)
+
+        if not resp.is_success:
+            errors.append(f"{primary_method} /settings/openingbalances failed ({resp.status_code}): {resp.text[:200]}")
+            for it in items:
+                it["status"] = "failed"
+            return {"processed": len(items), "updated": 0, "pulse_synced": 0, "errors": errors, "items": items}
+
+        for it in items:
+            if it["code"] in code_to_zoho_id:
+                it["status"] = "opening_balance_set"
+
+    pulse_res = await zoho.sync_owner_pulse_snapshot(sb)
+    pulse_synced = int(pulse_res.get("accounts_synced") or 0)
+    return {
+        "processed": len(items),
+        "updated": sum(1 for it in items if it["status"] == "opening_balance_set"),
+        "pulse_synced": pulse_synced,
+        "errors": errors,
+        "items": items,
+    }
+
+
 async def load_cutover_opening(
     sb: Any,
     payload: dict[str, Any],
@@ -560,7 +782,7 @@ async def load_cutover_opening(
     execute: bool,
     skip_zoho: bool = False,
 ) -> dict[str, Any]:
-    """Run all three pre-cutover opening adjustments cleanly."""
+    """Run pre-cutover opening adjustments and optional Zoho account opening balances."""
     cutover_date = str(payload.get("cutover_date") or datetime.now(IST).date().isoformat()).strip()
     salary_month = str(payload.get("salary_month") or cutover_date[:7]).strip()
 
@@ -580,6 +802,13 @@ async def load_cutover_opening(
         execute=execute,
         skip_zoho=skip_zoho,
     )
+    balances_res = await apply_account_opening_balances(
+        sb,
+        list(payload.get("account_balances") or []),
+        cutover_date=cutover_date,
+        execute=execute,
+        skip_zoho=skip_zoho,
+    )
     return {
         "executed": execute,
         "cutover_date": cutover_date,
@@ -587,6 +816,7 @@ async def load_cutover_opening(
         "orders": orders_res,
         "vendor_udhaar": udhaar_res,
         "salaried_staff": staff_res,
+        "account_balances": balances_res,
     }
 
 
@@ -626,6 +856,19 @@ def _print_report(report: dict[str, Any]) -> None:
     for err in staff["errors"]:
         print(f"   ! ERROR: {err}")
 
+    balances = report.get("account_balances") or {"processed": 0, "updated": 0, "pulse_synced": 0, "items": [], "errors": []}
+    print(
+        f"\n4) BANK & CASH OPENING BALANCES: count={balances['processed']}, "
+        f"updated={balances['updated']}, pulse_synced={balances['pulse_synced']}"
+    )
+    for row in balances["items"]:
+        print(
+            f"   * {row['display_name']} ({row['code']}): "
+            f"{row['balance_inr']:,.2f} ({row['debit_or_credit']}) [{row['status']}]"
+        )
+    for err in balances["errors"]:
+        print(f"   ! ERROR: {err}")
+
     if not report["executed"]:
         print("\nDry-run complete. Re-run with `--execute` to apply these opening figures.\n")
     else:
@@ -633,8 +876,8 @@ def _print_report(report: dict[str, Any]) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Load pre-cutover opening orders, vendor Udhaar, and staff salaries/advances.")
-    parser.add_argument("--input", required=True, help="Path to JSON file with orders, vendor_udhaar, and salaried_staff.")
+    parser = argparse.ArgumentParser(description="Load pre-cutover opening orders, vendor Udhaar, staff salaries/advances, and account opening balances.")
+    parser.add_argument("--input", required=True, help="Path to JSON file with orders, vendor_udhaar, salaried_staff, and/or account_balances.")
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument("--dry-run", action="store_true", help="Preview changes without mutating Supabase or Zoho (default).")
     mode_group.add_argument("--execute", action="store_true", help="Apply live updates to Supabase and Zoho Books.")
@@ -658,7 +901,7 @@ def main(argv: list[str] | None = None) -> int:
             save_cli_zoho_token_cache()
     _print_report(report)
     has_errors = any(
-        report[section]["errors"] for section in ("orders", "vendor_udhaar", "salaried_staff")
+        report[section]["errors"] for section in ("orders", "vendor_udhaar", "salaried_staff", "account_balances")
     )
     return 1 if has_errors else 0
 

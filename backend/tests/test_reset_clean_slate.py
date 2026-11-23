@@ -543,6 +543,7 @@ async def test_zoho_get_access_token_uses_form_data_and_redacts_secrets_on_error
         zoho_client_secret=secret_client,
         zoho_refresh_token=secret_refresh,
     )
+    prev_cache = dict(zoho._token_cache)
     zoho._token_cache.update({"access_token": None, "expires_at": 0.0})
     try:
         with (
@@ -552,7 +553,7 @@ async def test_zoho_get_access_token_uses_form_data_and_redacts_secrets_on_error
             with pytest.raises(httpx.HTTPStatusError) as exc_info:
                 await zoho._get_access_token(force_refresh=True)
     finally:
-        zoho._token_cache.update({"access_token": None, "expires_at": 0.0})
+        zoho._token_cache.update(prev_cache)
 
     assert len(captured) == 1
     assert "params" not in captured[0]["kwargs"]
@@ -562,6 +563,108 @@ async def test_zoho_get_access_token_uses_form_data_and_redacts_secrets_on_error
     assert "Access Denied" in err_str
     assert secret_refresh not in err_str
     assert secret_client not in err_str
+
+
+@pytest.mark.asyncio
+async def test_apply_account_opening_balances_debit_credit_and_pulse_sync():
+    mod = _load_opening_module()
+    sb = _ResetFakeSupabase(
+        {
+            "payment_accounts": [
+                {
+                    "id": "a-cash",
+                    "code": "cash_galla",
+                    "display_name": "Cash",
+                    "account_kind": "cash_galla",
+                    "aliases": ["cash", "cash galla"],
+                    "zoho_account_id": "za-cash",
+                    "cached_balance_inr": 0.0,
+                    "is_active": True,
+                    "sort_order": 1,
+                },
+                {
+                    "id": "a-rgb",
+                    "code": "rgb",
+                    "display_name": "RGB",
+                    "account_kind": "bank",
+                    "aliases": ["rgb"],
+                    "zoho_account_id": "za-rgb",
+                    "cached_balance_inr": 0.0,
+                    "is_active": True,
+                    "sort_order": 3,
+                },
+                {
+                    "id": "a-ccrgb",
+                    "code": "ccrgb",
+                    "display_name": "CCRGB",
+                    "account_kind": "od_cc",
+                    "aliases": ["ccrgb", "cc rgb"],
+                    "zoho_account_id": "za-ccrgb",
+                    "cached_balance_inr": 0.0,
+                    "is_active": True,
+                    "sort_order": 4,
+                },
+            ]
+        }
+    )
+
+    balances = [
+        {"account": "cash_galla", "balance_inr": 130000},
+        {"account": "rgb", "balance_inr": 42469.68},
+        {"account": "ccrgb", "balance_inr": -1421360},
+    ]
+
+    # Dry-run makes zero Zoho writes and keeps Supabase at 0.0
+    dry = await mod.apply_account_opening_balances(sb, balances, cutover_date="2026-11-23", execute=False)
+    assert dry["processed"] == 3
+    assert dry["updated"] == 0
+    assert sb.store["payment_accounts"][0]["cached_balance_inr"] == 0.0
+
+    req = httpx.Request("POST", "https://www.zohoapis.in/books/v3/settings/openingbalances")
+    posted_ob: list[tuple[str, dict[str, Any]]] = []
+    zoho_accs = [
+        {"account_id": "za-cash", "account_name": "Cash Galla", "account_type": "cash", "currency_id": "cur-inr", "balance": 0.0, "is_active": True},
+        {"account_id": "za-rgb", "account_name": "RGB", "account_type": "bank", "currency_id": "cur-inr", "balance": 0.0, "is_active": True},
+        {"account_id": "za-ccrgb", "account_name": "CCRGB", "account_type": "bank", "currency_id": "cur-inr", "balance": 0.0, "is_active": True},
+    ]
+
+    async def fake_zoho_request(_client, method: str, path: str, *, json_body=None, **_kwargs):
+        if method == "GET" and path == "/bankaccounts":
+            return httpx.Response(200, json={"bankaccounts": zoho_accs}, request=req)
+        if method == "GET" and path == "/settings/openingbalances":
+            return httpx.Response(200, json={"opening_balance": {}}, request=req)
+        if method in ("POST", "PUT") and path == "/settings/openingbalances":
+            posted_ob.append((method, json_body))
+            # Reflect opening balances on zoho_accs for sync_owner_pulse_snapshot
+            by_id = {a["account_id"]: a for a in zoho_accs}
+            for row in json_body["accounts"]:
+                val = float(row["bcy_amount"])
+                by_id[row["account_id"]]["balance"] = -val if row["debit_or_credit"] == "credit" else val
+            return httpx.Response(200, json={"code": 0}, request=req)
+        return httpx.Response(200, json={"code": 0}, request=req)
+
+    fake_settings = SimpleNamespace(zoho_enabled=True)
+    with (
+        patch.object(mod.zoho, "get_settings", return_value=fake_settings),
+        patch.object(mod.zoho, "_zoho_request", side_effect=fake_zoho_request),
+        patch.object(mod.zoho, "_list_all_zoho_docs", new=AsyncMock(return_value=(True, []))),
+    ):
+        live = await mod.apply_account_opening_balances(sb, balances, cutover_date="2026-11-23", execute=True)
+
+    assert live["updated"] == 3
+    assert live["pulse_synced"] == 3
+    assert len(posted_ob) == 1
+    method, body = posted_ob[0]
+    assert method == "POST"
+    assert body["date"] == "2026-11-23"
+    by_zid = {r["account_id"]: r for r in body["accounts"]}
+    assert by_zid["za-cash"] == {"account_id": "za-cash", "debit_or_credit": "debit", "bcy_amount": 130000.0, "amount": 130000.0, "currency_id": "cur-inr", "exchange_rate": 1.0}
+    assert by_zid["za-rgb"] == {"account_id": "za-rgb", "debit_or_credit": "debit", "bcy_amount": 42469.68, "amount": 42469.68, "currency_id": "cur-inr", "exchange_rate": 1.0}
+    assert by_zid["za-ccrgb"] == {"account_id": "za-ccrgb", "debit_or_credit": "credit", "bcy_amount": 1421360.0, "amount": 1421360.0, "currency_id": "cur-inr", "exchange_rate": 1.0}
+
+    cached_by_code = {a["code"]: a["cached_balance_inr"] for a in sb.store["payment_accounts"]}
+    assert cached_by_code == {"cash_galla": 130000.0, "rgb": 42469.68, "ccrgb": -1421360.0}
+
 
 
 

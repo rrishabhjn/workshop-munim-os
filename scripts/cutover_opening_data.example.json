@@ -24,5 +24,19 @@
       "advance_paid_inr": 10000,
       "notes": "Nov salary advance paid before cutover"
     }
+  ],
+  "account_balances": [
+    {
+      "account": "cash_galla",
+      "balance_inr": 130000
+    },
+    {
+      "account": "rgb",
+      "balance_inr": 42469.68
+    },
+    {
+      "account": "ccrgb",
+      "balance_inr": -1421360
+    }
   ]
 }
