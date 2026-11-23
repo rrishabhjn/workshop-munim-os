@@ -124,7 +124,7 @@ class AgentGoalChecklist(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     owner_person_id: str | None = None
     source_channel: Literal["telegram", "web_command_bar", "system"] = "telegram"
-    domain_scope: Literal["production", "munim", "attendance", "shared"] = "production"
+    domain_scope: Literal["production", "inventory", "munim", "attendance", "shared"] = "production"
     goal_type: GoalType
     status: GoalStatus = "gathering_info"
     thinking_level_used: ThinkingLevel = "low"
@@ -488,11 +488,12 @@ def merge_buffered_telegram_burst(
     photo_file_ids: list[str] = []
     voice_file_ids: list[str] = []
     document_file_ids: list[str] = []
+    document_dicts: list[dict[str, Any]] = []
     reply_to_message_id: int | None = None
     latest_message_id: int | None = None
 
     for row in sorted(buffered_rows, key=lambda r: int(r.get("telegram_update_id", 0))):
-        payload = row.get("raw_payload") or {}
+        payload = row.get("raw_payload") or row.get("payload") or {}
         msg = payload.get("message") or payload.get("edited_message") or {}
         if msg.get("message_id"):
             latest_message_id = int(msg["message_id"])
@@ -511,12 +512,18 @@ def merge_buffered_telegram_burst(
         doc = msg.get("document")
         if doc and doc.get("file_id"):
             document_file_ids.append(doc["file_id"])
+            document_dicts.append({
+                "file_id": doc["file_id"],
+                "mime_type": doc.get("mime_type"),
+                "file_name": doc.get("file_name"),
+            })
 
     return {
         "combined_text": "\n".join(texts).strip(),
         "photo_file_ids": photo_file_ids,
         "voice_file_ids": voice_file_ids,
         "document_file_ids": document_file_ids,
+        "documents": document_dicts,
         "reply_to_message_id": reply_to_message_id,
         "latest_message_id": latest_message_id,
         "update_count": len(buffered_rows),
@@ -821,6 +828,8 @@ _EXPENSE_CATEGORY_ALIASES: dict[str, str] = {
     "fuel": "transport_freight",
     "material": "raw_materials",
     "materials": "raw_materials",
+    "purchase": "raw_materials",
+    "purchases": "raw_materials",
     "raw_material": "raw_materials",
     "raw_materials_and_consumables": "raw_materials",
     "raw_materials_hardware_cogs": "raw_materials",

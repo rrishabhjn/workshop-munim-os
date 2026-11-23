@@ -79,6 +79,78 @@ async def check_duplicate_bill(
     return None
 
 
+async def _resolve_draft_bill_account(
+    sb: Any,
+    client: Any,
+    *,
+    supplier_name: str,
+    expense_category: str | None = None,
+    account_name: str | None = None,
+) -> dict[str, Any] | None:
+    """Resolve Zoho Expense/COGS Chart of Accounts entry for draft bills.
+
+    Honors explicit `account_name` override or active `workshop_memory` account rules
+    for the vendor first, otherwise defaults to Materials COGS (`raw_materials`).
+    """
+    pkg = _pkg()
+    accounts = await pkg._get_chart_of_accounts(client)
+    active_exp = [
+        a
+        for a in (accounts or [])
+        if a.get("account_type") in ("expense", "cost_of_goods_sold")
+        and a.get("is_active", True)
+    ]
+    if not active_exp:
+        return None
+
+    target_name = (account_name or "").strip()
+    if not target_name and sb is not None and supplier_name:
+        sup_low = supplier_name.strip().lower()
+        try:
+            mem_rows = (
+                sb.table("workshop_memory")
+                .select("category,rule_text")
+                .eq("category", "account")
+                .eq("is_active", True)
+                .order("created_at", desc=True)
+                .limit(20)
+                .execute()
+                .data
+                or []
+            )
+            sorted_accs = sorted(
+                active_exp,
+                key=lambda a: len(str(a.get("account_name") or "")),
+                reverse=True,
+            )
+            for row in mem_rows:
+                rule = str(row.get("rule_text") or "").lower()
+                if sup_low and sup_low in rule:
+                    for acc in sorted_accs:
+                        aname = str(acc.get("account_name") or "").strip()
+                        if aname and aname.lower() in rule:
+                            return acc
+        except Exception:
+            pass
+
+    if target_name:
+        tlow = target_name.lower()
+        exact = next(
+            (a for a in active_exp if str(a.get("account_name") or "").strip().lower() == tlow),
+            None,
+        )
+        if exact:
+            return exact
+        sub = next(
+            (a for a in active_exp if tlow in str(a.get("account_name") or "").strip().lower()),
+            None,
+        )
+        if sub:
+            return sub
+
+    return pkg._pick_zoho_expense_account(accounts, expense_category or "raw_materials")
+
+
 async def create_draft_bill(
     supplier_name: str,
     invoice_no: str | None,
@@ -89,19 +161,18 @@ async def create_draft_bill(
     *,
     reference_number: str | None = None,
     project_id: str | None = None,
+    expense_category: str | None = None,
+    account_name: str | None = None,
     sb: Any = None,
 ) -> dict[str, Any]:
-    """Create a supplier bill strictly in DRAFT status in Zoho Books India.
-
-    Automated code paths must NEVER finalize/approve bills or send customer invoices.
-    """
+    """Create a confirmed supplier bill in OPEN Accounts Payable status in Zoho Books India."""
     pkg = _pkg()
     settings = pkg.get_settings()
     if not settings.zoho_enabled:
         return {
             "stubbed": True,
-            "status": "draft",
-            "message": "Zoho Books India not configured yet (Wave 2); bill logged locally.",
+            "status": "open",
+            "message": "Zoho Books India not configured yet (Wave 2); Open AP bill logged locally.",
         }
 
     order_tags: dict[str, Any] = {}
@@ -120,7 +191,7 @@ async def create_draft_bill(
                         "deduped": True,
                         "bill": {
                             "bill_id": existing_bill_id,
-                            "status": "draft",
+                            "status": "open",
                             "reference_number": reference_number,
                         },
                     }
@@ -149,22 +220,37 @@ async def create_draft_bill(
                     }
                 vendor_id = contacts[0]["contact_id"]
 
+            resolved_coa = await _resolve_draft_bill_account(
+                sb,
+                client,
+                supplier_name=supplier_name,
+                expense_category=expense_category,
+                account_name=account_name,
+            )
+            default_account_id = resolved_coa.get("account_id") if resolved_coa else None
+
             line_tags = {"tags": order_tags["tags"]} if order_tags.get("tags") else {}
             proj_prefix = f"[{bridge['cf_project_code']}] " if bridge.get("cf_project_code") else ""
+            built_items: list[dict[str, Any]] = []
+            for li in (line_items or [{"description": "Workshop Material", "rate": 0, "quantity": 1}]):
+                item_obj: dict[str, Any] = {
+                    "name": li.get("description", "Material"),
+                    "rate": li.get("rate", 0),
+                    "quantity": li.get("quantity", 1),
+                    **line_tags,
+                }
+                acc_id = li.get("account_id") or default_account_id
+                if acc_id:
+                    item_obj["account_id"] = acc_id
+                built_items.append(item_obj)
+
             payload: dict[str, Any] = {
                 "vendor_id": vendor_id,
-                "status": "draft",  # HARDCODED DRAFT-ONLY BOUNDARY
-                "bill_number": invoice_no or f"DRAFT-{int(time.time())}",
-                "notes": f"[Workshop Munim Bot Draft] {proj_prefix}{notes}".strip(),
-                "line_items": [
-                    {
-                        "name": li.get("description", "Material"),
-                        "rate": li.get("rate", 0),
-                        "quantity": li.get("quantity", 1),
-                        **line_tags,
-                    }
-                    for li in (line_items or [{"description": "Workshop Material", "rate": 0, "quantity": 1}])
-                ],
+                "status": "open",
+                "bill_number": invoice_no or f"BILL-{int(time.time())}",
+                "is_inclusive_tax": False,
+                "notes": f"[Workshop Munim AP] {proj_prefix}{notes}".strip(),
+                "line_items": built_items,
                 **order_tags,
             }
             if reference_number:
@@ -182,7 +268,11 @@ async def create_draft_bill(
                     "error_kind": classify_external_error(b_resp.status_code),
                     "error": f"Zoho Bill error {b_resp.status_code}: {b_resp.text[:160]}",
                 }
-            return {"stubbed": False, "bill": b_resp.json().get("bill", {})}
+            return {
+                "stubbed": False,
+                "bill": b_resp.json().get("bill", {}),
+                "expense_account_name": resolved_coa.get("account_name") if resolved_coa else None,
+            }
     except httpx.TimeoutException as exc:
         logger.warning("Zoho create_draft_bill timed out: %s", exc)
         return {

@@ -287,6 +287,13 @@ async def upsert_or_transition_item(
         if existing_items:
             item_id = existing_items[0]["id"]
 
+    img_paths = [
+        str(p)
+        for p in (uploaded_gcs_paths or [])
+        if str(p).lower().endswith((".webp", ".jpg", ".jpeg", ".png"))
+    ]
+    first_img_path = img_paths[-1] if img_paths else None
+
     if not item_id:
         if not item_name or not item_name.strip():
             return {"ok": False, "error_kind": "validation_400", "error": {"message": "Item name is required (e.g., Kitchen, Master Bed)."}}
@@ -303,6 +310,7 @@ async def upsert_or_transition_item(
                     "production_mistri_id": production_mistri_id,
                     "assembly_mistri_id": assembly_mistri_id,
                     "assigned_karigar": m_name or None,
+                    **({"pre_pack_photo_path": first_img_path} if first_img_path else {}),
                 }
             )
             .execute()
@@ -344,8 +352,12 @@ async def upsert_or_transition_item(
         return {"ok": False, "error_kind": "validation_400", "error": {"message": "Furniture item not found."}}
     cur = cur_rows[0]
     prior_snap = build_stage_undo_snapshot(track="item", row_before=cur)
+    if first_img_path:
+        prior_snap["pre_pack_photo_path"] = cur.get("pre_pack_photo_path")
 
     patch: dict[str, Any] = {"stage": to_stage}
+    if first_img_path:
+        patch["pre_pack_photo_path"] = first_img_path
     # Preserve production_mistri_id permanently unless explicitly changed!
     if production_mistri_id:
         patch["production_mistri_id"] = production_mistri_id

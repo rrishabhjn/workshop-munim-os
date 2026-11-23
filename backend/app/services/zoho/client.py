@@ -47,17 +47,32 @@ async def _get_access_token(force_refresh: bool = False) -> str:
             return str(cache["access_token"])
 
         url = f"{settings.zoho_accounts_base}/oauth/v2/token"
-        params = {
+        form_data = {
             "refresh_token": settings.zoho_refresh_token,
             "client_id": settings.zoho_client_id,
             "client_secret": settings.zoho_client_secret,
             "grant_type": "refresh_token",
         }
         async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(url, params=params)
-            resp.raise_for_status()
+            resp = await client.post(url, data=form_data)
+            if not resp.is_success:
+                err_msg = f"HTTP {resp.status_code}"
+                try:
+                    err_body = resp.json()
+                    if isinstance(err_body, dict) and err_body.get("error"):
+                        err_msg = str(err_body["error"])
+                except Exception:
+                    pass
+                raise httpx.HTTPStatusError(
+                    f"Zoho OAuth token refresh failed ({resp.status_code}: {err_msg})",
+                    request=httpx.Request("POST", url),
+                    response=resp,
+                )
             data = resp.json()
 
+        if not isinstance(data, dict) or not data.get("access_token"):
+            err_msg = str(data.get("error") if isinstance(data, dict) else "unknown")
+            raise RuntimeError(f"Zoho OAuth token refresh failed: {err_msg}")
         access_token = data["access_token"]
         expires_in = int(data.get("expires_in", 3600))
         cache["access_token"] = access_token

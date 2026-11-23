@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.services import goal_intelligence
+from app.services import goal_intelligence, inventory_ai
 from app.services.agent_core.slot_resolvers import parse_initial_items_slot
 from app.services.goal_primitives import (
     CheckpointedStep,
@@ -32,6 +32,11 @@ def _default_missing_question(op: str, missing: list[str]) -> str:
         "archive_entity_kind": "Record Type (Customer / Vendor / Person / Order)",
         "item_name": "Furniture Item Name (e.g. Kitchen, Bed)",
         "material_lines_json": "Raw Material Name & Quantity (e.g. 8 sheets 18mm Ply)",
+        "inventory_lines_json": "Material Name & Quantity",
+        "inventory_item_id": "Workshop Stock SKU",
+        "quantity": "Quantity",
+        "actual_qty": "Actual Physical Count",
+        "unit_rate_inr": "Unit Rate (₹)",
         "to_stage": "Target Stage",
     }
     nice = ", ".join(labels.get(m, m) for m in missing)
@@ -39,27 +44,35 @@ def _default_missing_question(op: str, missing: list[str]) -> str:
 
 
 def _format_confirmation_summary(
-    op: str, slots: dict[str, Any], before_row: dict[str, Any] | None = None
+    op: str, slots: dict[str, Any], before_row: dict[str, Any] | None = None, *, sb: Any = None
 ) -> str:
+    if op in inventory_ai.INVENTORY_OPS:
+        return inventory_ai.format_inventory_confirmation_summary(sb, op, slots)
     row = before_row or {}
     if op == "new_lead":
         q_str = f" · Est: {format_inr(slots['quoted_total'])}" if slots.get("quoted_total") else ""
         items = parse_initial_items_slot(slots)
         items_str = f"\n• Items: *{len(items)} furniture item(s)* parsed" if items else ""
-        stage_norm = (
+        adv_amt = float(slots.get("advance_amount_inr") or 0)
+        explicit_stage = (
             normalize_stage_code_for_op("pipeline_stage_move", slots.get("to_stage"))
             if slots.get("to_stage")
             else None
         )
+        stage_norm = explicit_stage or ("site_sizing_boq" if adv_amt > 0 else None)
         stage_str = (
             f"\n• Start Stage: *{stage_norm.replace('_', ' ').title()}*"
             if stage_norm and stage_norm in PROJECT_PIPELINE_STAGES and stage_norm != "lead"
             else ""
         )
+        adv_str = ""
+        if adv_amt > 0:
+            adv_acc = (slots.get("payment_account_code") or "").upper() or "TBD"
+            adv_str = f"\n• Initial Advance: *{format_inr(adv_amt)}* (`{adv_acc}` → Zoho Receipt)"
         return (
-            f"🆕 *Confirm New Lead*\n"
+            f"🆕 *Confirm New Lead{' + Advance' if adv_amt > 0 else ''}*\n"
             f"• Customer: *{slots.get('full_name')}* ({slots.get('area_landmark')})\n"
-            f"• Scope: _{slots.get('rough_scope')}_{q_str}{items_str}{stage_str}"
+            f"• Scope: _{slots.get('rough_scope')}_{q_str}{items_str}{stage_str}{adv_str}"
         )
     if op == "add_customer":
         cname = slots.get("full_name") or slots.get("party_name")
@@ -124,15 +137,23 @@ def _format_confirmation_summary(
         is_inflow = op in ("customer_receipt", "customer_payment")
         badge = "🟢 PAISA AAYA (IN)" if is_inflow else ("🔄 TRANSFER" if op == "float_transfer" else "🔴 PAISA GAYA (OUT)")
         party = slots.get("party_name") or slots.get("to_payment_account_code") or op
+        if op == "float_transfer" and slots.get("to_payment_account_code"):
+            party = f"{party} ({str(slots['to_payment_account_code']).upper()})"
         match_tag = ""
         if op != "float_transfer" and slots.get("party_name"):
-            if slots.get("is_new_payee") is True:
+            if slots.get("is_generic_expense_label"):
+                match_tag = " _(🧾 Direct Expense)_"
+            elif slots.get("matched_customer_as_site"):
+                match_tag = " _(🏠 Customer Site)_"
+            elif slots.get("is_new_payee") is True:
                 match_tag = " _(🆕 New Customer)_" if is_inflow else " _(🆕 New Vendor)_"
             elif slots.get("is_new_payee") is False or any(slots.get(k) for k in ("zoho_contact_id", "vendor_id", "person_id")):
                 match_tag = " _(✅ Matched)_"
         cat_line = ""
         if op == "expense":
             cat_line = f"\n• Category: *{get_expense_category_label(slots.get('expense_category'))}*"
+        elif op == "float_transfer":
+            cat_line = "\n• Type: *Wallet / Float Transfer (Custodian)*"
         elif op == "customer_receipt":
             cat_line = "\n• Type: *Sales / Revenue (Zoho Sales)*"
         elif op == "customer_payment":
@@ -140,26 +161,47 @@ def _format_confirmation_summary(
         elif op == "vendor_payment":
             cat_line = "\n• Type: *AP Settlement (Against Bill)*"
         order_line = ""
-        if is_inflow and slots.get("project_id"):
+        if slots.get("project_id"):
             if row.get("project_code"):
                 adv_hint = (
                     " _(→ Site Sizing / BOQ)_"
-                    if slots.get("is_explicit_advance")
+                    if is_inflow
+                    and slots.get("is_explicit_advance")
                     and row.get("pipeline_stage") in ("lead", "design", "estimating", "quoted_awaiting_advance")
                     else ""
                 )
                 order_line = f"\n• Order: *#{row['project_code']} — {row.get('customer_name') or party}*{adv_hint}"
             else:
                 order_line = f"\n• Order ID: `{slots['project_id']}`"
-        return f"{badge}: *{amt}*\n• Party/To: *{party}*{match_tag}{order_line}{cat_line}\n• Account: `{acc}`\n• Note: _{slots.get('notes') or slots.get('summary_title') or '-'}_"
+        elif slots.get("auto_create_site_order") and slots.get("site_customer_name"):
+            order_line = f"\n• Order: *➕ Auto-create new Order for {slots['site_customer_name']}* _(Site Sizing / BOQ)_"
+        amend_hdr = ""
+        if slots.get("amends_goal_id"):
+            prior_lbl = slots.get("amend_prior_summary") or f"Entry {str(slots['amends_goal_id'])[:8]}"
+            amend_hdr = f"✏️ *AMEND TODAY'S ENTRY* _(Voids `{prior_lbl}` & saves below)_\n"
+        return f"{amend_hdr}{badge}: *{amt}*\n• Party/To: *{party}*{match_tag}{order_line}{cat_line}\n• Account: `{acc}`\n• Note: _{slots.get('notes') or slots.get('summary_title') or '-'}_"
     if op == "supplier_draft_bill":
         amt = format_inr(float(slots.get("amount_inr") or 0))
         match_tag = " _(🆕 New Vendor)_" if slots.get("is_new_payee") is True else (" _(✅ Matched)_" if slots.get("is_new_payee") is False or slots.get("zoho_contact_id") or slots.get("vendor_id") else "")
+        amend_hdr = (
+            f"✏️ *AMEND TODAY'S BILL* _(Voids `{slots.get('amend_prior_summary') or str(slots['amends_goal_id'])[:8]}`)_\n"
+            if slots.get("amends_goal_id")
+            else ""
+        )
+        site_line = (
+            f"\n• Order: *#{row['project_code']} — {row.get('customer_name') or ''}*"
+            if slots.get("project_id") and row.get("project_code")
+            else (
+                f"\n• Order: *➕ Auto-create new Order for {slots.get('site_customer_name')}*"
+                if slots.get("auto_create_site_order") and slots.get("site_customer_name")
+                else ""
+            )
+        )
         return (
-            f"🧾 *Confirm Zoho Draft Bill (Payable)*\n"
-            f"• Vendor: *{slots.get('party_name')}*{match_tag}\n"
+            f"{amend_hdr}🧾 *Confirm Zoho Open Bill (AP / Udhaar)*\n"
+            f"• Vendor: *{slots.get('party_name')}*{match_tag}{site_line}\n"
             f"• Invoice: `{slots.get('invoice_no') or 'Auto'}` · Total: *{amt}*\n"
-            f"_(Strictly saved as Draft in Zoho Books for Clerk review)_"
+            f"_(Posts as Open Accounts Payable; auto-clears FIFO when vendor payment is logged)_"
         )
     if op == "customer_draft_invoice":
         amt = format_inr(float(slots.get("amount_inr") or 0))
@@ -175,14 +217,43 @@ def _format_confirmation_summary(
 
 
 def _build_steps_for_slots(op: str, slots: dict[str, Any]) -> list[dict[str, Any]]:
-    steps: list[dict[str, Any]] = [
+    steps: list[dict[str, Any]] = []
+    if slots.get("amends_goal_id"):
+        steps.append(
+            CheckpointedStep(
+                step_index=0,
+                target="zoho",
+                operation="void_prior_goal",
+                payload={"prior_goal_id": str(slots["amends_goal_id"])},
+            ).model_dump()
+        )
+    if (
+        op in ("expense", "supplier_draft_bill", "vendor_payment")
+        and slots.get("auto_create_site_order")
+        and not slots.get("project_id")
+    ):
+        steps.append(
+            CheckpointedStep(
+                step_index=len(steps),
+                target="supabase",
+                operation="auto_create_site_order",
+                payload={
+                    "customer_id": slots.get("customer_id"),
+                    "full_name": slots.get("site_customer_name") or slots.get("party_name"),
+                    "area_landmark": slots.get("site_area_hint"),
+                    "rough_scope": slots.get("notes") or slots.get("summary_title") or "Site Work",
+                },
+            ).model_dump()
+        )
+
+    steps.append(
         CheckpointedStep(
-            step_index=0,
-            target="zoho" if op in ("customer_receipt", "customer_payment", "vendor_payment", "expense", "float_transfer", "supplier_draft_bill", "customer_draft_invoice") else "supabase",
+            step_index=len(steps),
+            target="zoho" if op in ("customer_receipt", "customer_payment", "vendor_payment", "expense", "float_transfer", "supplier_draft_bill", "customer_draft_invoice", *inventory_ai.INVENTORY_OPS) else "supabase",
             operation=op,
             payload=slots,
         ).model_dump()
-    ]
+    )
     if op in ("new_lead", "update_order_details"):
         for it in parse_initial_items_slot(slots):
             steps.append(
@@ -199,11 +270,13 @@ def _build_steps_for_slots(op: str, slots: dict[str, Any]) -> list[dict[str, Any
                 ).model_dump()
             )
     if op == "new_lead":
-        lead_stage = (
+        adv_amt = float(slots.get("advance_amount_inr") or 0)
+        explicit_lead_stage = (
             normalize_stage_code_for_op("pipeline_stage_move", slots.get("to_stage"))
             if slots.get("to_stage")
             else None
         )
+        lead_stage = explicit_lead_stage or ("site_sizing_boq" if adv_amt > 0 else None)
         if lead_stage and lead_stage in PROJECT_PIPELINE_STAGES and lead_stage != "lead":
             steps.append(
                 CheckpointedStep(
@@ -230,6 +303,24 @@ def _build_steps_for_slots(op: str, slots: dict[str, Any]) -> list[dict[str, Any
                     target="supabase",
                     operation="material_stage_move",
                     payload={"to_stage": mat_stage},
+                ).model_dump()
+            )
+        if adv_amt > 0:
+            steps.append(
+                CheckpointedStep(
+                    step_index=len(steps),
+                    target="zoho",
+                    operation="customer_receipt",
+                    payload={
+                        "amount_inr": adv_amt,
+                        "payment_account_code": slots.get("payment_account_code"),
+                        "payment_account_id": slots.get("payment_account_id"),
+                        "party_name": slots.get("full_name") or slots.get("party_name"),
+                        "customer_id": slots.get("customer_id"),
+                        "is_explicit_advance": True,
+                        "txn_date": slots.get("txn_date"),
+                        "notes": slots.get("advance_notes") or slots.get("notes") or "Initial advance",
+                    },
                 ).model_dump()
             )
     return steps

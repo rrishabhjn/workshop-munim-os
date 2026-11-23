@@ -20,6 +20,8 @@ BACKUP_TABS = [
     "v_project_pnl",
     "v_whos_doing_what",
     "v_master_purchase_list",
+    "inventory_items",
+    "inventory_movements",
 ]
 
 

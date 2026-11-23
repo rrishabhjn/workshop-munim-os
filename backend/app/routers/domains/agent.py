@@ -47,7 +47,11 @@ async def execute_web_agent_turn(
     pkg = _pkg()
     sb = pkg.get_supabase_admin()
     actor_id, actor_name, can_munim = _resolve_actor_access(sb, user)
-    scope = "munim" if domain_scope == "munim" else "production"
+    scope = (
+        "munim"
+        if domain_scope == "munim"
+        else ("inventory" if domain_scope == "inventory" else "production")
+    )
     if scope == "munim" and not can_munim:
         return {
             "kind": "error",
@@ -152,7 +156,12 @@ async def undo_agent_goal(
     gid = _validate_goal_id_or_400(sb, goal_id)
     actor_id, _, _ = _enforce_goal_munim_rbac(sb, user, gid)
     try:
-        return pkg.agent_core.undo_completed_goal(sb, goal_id=gid, actor_person_id=actor_id)
+        res = await pkg.agent_core.undo_completed_goal_async(sb, goal_id=gid, actor_person_id=actor_id)
+        if not res.get("ok"):
+            raise HTTPException(status_code=400, detail=str(res.get("error") or "Could not undo action safely."))
+        return res
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.exception("Unhandled error in /agent/goals/%s/undo: %s", gid, exc)
         raise HTTPException(status_code=400, detail="Could not undo action safely.") from exc

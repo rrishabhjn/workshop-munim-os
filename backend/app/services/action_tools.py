@@ -12,6 +12,7 @@ from app.services.draft_cart import (
     goal_item_dedup_key,
 )
 from app.services.goal_primitives import make_zoho_reference_number, normalize_financial_entry_kind
+from app.services.inventory_ai import INVENTORY_ACTION_TOOLS_SCHEMA, build_inventory_candidates_from_tool
 
 ACTION_TOOLS_SCHEMA: list[dict[str, Any]] = [
     {
@@ -31,6 +32,9 @@ ACTION_TOOLS_SCHEMA: list[dict[str, Any]] = [
                 "to_stage": {"type": "string", "description": "Starting pipeline stage ('lead', 'design', 'estimating', 'site_sizing_boq', 'execution')"},
                 "material_stage": {"type": "string", "description": "Optional material stage ('check_stock', 'ordered_pending', 'all_in_shop')"},
                 "quoted_total": {"type": "number", "description": "Deal value in INR if mentioned"},
+                "advance_amount_inr": {"type": "number", "description": "Initial customer advance amount in INR if received with this new order"},
+                "payment_account_code": {"type": "string", "description": "Payment account code for the initial advance (e.g. 'cash_galla', 'axis', 'rgb')"},
+                "advance_notes": {"type": "string", "description": "Optional note for the initial advance receipt"},
                 "promised_delivery_date": {"type": "string", "description": "Delivery date YYYY-MM-DD if mentioned"},
                 "phone": {"type": "string", "description": "Customer phone number if mentioned"},
                 "specs_notes": {"type": "string", "description": "Ply/laminate/fabric/hardware specs across the order"},
@@ -168,6 +172,9 @@ ACTION_TOOLS_SCHEMA: list[dict[str, Any]] = [
                     "type": "string",
                     "description": "'salary_wages'|'contractor_labor'|'raw_materials'|'transport_freight'|'food_tea_mess'|'rent'|'utilities_office'|'repairs_maintenance'|'other_expense'",
                 },
+                "account_name": {"type": "string", "description": "Optional Zoho Chart of Accounts name override"},
+                "force_direct_expense": {"type": "boolean", "description": "Force direct expense instead of wallet float transfer for a custodian"},
+                "auto_create_site_order": {"type": "boolean", "description": "Auto-create a new active site order for the matched customer"},
                 "invoice_no": {"type": "string", "description": "Supplier invoice number if bill"},
                 "bill_line_items": {
                     "type": "array",
@@ -218,6 +225,9 @@ ACTION_TOOLS_SCHEMA: list[dict[str, Any]] = [
                 "to_stage": {"type": "string"},
                 "material_status": {"type": "string"},
                 "project_id": {"type": "string"},
+                "account_name": {"type": "string"},
+                "force_direct_expense": {"type": "boolean"},
+                "auto_create_site_order": {"type": "boolean"},
                 "dimensions": {"type": "string"},
                 "specs_notes": {"type": "string"},
                 "production_mistri": {"type": "string"},
@@ -305,6 +315,33 @@ ACTION_TOOLS_SCHEMA: list[dict[str, Any]] = [
             "required": ["operation_kind"],
         },
     },
+    {
+        "type": "function",
+        "name": "amend_recent_financial_entry",
+        "description": (
+            "Correct, re-route, or site-tag an already-confirmed financial entry from earlier TODAY "
+            "(found in `recent_completed_financial_today`, e.g. 'Actually in cash', 'via Rohit wallet', "
+            "'add above transport to Rajyawas site'). Always shows Confirm card and voids prior entry first."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "prior_goal_id": {"type": "string", "description": "Exact goal_id UUID from recent_completed_financial_today"},
+                "entry_kind": {"type": "string"},
+                "amount_inr": {"type": "number"},
+                "payment_account_code": {"type": "string"},
+                "to_payment_account_code": {"type": "string"},
+                "party_name": {"type": "string"},
+                "project_id": {"type": "string"},
+                "expense_category": {"type": "string"},
+                "account_name": {"type": "string"},
+                "force_direct_expense": {"type": "boolean"},
+                "notes": {"type": "string"},
+            },
+            "required": ["prior_goal_id"],
+        },
+    },
+    *INVENTORY_ACTION_TOOLS_SCHEMA,
 ]
 
 _ACTION_META_KEYS = frozenset(
@@ -469,6 +506,9 @@ def _build_candidates_from_tool(
                 to_stage=args.get("to_stage"),
                 material_stage=args.get("material_stage"),
                 quoted_total=args.get("quoted_total"),
+                advance_amount_inr=args.get("advance_amount_inr"),
+                payment_account_code=args.get("payment_account_code"),
+                advance_notes=args.get("advance_notes"),
                 promised_delivery_date=args.get("promised_delivery_date"),
                 phone=args.get("phone"),
                 specs_notes=args.get("specs_notes"),
@@ -553,6 +593,9 @@ def _build_candidates_from_tool(
                 project_id=args.get("project_id"),
                 is_explicit_advance=is_adv,
                 expense_category=args.get("expense_category"),
+                account_name=args.get("account_name"),
+                force_direct_expense=args.get("force_direct_expense"),
+                auto_create_site_order=args.get("auto_create_site_order"),
                 invoice_no=args.get("invoice_no"),
                 bill_line_items_json=json.dumps(line_items, ensure_ascii=False) if line_items else None,
                 txn_date=args.get("txn_date"),
@@ -602,6 +645,52 @@ def _build_candidates_from_tool(
                 **patch_fields,
             )
         ]
+
+    if name == "amend_recent_financial_entry":
+        prior_gid = str(args.get("prior_goal_id") or "").strip()
+        prior_slots: dict[str, Any] = {}
+        if prior_gid:
+            g_rows = sb.table("agent_goals").select("collected_slots,steps").eq("id", prior_gid).limit(1).execute().data or []
+            if g_rows:
+                prior_slots = dict(g_rows[0].get("collected_slots") or {})
+        op_kind = (
+            normalize_financial_entry_kind(
+                str(args["entry_kind"]), args.get("notes"), args.get("party_name"), user_text, heard_transcript
+            )
+            if args.get("entry_kind")
+            else str(prior_slots.get("operation_kind") or "expense")
+        )
+        merged_fields: dict[str, Any] = {
+            k: prior_slots.get(k)
+            for k in (
+                "party_name",
+                "amount_inr",
+                "payment_account_code",
+                "to_payment_account_code",
+                "expense_category",
+                "project_id",
+                "customer_id",
+                "vendor_id",
+                "person_id",
+                "notes",
+                "account_name",
+            )
+            if prior_slots.get(k) not in (None, "")
+        }
+        for k, v in args.items():
+            if k not in ("prior_goal_id", "entry_kind", *_ACTION_META_KEYS) and v is not None:
+                merged_fields[k] = v
+        return [
+            GoalIntentItem(
+                operation_kind=op_kind,  # type: ignore[arg-type]
+                summary_title=f"Amend {merged_fields.get('party_name') or op_kind}",
+                amends_goal_id=prior_gid or None,
+                **merged_fields,
+            )
+        ]
+
+    if name == "stage_inventory_action":
+        return [GoalIntentItem(**kw) for kw in build_inventory_candidates_from_tool(args)]
 
     # manage_directory_or_order
     op = str(args.get("operation_kind") or "update_order_details")

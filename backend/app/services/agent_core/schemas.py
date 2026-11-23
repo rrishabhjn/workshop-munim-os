@@ -11,8 +11,8 @@ from pydantic import BaseModel, Field, model_validator
 
 _NULL_STRINGS = {"", "null", "none", "nil", "n/a", "na", "undefined", "unknown", "tbd"}
 _LIST_FIELDS = {"aliases", "payout_aliases", "role_tags", "estimator_ids", "choices", "repair_options", "goal_items"}
-_FLOAT_FIELDS = {"amount_inr", "quoted_total"}
-_JSON_STRING_FIELDS = {"material_lines_json", "bill_line_items_json", "slot_patch_json", "initial_items_json"}
+_FLOAT_FIELDS = {"amount_inr", "quoted_total", "advance_amount_inr", "quantity", "actual_qty", "unit_rate_inr"}
+_JSON_STRING_FIELDS = {"material_lines_json", "bill_line_items_json", "slot_patch_json", "initial_items_json", "inventory_lines_json"}
 
 
 def _strip_json_fences(raw_text: str) -> str:
@@ -72,7 +72,7 @@ def _sanitize_gemini_nulls(raw: Any) -> Any:
         if k == "is_ambiguous":
             cleaned[k] = bool(_coerce_optional_bool(v))
             continue
-        if k in ("boq_scope_changed", "is_new_payee"):
+        if k in ("boq_scope_changed", "is_new_payee", "force_direct_expense", "auto_create_site_order", "skip_amend_check"):
             cleaned[k] = _coerce_optional_bool(v)
             continue
         if k in _JSON_STRING_FIELDS:
@@ -163,6 +163,9 @@ class GoalIntentItem(BaseModel):
         "supplier_draft_bill",
         "customer_draft_invoice",
         "add_person_or_vendor",
+        "inventory_load",
+        "inventory_attribution",
+        "inventory_count_adjust",
     ]
     summary_title: str = Field(description="Crisp 1-line summary in Hinglish/English.")
     is_ambiguous: bool = Field(
@@ -285,6 +288,22 @@ class GoalIntentItem(BaseModel):
     is_explicit_advance: bool | None = None
     txn_date: str | None = None
     invoice_no: str | None = None
+    account_name: str | None = Field(
+        default=None,
+        description="Exact Zoho Chart of Accounts name override for expenses or supplier bills (from workshop_memory or error repair).",
+    )
+    advance_amount_inr: float | None = Field(
+        default=None,
+        description="Initial customer advance amount in INR when creating a new order with advance in one message.",
+    )
+    advance_notes: str | None = None
+    amends_goal_id: str | None = Field(
+        default=None,
+        description="UUID of a same-day completed financial goal being amended/corrected.",
+    )
+    force_direct_expense: bool | None = None
+    auto_create_site_order: bool | None = None
+    skip_amend_check: bool | None = None
     bill_line_items_json: str | None = Field(
         default=None,
         description="JSON array string of [{description, quantity, rate, amount}] for supplier_draft_bill.",
@@ -293,6 +312,13 @@ class GoalIntentItem(BaseModel):
         default=None,
         description="For add_person_or_vendor: 'salaried_karigar' | 'contractor_mistri' | 'supplier' | 'contractor'",
     )
+    inventory_item_id: str | None = None
+    settlement_mode: str | None = None
+    matched_item_material_id: str | None = None
+    quantity: float | None = None
+    actual_qty: float | None = None
+    unit_rate_inr: float | None = None
+    inventory_lines_json: str | None = None
     notes: str | None = None
 
     @model_validator(mode="before")

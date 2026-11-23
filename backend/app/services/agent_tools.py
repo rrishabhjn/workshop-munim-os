@@ -13,6 +13,7 @@ from typing import Any
 
 from app.services import step_executors, zoho
 from app.services.action_tools import ACTION_TOOLS_SCHEMA
+from app.services.inventory_ai import INVENTORY_READ_TOOLS_SCHEMA, execute_inventory_read_tool
 
 
 _READ_TOOLS_SCHEMA: list[dict[str, Any]] = [
@@ -110,13 +111,15 @@ _READ_TOOLS_SCHEMA: list[dict[str, Any]] = [
     },
 ]
 
-INTERACTION_TOOLS_SCHEMA: list[dict[str, Any]] = [*_READ_TOOLS_SCHEMA, *ACTION_TOOLS_SCHEMA]
+INTERACTION_TOOLS_SCHEMA: list[dict[str, Any]] = [*_READ_TOOLS_SCHEMA, *INVENTORY_READ_TOOLS_SCHEMA, *ACTION_TOOLS_SCHEMA]
 ALL_INTERACTION_TOOLS_SCHEMA = INTERACTION_TOOLS_SCHEMA
 
 
 async def execute_read_tool(sb: Any, name: str, arguments: dict[str, Any]) -> str:
     """Dispatch a side-effect-free tool call from Gemini and return compact JSON."""
-    if name == "search_customers":
+    if name == "search_inventory":
+        res = execute_inventory_read_tool(sb, arguments)
+    elif name == "search_customers":
         res = await _tool_search_customers(
             sb,
             query=str(arguments.get("query") or ""),
@@ -259,6 +262,19 @@ def _tool_search_projects_and_items(
     items_by_prj: dict[str, list[dict[str, Any]]] = {}
     for it in items:
         items_by_prj.setdefault(it["project_id"], []).append(it)
+    open_mats_by_prj: dict[str, list[dict[str, Any]]] = {}
+    if p_ids:
+        mats_raw = (
+            sb.table("item_materials")
+            .select("id,project_id,item_id,material_name,quantity,unit,status,category")
+            .in_("project_id", p_ids)
+            .in_("status", ["needed", "ordered"])
+            .execute()
+            .data
+            or []
+        )
+        for mr in mats_raw:
+            open_mats_by_prj.setdefault(mr["project_id"], []).append(mr)
 
     results: list[dict[str, Any]] = []
     for p in projects:
@@ -275,7 +291,7 @@ def _tool_search_projects_and_items(
             ).lower()
             if q_low not in hay:
                 continue
-        results.append({**p, "items": p_items})
+        results.append({**p, "items": p_items, "open_materials": open_mats_by_prj.get(p["id"], [])[:20]})
 
     return {"projects": results[:12]}
 

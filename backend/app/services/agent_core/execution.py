@@ -10,7 +10,16 @@ import re
 import sys
 from typing import Any
 
-from app.services import goal_intelligence, step_executors, zoho
+from app.services import goal_intelligence, inventory_ai, step_executors, zoho
+from app.services.agent_core.financial_amendments import (
+    apply_financial_slot_patch_adjustments,
+    build_financial_guard_choices,
+    dedup_or_insert_vendor_or_person,
+    execute_auto_create_site_order_step,
+    execute_void_prior_goal_step,
+    is_goal_undoable_today_ist,
+    run_async_financial_or_stage_undo,
+)
 from app.services.agent_core.formatting import (
     _build_steps_for_slots,
     _default_missing_question,
@@ -283,12 +292,15 @@ async def confirm_and_execute_goal(
     ).eq("id", goal_id).execute()
 
     has_entity_undo = any(bool((s.get("result") or {}).get("entity_undo")) for s in steps)
+    fin_undoable = is_goal_undoable_today_ist(
+        {"status": "completed", "undo_event_ids": undo_ids, "steps": steps, "collected_slots": slots}
+    )
     return {
         "goal_id": goal_id,
         "status": "completed",
         "summary_title": claimed.get("summary_title"),
         "receipt": "\n".join(receipts),
-        "undo_available": len(undo_ids) > 0 or has_entity_undo,
+        "undo_available": len(undo_ids) > 0 or has_entity_undo or fin_undoable,
         "undo_event_ids": undo_ids,
         "heard_transcript": heard,
         "verified": True,
@@ -527,10 +539,7 @@ async def _run_single_step(
                 )
             )
             has_adv_word = bool(re.search(r"\b(?:advance|adv)\b", adv_text, re.IGNORECASE))
-            in_munim = goal_domain_scope in (None, "munim", "shared")
-            is_explicit_advance = bool(
-                in_munim and (slots.get("is_explicit_advance") is True or has_adv_word)
-            )
+            is_explicit_advance = bool(slots.get("is_explicit_advance") is True or has_adv_word)
         return await step_executors.execute_munim_financial_step(
             sb,
             goal_id=goal_id,
@@ -548,6 +557,14 @@ async def _run_single_step(
             expense_category=slots.get("expense_category"),
             is_explicit_advance=is_explicit_advance,
         )
+    if op == "void_prior_goal":
+        return await execute_void_prior_goal_step(
+            sb, prior_goal_id=str(slots.get("prior_goal_id") or slots.get("amends_goal_id") or "")
+        )
+    if op == "auto_create_site_order":
+        return await execute_auto_create_site_order_step(
+            sb, slots=slots, actor_person_id=actor_person_id, src=src
+        )
     if op in ("supplier_draft_bill", "customer_draft_invoice"):
         return await step_executors.execute_munim_draft_doc_step(
             sb,
@@ -557,34 +574,11 @@ async def _run_single_step(
             slots=slots,
         )
     if op == "add_person_or_vendor":
-        kind = str(slots.get("person_or_vendor_kind") or "salaried_karigar")
-        name = str(slots.get("full_name") or slots.get("party_name") or "").strip()
-        if not name:
-            return {"ok": False, "error_kind": "validation_400", "error": {"message": "Name is required."}}
-        if kind in ("supplier", "contractor"):
-            ins = sb.table("vendors").insert(
-                {
-                    "canonical_name": name,
-                    "vendor_kind": kind,
-                    "phone": slots.get("phone"),
-                    "gstin": str(slots["gstin"]).strip().upper() if slots.get("gstin") else None,
-                    "specialty": slots.get("specialty"),
-                    "aliases": slots.get("aliases") or [],
-                    "notes": slots.get("notes"),
-                }
-            ).execute().data
-            return {"ok": True, "vendor_id": ins[0]["id"], "receipt": f"Added Vendor *{ins[0]['canonical_name']}* ({kind})"}
-        ins = sb.table("people").insert(
-            {
-                "full_name": name,
-                "person_type": "contractor_mistri" if kind == "contractor_mistri" else "salaried_karigar",
-                "role_tags": slots.get("role_tags") or ["mistri"],
-                "phone": slots.get("phone"),
-                "aliases": slots.get("aliases") or [],
-                "payout_aliases": slots.get("payout_aliases") or [],
-            }
-        ).execute().data
-        return {"ok": True, "person_id": ins[0]["id"], "receipt": f"Added Mistri *{ins[0]['full_name']}* to Roster"}
+        return dedup_or_insert_vendor_or_person(sb, slots)
+    if op in inventory_ai.INVENTORY_OPS:
+        return await inventory_ai.run_inventory_goal_step(
+            sb, goal_id=goal_id, step_index=step_index, op=op, slots=slots, actor_person_id=actor_person_id, source_channel=src
+        )
 
     return {"ok": False, "error_kind": "validation_400", "error": {"message": f"Unsupported step '{op}'."}}
 
@@ -647,8 +641,7 @@ async def apply_slot_patch_and_resume(
     prior_slots = dict(g.get("collected_slots") or {})
     explicit_op = str(slot_patch["operation_kind"]).strip() if slot_patch.get("operation_kind") else None
     merged_slots = _sanitize_gemini_nulls({**prior_slots, **slot_patch})
-    if "project_id" in slot_patch and slot_patch["project_id"] is None:
-        merged_slots.pop("project_id", None)
+    apply_financial_slot_patch_adjustments(sb, merged_slots=merged_slots, slot_patch=slot_patch)
     _backfill_financial_slots_from_text(
         sb,
         merged_slots,
@@ -703,18 +696,23 @@ async def apply_slot_patch_and_resume(
         }
 
     target_before_row = _fetch_target_row_for_slots(sb, op, merged_slots)
-    is_auto_commit = op in ("pipeline_stage_move", "material_stage_move", "item_upsert_or_move", "item_material_upsert") or (
+    is_auto_commit = op in ("pipeline_stage_move", "material_stage_move", "item_upsert_or_move", "item_material_upsert") or inventory_ai.is_inventory_auto_commit(op, merged_slots) or (
         op in ("update_customer", "update_vendor", "update_person", "update_order_details")
         and not is_high_sensitivity_master_mutation(op, merged_slots, target_before_row)
     )
-    if g.get("status") == "gathering_info" and not is_auto_commit:
-        confirm_card_text = _format_confirmation_summary(op, merged_slots, target_before_row)
+    is_guard_toggle = g.get("status") == "awaiting_confirmation" and any(
+        k in slot_patch
+        for k in ("force_direct_expense", "skip_amend_check", "auto_create_site_order", "skip_site_prompt")
+    )
+    if (g.get("status") == "gathering_info" or is_guard_toggle) and not is_auto_commit:
+        confirm_card_text = _format_confirmation_summary(op, merged_slots, target_before_row, sb=sb)
+        next_choices = build_financial_guard_choices(op, merged_slots)
         sb.table("agent_goals").update(
             {
                 "collected_slots": merged_slots,
                 "missing_slots": [],
                 "pending_prompt": confirm_card_text,
-                "repair_options": [],
+                "repair_options": next_choices,
                 "steps": steps,
                 "project_id": merged_slots.get("project_id"),
                 "customer_id": merged_slots.get("customer_id"),
@@ -726,7 +724,7 @@ async def apply_slot_patch_and_resume(
             "status": "awaiting_confirmation",
             "summary_title": g.get("summary_title"),
             "prompt": confirm_card_text,
-            "choices": [],
+            "choices": next_choices,
             "project_id": merged_slots.get("project_id"),
             "collected_slots": merged_slots,
         }
@@ -779,7 +777,7 @@ def edit_open_goal_slots(
         parse_initial_items_slot(merged_slots)
     steps = _build_steps_for_slots(op, merged_slots)
     target_before_row = _fetch_target_row_for_slots(sb, op, merged_slots)
-    confirm_card_text = _format_confirmation_summary(op, merged_slots, target_before_row)
+    confirm_card_text = _format_confirmation_summary(op, merged_slots, target_before_row, sb=sb)
 
     sb.table("agent_goals").update(
         {
@@ -851,6 +849,15 @@ def undo_completed_goal(
 
     sb.table("agent_goals").update({"status": "undone"}).eq("id", goal_id).execute()
     return {"ok": True, "reverted": reverted}
+
+
+async def undo_completed_goal_async(
+    sb: Any, *, goal_id: str, actor_person_id: str | None = None
+) -> dict[str, Any]:
+    """1-tap [↩️ Undo] supporting both sync stage/entity reverts and live same-day Zoho reversals."""
+    return await run_async_financial_or_stage_undo(
+        sb, goal_id=goal_id, actor_person_id=actor_person_id, sync_undo_fn=undo_completed_goal
+    )
 
 
 def park_goal_for_clerk(sb: Any, goal_id: str) -> dict[str, Any]:

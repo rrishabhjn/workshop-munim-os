@@ -7,7 +7,7 @@ import re
 from typing import Any
 import uuid
 
-from app.services import step_executors
+from app.services import inventory_ai, step_executors
 from app.services.agent_core.schemas import _NULL_STRINGS
 from app.services.goal_primitives import (
     MATERIAL_TRACK_STAGES,
@@ -49,6 +49,7 @@ def _map_op_to_db_goal_type(op: str) -> str:
         "supplier_draft_bill": "supplier_bill",
         "customer_draft_invoice": "financial_txn",
         "add_person_or_vendor": "entity_onboarding",
+        "inventory_load": "inventory_load", "inventory_attribution": "inventory_attribution", "inventory_count_adjust": "inventory_adjust",
     }
     return mapping.get(op, "stage_update")
 
@@ -223,6 +224,14 @@ def _backfill_financial_slots_from_text(
 ) -> None:
     """Ensure amount_inr, payment_account_code, expense_category, and party_name are populated cleanly."""
     op = str(slots.get("operation_kind") or "")
+    if op == "new_lead" and float(slots.get("advance_amount_inr") or 0) > 0:
+        if not slots.get("payment_account_code"):
+            acc_code = _extract_payment_account_code_from_text(
+                sb, user_text, heard_transcript, slots.get("summary_title"), slots.get("advance_notes")
+            )
+            if acc_code:
+                slots["payment_account_code"] = acc_code
+        return
     if op not in (
         "customer_receipt",
         "customer_payment",
@@ -444,6 +453,7 @@ def _sanitize_and_resolve_slot_ids(sb: Any, slots: dict[str, Any]) -> None:
         "item_material_upsert",
         "update_order_details",
         "customer_draft_invoice",
+        "inventory_attribution",
     ):
         hint = slots.get("party_name") or slots.get("full_name")
         resolved_pid = _resolve_project_id_by_hint(sb, hint)
@@ -541,6 +551,7 @@ def _sanitize_and_resolve_slot_ids(sb: Any, slots: dict[str, Any]) -> None:
             tc_key = str(slots["to_payment_account_code"]).strip().lower()
             if tc_key in code_map:
                 slots["to_payment_account_code"], slots["to_payment_account_id"] = code_map[tc_key]
+    inventory_ai.resolve_inventory_slots(sb, slots, _resolve_project_id_by_hint)
 
 
 def _backfill_material_slots_from_text(
@@ -766,9 +777,14 @@ def _backfill_onboarding_and_open_goal_slots(
 
 def _compute_missing_slots_for_op(op: str, slots: dict[str, Any]) -> list[str]:
     """Compute required missing slots deterministically for a given operation kind."""
+    if op in inventory_ai.INVENTORY_OPS:
+        return inventory_ai.compute_inventory_missing_slots(op, slots)
     missing: list[str] = []
-    if op == "new_lead" and not slots.get("customer_id"):
-        missing = compute_missing_customer_onboarding_slots(slots)
+    if op == "new_lead":
+        if not slots.get("customer_id"):
+            missing = compute_missing_customer_onboarding_slots(slots)
+        if float(slots.get("advance_amount_inr") or 0) > 0 and not slots.get("payment_account_id"):
+            missing.append("payment_account_code")
     elif op == "add_customer":
         if not (slots.get("full_name") or slots.get("party_name")):
             missing.append("full_name")
@@ -855,10 +871,15 @@ def _build_default_missing_slot_choices(
 
     if missing_slot in ("payment_account_code", "to_payment_account_code"):
         acc_rows = sb.table("payment_accounts").select("code,display_name,account_kind,sort_order").eq("is_active", True).order("sort_order").execute().data or []
-        pref_rank = {c: idx for idx, c in enumerate(("cash_galla", "axis", "rgb", "float_ansh"))}
+        pref_rank = {
+            c: idx
+            for idx, c in enumerate(
+                ("cash_galla", "axis", "rgb", "float_rohit", "float_kamlesh", "ccrgb", "float_ansh")
+            )
+        }
         ordered = sorted(
             [a for a in acc_rows if a.get("code")],
-            key=lambda a: (pref_rank.get(str(a["code"]).strip().lower(), 4), int(a.get("sort_order") or 999), str(a["code"])),
+            key=lambda a: (pref_rank.get(str(a["code"]).strip().lower(), len(pref_rank)), int(a.get("sort_order") or 999), str(a["code"])),
         )
         return [
             {

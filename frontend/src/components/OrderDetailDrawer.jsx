@@ -1,13 +1,15 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   Archive,
+  Camera,
   Check,
   ChevronDown,
   ChevronUp,
   Copy,
   FileText,
   History,
+  Image,
   Pencil,
   Plus,
   Share2,
@@ -16,6 +18,7 @@ import {
 } from "lucide-react";
 import { apiFetch } from "../lib/api";
 import { formatDate, formatINR } from "../lib/format";
+import { matchStockSkuForMaterial } from "../lib/inventoryMatch";
 import { shareKarigarJobCard } from "../lib/jobCard";
 
 const MATERIAL_UNITS = [
@@ -74,6 +77,7 @@ export default function OrderDetailDrawer({
   order,
   lookups,
   people,
+  inventoryItems = [],
   onClose,
   onMutated,
   onShowUndoToast,
@@ -86,6 +90,11 @@ export default function OrderDetailDrawer({
   const [copiedMsg, setCopiedMsg] = useState(false);
 
   const [newMatForm, setNewMatForm] = useState({});
+  const [orderWideMat, setOrderWideMat] = useState({
+    material_name: "",
+    quantity: "1",
+    unit: "sheets",
+  });
   const [newItemName, setNewItemName] = useState("");
   const [newItemMistri, setNewItemMistri] = useState("");
 
@@ -93,6 +102,10 @@ export default function OrderDetailDrawer({
   const [editingOrder, setEditingOrder] = useState(null);
   const [timeline, setTimeline] = useState(null);
   const [busyKey, setBusyKey] = useState(null);
+  const [uploadErr, setUploadErr] = useState("");
+  const orderAttachRef = useRef(null);
+  const itemPhotoRef = useRef(null);
+  const photoUploadItemIdRef = useRef(null);
 
   useEffect(() => {
     setExpandedItemId(null);
@@ -156,6 +169,8 @@ export default function OrderDetailDrawer({
           materialName: (m.material_name || "").trim(),
           unit,
           totalQty: 0,
+          neededQty: 0,
+          firstNeededRow: null,
           statuses: new Set(),
           materialIds: [],
           breakdown: [],
@@ -164,9 +179,13 @@ export default function OrderDetailDrawer({
       const entry = aggMap.get(key);
       const q = Number(m.quantity || 0);
       entry.totalQty = Number((entry.totalQty + q).toFixed(2));
+      if ((m.status || "needed") === "needed") {
+        entry.neededQty = Number((entry.neededQty + q).toFixed(2));
+        if (!entry.firstNeededRow) entry.firstNeededRow = m;
+      }
       entry.statuses.add(m.status || "needed");
       entry.materialIds.push(m.id);
-      const iName = itemNameById[m.item_id] || "Item";
+      const iName = itemNameById[m.item_id] || "Order-Wide";
       const existingBr = entry.breakdown.find((b) => b.itemName === iName);
       if (existingBr) {
         existingBr.qty = Number((existingBr.qty + q).toFixed(2));
@@ -202,6 +221,50 @@ export default function OrderDetailDrawer({
       if (res?.url) {
         window.open(res.url, "_blank", "noopener,noreferrer");
       }
+    } finally {
+      setBusyKey(null);
+    }
+  }
+
+  async function handleOrderAttachmentFile(e) {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file || !order?.id) return;
+    setUploadErr("");
+    setBusyKey("att_upload");
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      await apiFetch(`/api/production/orders/${order.id}/attachments`, {
+        method: "POST",
+        body: fd,
+      });
+      await onMutated();
+    } catch (err) {
+      setUploadErr(err?.message || "Attachment upload failed.");
+    } finally {
+      setBusyKey(null);
+    }
+  }
+
+  async function handleItemPhotoFile(e) {
+    const file = e.target.files?.[0];
+    const targetItemId = photoUploadItemIdRef.current;
+    e.target.value = "";
+    photoUploadItemIdRef.current = null;
+    if (!file || !targetItemId) return;
+    setUploadErr("");
+    setBusyKey(`item_photo:${targetItemId}`);
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      await apiFetch(`/api/production/items/${targetItemId}/photo`, {
+        method: "POST",
+        body: fd,
+      });
+      await onMutated();
+    } catch (err) {
+      setUploadErr(err?.message || "Item photo upload failed.");
     } finally {
       setBusyKey(null);
     }
@@ -420,6 +483,75 @@ export default function OrderDetailDrawer({
     }
   }
 
+  async function handleAddOrderWideMaterial(e) {
+    e.preventDefault();
+    const mName = (orderWideMat.material_name || "").trim();
+    if (!mName) return;
+    setUploadErr("");
+    setBusyKey("mat-order-wide");
+    try {
+      const res = await apiFetch(`/api/production/orders/${order.id}/materials`, {
+        method: "POST",
+        body: JSON.stringify({
+          material_name: mName,
+          quantity: Math.max(Number(orderWideMat.quantity || 1), 0.01),
+          unit: orderWideMat.unit || "sheets",
+          status: "needed",
+        }),
+      });
+      setOrderWideMat((prev) => ({ ...prev, material_name: "", quantity: "1" }));
+      await onMutated();
+      if (res?.undo_event_ids?.length) {
+        onShowUndoToast(res.receipt || `Added ${mName}`, res.undo_event_ids);
+      }
+    } catch (err) {
+      let msg = err?.message || "Failed adding order material";
+      if (msg.startsWith("{")) {
+        try {
+          msg = JSON.parse(msg)?.detail || msg;
+        } catch {
+          // keep raw message
+        }
+      }
+      setUploadErr(msg);
+    } finally {
+      setBusyKey(null);
+    }
+  }
+
+  async function handlePullStockForMaterial(sku, { projectId, itemId, itemMaterialId, pullQty }) {
+    setUploadErr("");
+    setBusyKey(`pull-${itemMaterialId || sku.id}`);
+    try {
+      const res = await apiFetch("/api/inventory/attribute", {
+        method: "POST",
+        body: JSON.stringify({
+          inventory_item_id: sku.id,
+          project_id: projectId,
+          item_id: itemId || null,
+          item_material_id: itemMaterialId || null,
+          quantity: pullQty,
+        }),
+      });
+      await onMutated();
+      if (res?.undo_event_ids?.length) {
+        onShowUndoToast(res.receipt || `Pulled ${sku.name}`, res.undo_event_ids);
+      }
+    } catch (err) {
+      let msg = err?.message || "Failed pulling stock for order";
+      if (msg.startsWith("{")) {
+        try {
+          msg = JSON.parse(msg)?.detail || msg;
+        } catch {
+          // keep raw message
+        }
+      }
+      setUploadErr(msg);
+    } finally {
+      setBusyKey(null);
+    }
+  }
+
   async function handleCopyToOrderWhatsApp() {
     const neededMats = allMaterials.filter((m) => m.status === "needed");
     const sourceList = neededMats.length > 0 ? neededMats : allMaterials;
@@ -442,7 +574,7 @@ export default function OrderDetailDrawer({
       const row = agg.get(k);
       const q = Number(m.quantity || 0);
       row.qty = Number((row.qty + q).toFixed(2));
-      const iName = itemNameById[m.item_id] || "Item";
+      const iName = itemNameById[m.item_id] || "Order-Wide";
       row.items.set(iName, Number(((row.items.get(iName) || 0) + q).toFixed(2)));
     }
 
@@ -586,6 +718,30 @@ export default function OrderDetailDrawer({
                   </button>
                 );
               })}
+
+              <input
+                ref={orderAttachRef}
+                type="file"
+                accept="image/*,application/pdf"
+                onChange={handleOrderAttachmentFile}
+                className="hidden"
+              />
+              <input
+                ref={itemPhotoRef}
+                type="file"
+                accept="image/*"
+                onChange={handleItemPhotoFile}
+                className="hidden"
+              />
+              <button
+                type="button"
+                disabled={busyKey === "att_upload"}
+                onClick={() => orderAttachRef.current?.click()}
+                className="min-h-[36px] px-2.5 rounded-lg border border-stone-200 bg-white font-semibold text-stone-700 flex items-center gap-1"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                <span>{busyKey === "att_upload" ? "Uploading..." : "Attach Spec / Sizing"}</span>
+              </button>
             </div>
 
             {order.pipeline_stage !== "lost" && (
@@ -599,6 +755,12 @@ export default function OrderDetailDrawer({
               </button>
             )}
           </div>
+
+          {uploadErr && (
+            <p className="text-xs font-medium text-rose-700 bg-rose-50 border border-rose-200 rounded-lg px-2.5 py-1.5">
+              {uploadErr}
+            </p>
+          )}
 
           {showOrderControls && (
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 pt-1 bg-stone-50 p-3 rounded-xl border border-stone-200">
@@ -1024,55 +1186,82 @@ export default function OrderDetailDrawer({
 
                               {itemMats.length > 0 && (
                                 <div className="space-y-1.5">
-                                  {itemMats.map((m) => (
-                                    <div
-                                      key={m.id}
-                                      className="bg-white rounded-lg border border-stone-200 px-2.5 py-2 flex items-center justify-between gap-2"
-                                    >
-                                      <div className="min-w-0 flex-1">
-                                        <div className="flex items-center gap-1.5 flex-wrap">
-                                          <span className="font-semibold text-xs text-stone-900">
-                                            {m.material_name}
-                                          </span>
-                                          <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-stone-100 text-stone-600">
-                                            {catLabelMap[m.category] || m.category}
-                                          </span>
+                                  {itemMats.map((m) => {
+                                    const stockSku =
+                                      (m.status || "needed") === "needed"
+                                        ? matchStockSkuForMaterial(inventoryItems, m)
+                                        : null;
+                                    return (
+                                      <div
+                                        key={m.id}
+                                        className="bg-white rounded-lg border border-stone-200 px-2.5 py-2 flex flex-wrap sm:flex-nowrap items-center justify-between gap-2"
+                                      >
+                                        <div className="min-w-0 flex-1">
+                                          <div className="flex items-center gap-1.5 flex-wrap">
+                                            <span className="font-semibold text-xs text-stone-900">
+                                              {m.material_name}
+                                            </span>
+                                            <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-stone-100 text-stone-600">
+                                              {catLabelMap[m.category] || m.category}
+                                            </span>
+                                          </div>
+                                          <div className="text-xs text-stone-600 font-medium">
+                                            {fmtQty(m.quantity)} {m.unit}
+                                          </div>
                                         </div>
-                                        <div className="text-xs text-stone-600 font-medium">
-                                          {fmtQty(m.quantity)} {m.unit}
+
+                                        <div className="flex items-center gap-1.5 flex-wrap shrink-0">
+                                          {stockSku && (
+                                            <button
+                                              type="button"
+                                              disabled={busyKey === `pull-${m.id}`}
+                                              onClick={() =>
+                                                handlePullStockForMaterial(stockSku, {
+                                                  projectId: order.id,
+                                                  itemId: m.item_id || it.id,
+                                                  itemMaterialId: m.id,
+                                                  pullQty: Math.min(
+                                                    Number(m.quantity || 1),
+                                                    Number(stockSku.on_hand_qty || 0)
+                                                  ),
+                                                })
+                                              }
+                                              className="min-h-[36px] px-2.5 rounded-lg bg-emerald-50 border border-emerald-300 text-emerald-900 text-[11px] font-bold"
+                                            >
+                                              🟢 {fmtQty(stockSku.on_hand_qty)} in Stock · Pull
+                                            </button>
+                                          )}
+
+                                          <select
+                                            value={m.status || "needed"}
+                                            disabled={busyKey === m.id}
+                                            onChange={(e) =>
+                                              handleMaterialStatusPatch(m.id, e.target.value)
+                                            }
+                                            className={`min-h-[36px] px-2 rounded-lg border text-xs font-bold ${
+                                              MATERIAL_STATUS_PILL_CLASS[m.status || "needed"]
+                                            }`}
+                                          >
+                                            {MATERIAL_STATUS_OPTIONS.map((opt) => (
+                                              <option key={opt.code} value={opt.code}>
+                                                {opt.label}
+                                              </option>
+                                            ))}
+                                          </select>
+
+                                          <button
+                                            type="button"
+                                            disabled={busyKey === m.id}
+                                            onClick={() => handleDeleteMaterial(m.id)}
+                                            title="Remove material line"
+                                            className="min-h-[36px] min-w-[36px] rounded-lg border border-stone-200 text-stone-400 hover:text-rose-700 hover:bg-rose-50 flex items-center justify-center"
+                                          >
+                                            <Trash2 className="w-3.5 h-3.5" />
+                                          </button>
                                         </div>
                                       </div>
-
-                                      <div className="flex items-center gap-1.5 shrink-0">
-                                        <select
-                                          value={m.status || "needed"}
-                                          disabled={busyKey === m.id}
-                                          onChange={(e) =>
-                                            handleMaterialStatusPatch(m.id, e.target.value)
-                                          }
-                                          className={`min-h-[36px] px-2 rounded-lg border text-xs font-bold ${
-                                            MATERIAL_STATUS_PILL_CLASS[m.status || "needed"]
-                                          }`}
-                                        >
-                                          {MATERIAL_STATUS_OPTIONS.map((opt) => (
-                                            <option key={opt.code} value={opt.code}>
-                                              {opt.label}
-                                            </option>
-                                          ))}
-                                        </select>
-
-                                        <button
-                                          type="button"
-                                          disabled={busyKey === m.id}
-                                          onClick={() => handleDeleteMaterial(m.id)}
-                                          title="Remove material line"
-                                          className="min-h-[36px] min-w-[36px] rounded-lg border border-stone-200 text-stone-400 hover:text-rose-700 hover:bg-rose-50 flex items-center justify-center"
-                                        >
-                                          <Trash2 className="w-3.5 h-3.5" />
-                                        </button>
-                                      </div>
-                                    </div>
-                                  ))}
+                                    );
+                                  })}
                                 </div>
                               )}
 
@@ -1160,23 +1349,56 @@ export default function OrderDetailDrawer({
                                 </span>
                               </button>
 
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  shareKarigarJobCard({
-                                    projectCode: order.project_code,
-                                    customerArea: order.site_area_landmark,
-                                    item: it,
-                                    shopMistriName: shopName,
-                                    siteMistriName: siteName,
-                                    materials: itemMats,
-                                  })
-                                }
-                                className="min-h-[38px] px-3 rounded-lg border border-amber-300 bg-amber-50 text-amber-950 text-xs font-semibold flex items-center gap-1.5"
-                              >
-                                <Share2 className="w-3.5 h-3.5" />
-                                <span>Job Card</span>
-                              </button>
+                              <div className="flex items-center gap-2 flex-wrap">
+                                {it.pre_pack_photo_path && (
+                                  <button
+                                    type="button"
+                                    disabled={busyKey === `att:${it.pre_pack_photo_path}`}
+                                    onClick={() => handleOpenAttachment(it.pre_pack_photo_path)}
+                                    className="min-h-[38px] px-3 rounded-lg border border-emerald-200 bg-emerald-50 text-emerald-900 text-xs font-semibold flex items-center gap-1.5"
+                                  >
+                                    <Image className="w-3.5 h-3.5" />
+                                    <span>View Photo</span>
+                                  </button>
+                                )}
+
+                                <button
+                                  type="button"
+                                  disabled={busyKey === `item_photo:${it.id}`}
+                                  onClick={() => {
+                                    photoUploadItemIdRef.current = it.id;
+                                    itemPhotoRef.current?.click();
+                                  }}
+                                  className="min-h-[38px] px-3 rounded-lg border border-stone-300 bg-white text-stone-700 text-xs font-semibold flex items-center gap-1.5"
+                                >
+                                  <Camera className="w-3.5 h-3.5" />
+                                  <span>
+                                    {busyKey === `item_photo:${it.id}`
+                                      ? "Saving..."
+                                      : it.pre_pack_photo_path
+                                      ? "Retake Photo"
+                                      : "Photo"}
+                                  </span>
+                                </button>
+
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    shareKarigarJobCard({
+                                      projectCode: order.project_code,
+                                      customerArea: order.site_area_landmark,
+                                      item: it,
+                                      shopMistriName: shopName,
+                                      siteMistriName: siteName,
+                                      materials: itemMats,
+                                    })
+                                  }
+                                  className="min-h-[38px] px-3 rounded-lg border border-amber-300 bg-amber-50 text-amber-950 text-xs font-semibold flex items-center gap-1.5"
+                                >
+                                  <Share2 className="w-3.5 h-3.5" />
+                                  <span>Job Card</span>
+                                </button>
+                              </div>
                             </div>
 
                             {showMistriForm && (
@@ -1371,10 +1593,14 @@ export default function OrderDetailDrawer({
                           g.statuses.size === 1
                             ? Array.from(g.statuses)[0]
                             : "mixed";
+                        const rollupStockSku =
+                          g.firstNeededRow
+                            ? matchStockSkuForMaterial(inventoryItems, g.firstNeededRow)
+                            : null;
                         return (
                           <div
                             key={g.key}
-                            className="px-3.5 py-2.5 flex items-center justify-between gap-2"
+                            className="px-3.5 py-2.5 flex flex-wrap sm:flex-nowrap items-center justify-between gap-2"
                           >
                             <div className="min-w-0 flex-1 space-y-0.5">
                               <div className="flex items-center gap-2 flex-wrap">
@@ -1392,30 +1618,53 @@ export default function OrderDetailDrawer({
                               </div>
                             </div>
 
-                            <select
-                              value={statusVal}
-                              disabled={busyKey === `bulk-${g.materialIds[0]}`}
-                              onChange={(e) => {
-                                if (e.target.value !== "mixed") {
-                                  handleBulkStatus(g.materialIds, e.target.value);
-                                }
-                              }}
-                              className={`min-h-[38px] px-2.5 rounded-lg border text-xs font-bold shrink-0 ${
-                                MATERIAL_STATUS_PILL_CLASS[statusVal] ||
-                                MATERIAL_STATUS_PILL_CLASS.mixed
-                              }`}
-                            >
-                              {statusVal === "mixed" && (
-                                <option value="mixed" disabled>
-                                  Mixed
-                                </option>
+                            <div className="flex items-center gap-1.5 flex-wrap shrink-0">
+                              {rollupStockSku && g.firstNeededRow && (
+                                <button
+                                  type="button"
+                                  disabled={busyKey === `pull-${g.firstNeededRow.id}`}
+                                  onClick={() =>
+                                    handlePullStockForMaterial(rollupStockSku, {
+                                      projectId: order.id,
+                                      itemId: g.firstNeededRow.item_id || null,
+                                      itemMaterialId: g.firstNeededRow.id,
+                                      pullQty: Math.min(
+                                        Number(g.firstNeededRow.quantity || 1),
+                                        Number(rollupStockSku.on_hand_qty || 0)
+                                      ),
+                                    })
+                                  }
+                                  className="min-h-[38px] px-2.5 rounded-lg bg-emerald-50 border border-emerald-300 text-emerald-900 text-[11px] font-bold"
+                                >
+                                  🟢 {fmtQty(rollupStockSku.on_hand_qty)} in Stock · Pull
+                                </button>
                               )}
-                              {MATERIAL_STATUS_OPTIONS.map((opt) => (
-                                <option key={opt.code} value={opt.code}>
-                                  {opt.label}
-                                </option>
-                              ))}
-                            </select>
+
+                              <select
+                                value={statusVal}
+                                disabled={busyKey === `bulk-${g.materialIds[0]}`}
+                                onChange={(e) => {
+                                  if (e.target.value !== "mixed") {
+                                    handleBulkStatus(g.materialIds, e.target.value);
+                                  }
+                                }}
+                                className={`min-h-[38px] px-2.5 rounded-lg border text-xs font-bold shrink-0 ${
+                                  MATERIAL_STATUS_PILL_CLASS[statusVal] ||
+                                  MATERIAL_STATUS_PILL_CLASS.mixed
+                                }`}
+                              >
+                                {statusVal === "mixed" && (
+                                  <option value="mixed" disabled>
+                                    Mixed
+                                  </option>
+                                )}
+                                {MATERIAL_STATUS_OPTIONS.map((opt) => (
+                                  <option key={opt.code} value={opt.code}>
+                                    {opt.label}
+                                  </option>
+                                ))}
+                              </select>
+                            </div>
                           </div>
                         );
                       })}
@@ -1423,6 +1672,52 @@ export default function OrderDetailDrawer({
                   </div>
                 ))
               )}
+
+              {/* Quick Add Order-Wide Material Bar */}
+              <form
+                onSubmit={handleAddOrderWideMaterial}
+                className="bg-white rounded-xl border border-dashed border-stone-300 p-3 flex flex-wrap sm:flex-nowrap items-center gap-1.5"
+              >
+                <input
+                  value={orderWideMat.material_name}
+                  onChange={(e) =>
+                    setOrderWideMat((prev) => ({ ...prev, material_name: e.target.value }))
+                  }
+                  placeholder="+ Add Order-Wide material (e.g. Fevicol SH 5kg, Satin Charcoal Louver)"
+                  className="flex-1 min-w-[180px] min-h-[42px] px-2.5 rounded-lg border border-stone-300 text-xs bg-white"
+                />
+                <input
+                  type="number"
+                  min="0.01"
+                  step="any"
+                  value={orderWideMat.quantity}
+                  onChange={(e) =>
+                    setOrderWideMat((prev) => ({ ...prev, quantity: e.target.value }))
+                  }
+                  className="w-16 min-h-[42px] px-2 rounded-lg border border-stone-300 text-xs bg-white text-center font-semibold"
+                />
+                <select
+                  value={orderWideMat.unit}
+                  onChange={(e) =>
+                    setOrderWideMat((prev) => ({ ...prev, unit: e.target.value }))
+                  }
+                  className="min-h-[42px] px-2 rounded-lg border border-stone-300 text-xs bg-white font-semibold"
+                >
+                  {MATERIAL_UNITS.map((u) => (
+                    <option key={u} value={u}>
+                      {u}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  type="submit"
+                  disabled={busyKey === "mat-order-wide"}
+                  className="min-h-[42px] px-3 rounded-lg bg-amber-900 text-white text-xs font-bold flex items-center gap-1 shrink-0"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  <span>Add Order-Wide</span>
+                </button>
+              </form>
             </div>
           )}
         </div>

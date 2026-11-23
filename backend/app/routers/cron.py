@@ -50,6 +50,35 @@ async def morning_brief(
     ansh_pending = [w for w in wdw if w.get("work_kind") == "material_track"]
     packed_gate = [w for w in wdw if w.get("stage_code") == "packed_ready"]
 
+    inv_items = (
+        sb.table("inventory_items")
+        .select("name,on_hand_qty,min_stock_qty")
+        .eq("is_active", True)
+        .execute()
+        .data
+        or []
+    )
+    low_stock_names = [
+        it["name"]
+        for it in inv_items
+        if float(it.get("min_stock_qty") or 0) > 0
+        and float(it.get("on_hand_qty") or 0) <= float(it.get("min_stock_qty") or 0)
+    ]
+    rate_pending_rows = (
+        sb.table("inventory_movements")
+        .select("id,is_undone")
+        .eq("zoho_sync_status", "rate_pending")
+        .execute()
+        .data
+        or []
+    )
+    rate_pending_cnt = sum(1 for m in rate_pending_rows if not m.get("is_undone"))
+    inv_line = (
+        f"\n• *Inventory Radar:* {len(low_stock_names)} low stock, {rate_pending_cnt} rate pending"
+        if (low_stock_names or rate_pending_cnt)
+        else ""
+    )
+
     needs_info = sb.table("v_needs_info_queue").select("goal_id,summary_title,status,domain_scope").limit(10).execute().data or []
     pnl_rows = (
         sb.table("v_project_pnl")
@@ -96,6 +125,7 @@ async def morning_brief(
         f"• *Deliveries Due (≤3d):* {due_summary}\n"
         f"• *Stuck ≥3 Days:* {stale_summary}\n"
         f"• *Ansh Material Queue:* {len(ansh_pending)} order(s) | *Packed / Ready Gate:* {len(packed_gate)} piece(s)"
+        f"{inv_line}"
         f"{prod_footer}"
     )
     munim_brief = (

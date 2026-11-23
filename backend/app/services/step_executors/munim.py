@@ -59,10 +59,11 @@ async def execute_munim_financial_step(
 
     # 2. Smart Auto-Bridge: Inflow matching an active Production order updates Payment Track
     pay_stage_note = ""
+    project_undo_snapshot: dict[str, Any] | None = None
     if entry_kind in ("customer_receipt", "customer_payment") and project_id:
         p_rows = (
             sb.table("projects")
-            .select("id,quoted_total,paid_cache_inr,payment_stage,pipeline_stage")
+            .select("id,quoted_total,paid_cache_inr,payment_stage,pipeline_stage,pipeline_stage_at")
             .eq("id", project_id)
             .limit(1)
             .execute()
@@ -71,11 +72,14 @@ async def execute_munim_financial_step(
         )
         if p_rows:
             p = p_rows[0]
-            new_paid = round(float(p.get("paid_cache_inr") or 0) + float(amount_inr), 2)
+            prev_paid = float(p.get("paid_cache_inr") or 0)
+            new_paid = round(prev_paid + float(amount_inr), 2)
             quoted = float(p.get("quoted_total") or 0)
             if quoted > 0 and new_paid >= quoted:
                 new_pstage = "payment_complete"
-            elif p.get("payment_stage") == "advance_pending":
+            elif p.get("payment_stage") in (None, "", "advance_pending") or (
+                p.get("payment_stage") == "advance_in" and prev_paid <= 0
+            ):
                 new_pstage = "advance_in"
             else:
                 new_pstage = "partial_paid" if new_paid > 0 else p.get("payment_stage")
@@ -97,7 +101,30 @@ async def execute_munim_financial_step(
                 pay_stage_note += " · Pipeline → *Site Sizing / BOQ*"
 
             if prj_patch:
+                project_undo_snapshot = {
+                    "project_id": project_id,
+                    "before": {k: p.get(k) for k in prj_patch},
+                }
                 sb.table("projects").update(prj_patch).eq("id", project_id).execute()
+    elif entry_kind in ("expense", "vendor_payment") and project_id and float(amount_inr or 0) > 0:
+        p_rows = (
+            sb.table("projects")
+            .select("id,cost_cache_inr")
+            .eq("id", project_id)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if p_rows:
+            old_cost = float(p_rows[0].get("cost_cache_inr") or 0)
+            new_cost = round(old_cost + float(amount_inr), 2)
+            project_undo_snapshot = {
+                "project_id": project_id,
+                "before": {"cost_cache_inr": old_cost},
+            }
+            sb.table("projects").update({"cost_cache_inr": new_cost}).eq("id", project_id).execute()
+            pay_stage_note = f" · Order Cost Updated (+{format_inr(amount_inr)})"
 
     acc_row = sb.table("payment_accounts").select("display_name").eq("id", payment_account_id).limit(1).execute().data
     acc_label = acc_row[0]["display_name"] if acc_row else "Account"
@@ -119,7 +146,9 @@ async def execute_munim_financial_step(
         "status_code": 200,
         "error_kind": "none",
         "zoho_id": z_res.get("zoho_id"),
+        "zoho_type": z_res.get("zoho_type"),
         "reference_number": ref_no,
+        **({"project_undo_snapshot": project_undo_snapshot} if project_undo_snapshot else {}),
         "receipt": f"{arrow} *{format_inr(amount_inr)}* ({acc_label}) — {party_name or entry_kind}{cat_note} [{z_badge}]{pay_stage_note}",
     }
 
@@ -170,9 +199,13 @@ async def execute_munim_draft_doc_step(
                 "error": {"message": err_msg},
             }
         draft_status = str(draft_res.get("status") or (draft_res.get("invoice") or {}).get("status") or "draft")
+        inv_id = str((draft_res.get("invoice") or {}).get("invoice_id") or "")
         return {
             "ok": True,
             "draft_status": draft_status,
+            "zoho_id": inv_id or None,
+            "zoho_type": "invoice",
+            "reference_number": ref_no,
             "receipt": f"📄 Zoho *Draft Invoice (AR)* saved: *{party_name}* · *{format_inr(amt)}*",
         }
 
@@ -202,6 +235,8 @@ async def execute_munim_draft_doc_step(
         vendor_id=payee.get("contact_id"),
         reference_number=ref_no,
         project_id=slots.get("project_id"),
+        expense_category=slots.get("expense_category"),
+        account_name=slots.get("account_name"),
         sb=sb,
     )
     if draft_res.get("error"):
@@ -215,9 +250,39 @@ async def execute_munim_draft_doc_step(
             ),
             "error": {"message": err_msg},
         }
-    draft_status = str(draft_res.get("status") or (draft_res.get("bill") or {}).get("status") or "draft")
+    bill_obj = draft_res.get("bill") or {}
+    bill_status = str(draft_res.get("status") or bill_obj.get("status") or "open")
+    bill_id = str(bill_obj.get("bill_id") or "")
+    bill_undo_snap: dict[str, Any] | None = None
+    if slots.get("project_id") and amt > 0:
+        pid = str(slots["project_id"])
+        p_rows = (
+            sb.table("projects")
+            .select("id,cost_cache_inr,zoho_bills_cache")
+            .eq("id", pid)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if p_rows:
+            old_cost = float(p_rows[0].get("cost_cache_inr") or 0)
+            old_bills = float(p_rows[0].get("zoho_bills_cache") or 0)
+            bill_undo_snap = {
+                "project_id": pid,
+                "before": {"cost_cache_inr": old_cost, "zoho_bills_cache": old_bills},
+            }
+            sb.table("projects").update(
+                {"cost_cache_inr": round(old_cost + amt, 2), "zoho_bills_cache": round(old_bills + amt, 2)}
+            ).eq("id", pid).execute()
+    acc_note = f" · _{draft_res['expense_account_name']}_" if draft_res.get("expense_account_name") else ""
     return {
         "ok": True,
-        "draft_status": draft_status,
-        "receipt": f"🧾 Zoho *Draft Bill (AP)* saved: *{party_name}* (`{inv_no or 'Draft'}`) · *{format_inr(amt)}*",
+        "draft_status": bill_status,
+        "zoho_id": bill_id or None,
+        "zoho_type": "bill",
+        "reference_number": ref_no,
+        "expense_account_name": draft_res.get("expense_account_name"),
+        **({"project_undo_snapshot": bill_undo_snap} if bill_undo_snap else {}),
+        "receipt": f"🧾 Zoho *Open Bill (AP)* saved: *{party_name}* (`{inv_no or 'AP'}`) · *{format_inr(amt)}*{acc_note}",
     }

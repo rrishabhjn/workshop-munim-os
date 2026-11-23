@@ -1,0 +1,14 @@
+{
+  "hosting": {
+    "site": "tfc-admin",
+    "rewrites": [
+      {
+        "source": "**",
+        "run": {
+          "serviceId": "workshop-munim-os",
+          "region": "asia-south1"
+        }
+      }
+    ]
+  }
+}

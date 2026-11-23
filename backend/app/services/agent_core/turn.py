@@ -12,8 +12,9 @@ import sys
 from typing import Any, Literal
 
 from app.services import (
-    action_tools, agent_tools, attachment_memory, decisions_triage, goal_intelligence, storage, turn_cache,
+    action_tools, agent_tools, attachment_memory, decisions_triage, goal_intelligence, inventory_ai, storage, turn_cache,
 )
+from app.services.agent_core.financial_amendments import prepare_turn_financial_amendment_and_choices
 from app.services.agent_core.formatting import (
     _build_steps_for_slots, _default_missing_question, _format_confirmation_summary, _upsert_goal_row,
 )
@@ -42,7 +43,7 @@ async def run_agent_turn(
     owner_person_id: str | None,
     actor_label: str,
     source_channel: Literal["telegram", "web_command_bar"] = "web_command_bar",
-    domain_scope: Literal["production", "munim", "shared"] = "production",
+    domain_scope: Literal["production", "inventory", "munim", "shared"] = "production",
     text: str | None = None,
     audio_bytes: bytes | None = None,
     audio_mime_type: str = "audio/ogg",
@@ -748,9 +749,22 @@ async def _process_goal_intent_item(
 
     op = str(slots.get("operation_kind") or item.operation_kind)
     goal_owner_id = existing_owner_person_id or owner_person_id
+    choices_serialized = [c.model_dump() for c in item.choices]
+    op, slots, choices_serialized = await prepare_turn_financial_amendment_and_choices(
+        sb,
+        op=op,
+        slots=slots,
+        item=item,
+        user_text=user_text,
+        heard_transcript=heard_transcript,
+        choices_serialized=choices_serialized,
+    )
+    if slots.get("payment_account_code") and slots["payment_account_code"] in acc_code_to_id:
+        slots["payment_account_id"] = acc_code_to_id[slots["payment_account_code"]]
+    if slots.get("to_payment_account_code") and slots["to_payment_account_code"] in acc_code_to_id:
+        slots["to_payment_account_id"] = acc_code_to_id[slots["to_payment_account_code"]]
 
     missing = _compute_missing_slots_for_op(op, slots)
-    choices_serialized = [c.model_dump() for c in item.choices]
 
     # Case A: Missing slots or Homonym Ambiguity -> status = 'gathering_info'
     if item.is_ambiguous or missing:
@@ -801,14 +815,14 @@ async def _process_goal_intent_item(
     ) and not is_high_sensitivity_master_mutation(op, slots, target_before_row)
 
     # Case B: Unambiguous Production Lifecycle OR Low-Sensitivity Detail Edit -> AUTO-COMMIT + 1-Tap [↩️ Undo]!
-    if op in ("pipeline_stage_move", "material_stage_move", "item_upsert_or_move", "item_material_upsert") or is_low_risk_entity_edit:
+    if op in ("pipeline_stage_move", "material_stage_move", "item_upsert_or_move", "item_material_upsert") or inventory_ai.is_inventory_auto_commit(op, slots) or is_low_risk_entity_edit:
         steps = _build_steps_for_slots(op, slots)
         goal_row = _upsert_goal_row(
             sb,
             goal_id=existing_goal_id,
             owner_person_id=goal_owner_id,
             source_channel=source_channel,
-            domain_scope="production" if op in ("pipeline_stage_move", "material_stage_move", "item_upsert_or_move", "item_material_upsert", "update_order_details") else domain_scope,
+            domain_scope="inventory" if op in inventory_ai.INVENTORY_OPS else ("production" if op in ("pipeline_stage_move", "material_stage_move", "item_upsert_or_move", "item_material_upsert", "update_order_details") else domain_scope),
             telegram_chat_id=telegram_chat_id,
             ui_context=ui_context,
             goal_type=_map_op_to_db_goal_type(op),
@@ -837,14 +851,14 @@ async def _process_goal_intent_item(
         return res_b
 
     # Case C: Money, Zoho Draft Bills/Invoices, New Entities, Soft-Archives & High-Sensitivity Edits -> MANDATORY CONFIRM!
-    confirm_card_text = _format_confirmation_summary(op, slots, target_before_row)
+    confirm_card_text = _format_confirmation_summary(op, slots, target_before_row, sb=sb)
     steps = _build_steps_for_slots(op, slots)
     goal_row = _upsert_goal_row(
         sb,
         goal_id=existing_goal_id,
         owner_person_id=goal_owner_id,
         source_channel=source_channel,
-        domain_scope="munim" if op in ("customer_receipt", "customer_payment", "vendor_payment", "expense", "float_transfer", "supplier_draft_bill", "customer_draft_invoice") else domain_scope,
+        domain_scope="inventory" if op in inventory_ai.INVENTORY_OPS else ("munim" if op in ("customer_receipt", "customer_payment", "vendor_payment", "expense", "float_transfer", "supplier_draft_bill", "customer_draft_invoice") else domain_scope),
         telegram_chat_id=telegram_chat_id,
         ui_context=ui_context,
         goal_type=_map_op_to_db_goal_type(op),
@@ -856,7 +870,7 @@ async def _process_goal_intent_item(
         missing_slots=[],
         pending_prompt=confirm_card_text,
         steps=steps,
-        repair_options=[],
+        repair_options=choices_serialized,
         project_id=slots.get("project_id"),
         customer_id=slots.get("customer_id"),
         user_message=user_text or heard_transcript,
@@ -866,7 +880,7 @@ async def _process_goal_intent_item(
         "status": "awaiting_confirmation",
         "summary_title": item.summary_title,
         "prompt": confirm_card_text,
-        "choices": [],
+        "choices": choices_serialized,
         "project_id": slots.get("project_id"),
         "collected_slots": slots,
         **({"superseded_bot_msg_id": prior_bot_msg_id} if prior_bot_msg_id else {}),

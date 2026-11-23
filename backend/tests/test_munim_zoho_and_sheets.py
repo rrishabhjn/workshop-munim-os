@@ -98,17 +98,29 @@ async def test_pass1_zoho_reporting_tags_draft_bill_and_pnl_sync():
             return httpx.Response(200, json={"tag_options": []})
         if method == "POST" and path == "/reportingtags/tag-prj/options":
             return httpx.Response(200, json={"tag_option": {"tag_option_id": "opt-101", "tag_option_name": "PRJ-101 - Mehta Garment"}})
+        if method == "GET" and path == "/chartofaccounts":
+            return httpx.Response(
+                200,
+                json={
+                    "chartofaccounts": [
+                        {"account_id": "coa-materials", "account_name": "Materials", "account_type": "cost_of_goods_sold", "is_active": True},
+                        {"account_id": "coa-other", "account_name": "Other Expenses", "account_type": "expense", "is_active": True},
+                    ]
+                },
+            )
         if method == "GET" and path == "/bills" and (params or {}).get("reference_number") == "MUNIM-G1-S1":
             return httpx.Response(200, json={"bills": []})
         if method == "GET" and path == "/bills" and (params or {}).get("reference_number") == "MUNIM-DUP-S0":
             return httpx.Response(200, json={"bills": [{"bill_id": "zb-existing", "reference_number": "MUNIM-DUP-S0"}]})
         if method == "POST" and path == "/bills":
-            assert json_body["status"] == "draft"
+            assert json_body["status"] == "open"
             assert json_body["reference_number"] == "MUNIM-G1-S1"
+            assert json_body["is_inclusive_tax"] is False
             assert json_body["tags"] == [{"tag_id": "tag-prj", "tag_option_id": "opt-101"}]
+            assert json_body["line_items"][0]["account_id"] == "coa-materials"
             assert json_body["line_items"][0]["tags"] == [{"tag_id": "tag-prj", "tag_option_id": "opt-101"}]
             assert json_body["custom_fields"] == [{"api_name": "cf_project_code", "value": "PRJ-101"}]
-            return httpx.Response(200, json={"bill": {"bill_id": "zb-new", "status": "draft"}})
+            return httpx.Response(200, json={"bill": {"bill_id": "zb-new", "status": "open"}})
         if method == "GET" and path == "/invoices":
             return httpx.Response(
                 200,
@@ -125,9 +137,27 @@ async def test_pass1_zoho_reporting_tags_draft_bill_and_pnl_sync():
                 200,
                 json={
                     "bills": [
-                        {"bill_id": "b1", "status": "draft", "total": 45000, "custom_field_hash": {"cf_project_code": "PRJ-101"}},
+                        {"bill_id": "b1", "status": "open", "total": 45000, "custom_field_hash": {"cf_project_code": "PRJ-101"}},
                         {"bill_id": "b2", "status": "void", "total": 5000, "tags": [{"tag_option_id": "opt-101"}]},
                     ],
+                    "page_context": {"has_more_page": False},
+                },
+            )
+        if method == "GET" and path == "/expenses":
+            return httpx.Response(
+                200,
+                json={
+                    "expenses": [
+                        {"expense_id": "e1", "status": "unbilled", "total": 5000, "tags": [{"tag_option_id": "opt-101"}]}
+                    ],
+                    "page_context": {"has_more_page": False},
+                },
+            )
+        if method == "GET" and path == "/journals":
+            return httpx.Response(
+                200,
+                json={
+                    "journals": [],
                     "page_context": {"has_more_page": False},
                 },
             )
@@ -152,7 +182,7 @@ async def test_pass1_zoho_reporting_tags_draft_bill_and_pnl_sync():
             sb=sb,
         )
         assert bill_res["bill"]["bill_id"] == "zb-new"
-        assert bill_res["bill"]["status"] == "draft"
+        assert bill_res["bill"]["status"] == "open"
 
         dup_res = await zoho.create_draft_bill(
             supplier_name="Bikaner Timber",
@@ -175,6 +205,7 @@ async def test_pass1_zoho_reporting_tags_draft_bill_and_pnl_sync():
     assert prj_after["zoho_tag_option_id"] == "opt-101"
     assert prj_after["zoho_invoiced_cache"] == 120000.0
     assert prj_after["zoho_bills_cache"] == 45000.0
+    assert prj_after["cost_cache_inr"] == 50000.0
 
 
 def test_pass1_sheets_backup_v1_tabs_and_error_resilience():

@@ -16,11 +16,13 @@ import WhosDoingWhat from "./components/WhosDoingWhat";
 import AllOrdersBoard from "./components/AllOrdersBoard";
 import RosterDrawer from "./components/RosterDrawer";
 import MunimPortal from "./components/MunimPortal";
+import InventoryPortal from "./components/InventoryPortal";
 import AgentCommandBar from "./components/AgentCommandBar";
 
 function detectInitialDomain() {
-  if (typeof window !== "undefined" && window.location.pathname.startsWith("/munim")) {
-    return "munim";
+  if (typeof window !== "undefined") {
+    if (window.location.pathname.startsWith("/munim")) return "munim";
+    if (window.location.pathname.startsWith("/inventory")) return "inventory";
   }
   return "production";
 }
@@ -32,6 +34,7 @@ export default function App() {
   const [prodTab, setProdTab] = useState("whos_doing_what");
   const [prodData, setProdData] = useState(null);
   const [munimData, setMunimData] = useState(null);
+  const [inventoryData, setInventoryData] = useState(null);
   const [selectedOrderId, setSelectedOrderId] = useState(null);
   const [showRoster, setShowRoster] = useState(false);
   const [showNeedsInfo, setShowNeedsInfo] = useState(false);
@@ -43,6 +46,9 @@ export default function App() {
       setError("");
       const pOverview = await apiFetch("/api/production/overview");
       setProdData(pOverview);
+      apiFetch("/api/inventory/overview")
+        .then(setInventoryData)
+        .catch(() => setInventoryData(null));
       const canMunim = pOverview?.me?.can_login_munim !== false;
       if (canMunim) {
         apiFetch("/api/munim/overview")
@@ -50,13 +56,15 @@ export default function App() {
           .catch(() => setMunimData(null));
       } else {
         setMunimData(null);
-        setDomain("production");
-        if (window.location.pathname === "/munim") {
+        setDomain((cur) => (cur === "munim" ? "production" : cur));
+        if (window.location.pathname.startsWith("/munim")) {
           window.history.replaceState({}, "", "/production");
         }
       }
     } catch (err) {
       setProdData(null);
+      setInventoryData(null);
+      setMunimData(null);
       setError(err.message || "Authentication required");
     } finally {
       setAuthChecked(true);
@@ -65,9 +73,23 @@ export default function App() {
 
   async function refreshActiveDomain(targetDomain = domain) {
     const canMunim = prodData?.me?.can_login_munim !== false;
-    if (targetDomain === "production" || !canMunim) {
+    if (targetDomain === "inventory") {
+      const invOverview = await apiFetch("/api/inventory/overview");
+      setInventoryData(invOverview);
+      apiFetch("/api/production/overview")
+        .then(setProdData)
+        .catch(() => {});
+      if (canMunim) {
+        apiFetch("/api/munim/overview")
+          .then(setMunimData)
+          .catch(() => {});
+      }
+    } else if (targetDomain === "production" || !canMunim) {
       const pOverview = await apiFetch("/api/production/overview");
       setProdData(pOverview);
+      apiFetch("/api/inventory/overview")
+        .then(setInventoryData)
+        .catch(() => {});
       if (pOverview?.me?.can_login_munim !== false) {
         apiFetch("/api/munim/overview")
           .then(setMunimData)
@@ -80,6 +102,9 @@ export default function App() {
       setMunimData(mOverview);
       apiFetch("/api/production/overview")
         .then(setProdData)
+        .catch(() => {});
+      apiFetch("/api/inventory/overview")
+        .then(setInventoryData)
         .catch(() => {});
     }
   }
@@ -135,7 +160,12 @@ export default function App() {
       nextDomain = "production";
     }
     setDomain(nextDomain);
-    const targetPath = nextDomain === "munim" ? "/munim" : "/production";
+    const targetPath =
+      nextDomain === "munim"
+        ? "/munim"
+        : nextDomain === "inventory"
+        ? "/inventory"
+        : "/production";
     if (window.location.pathname !== targetPath) {
       window.history.pushState({}, "", targetPath);
     }
@@ -152,6 +182,8 @@ export default function App() {
   async function handleLogout() {
     if (sbClient) await sbClient.auth.signOut();
     setProdData(null);
+    setInventoryData(null);
+    setMunimData(null);
   }
 
   function showUndoBanner(message, eventIds) {
@@ -256,6 +288,16 @@ export default function App() {
             >
               🏭 Production
             </button>
+            <button
+              onClick={() => switchDomain("inventory")}
+              className={`min-h-[38px] px-3 rounded-lg text-xs font-bold transition ${
+                domain === "inventory"
+                  ? "bg-amber-900 text-white shadow-sm"
+                  : "text-stone-600 hover:text-stone-900"
+              }`}
+            >
+              📦 Inventory
+            </button>
             {prodData?.me?.can_login_munim !== false && (
               <button
                 onClick={() => switchDomain("munim")}
@@ -336,7 +378,17 @@ export default function App() {
 
       {/* Main Content */}
       <main className="max-w-6xl mx-auto px-3 pt-4">
-        {domain === "production" || prodData?.me?.can_login_munim === false ? (
+        {domain === "inventory" ? (
+          <InventoryPortal
+            inventoryData={inventoryData}
+            onRefresh={() => refreshActiveDomain("inventory")}
+            onOpenOrder={(projectId) => {
+              switchDomain("production");
+              setProdTab("all_orders");
+              setSelectedOrderId(projectId);
+            }}
+          />
+        ) : domain === "production" || prodData?.me?.can_login_munim === false ? (
           prodTab === "whos_doing_what" ? (
             <WhosDoingWhat
               me={prodData.me}
@@ -353,6 +405,7 @@ export default function App() {
               lookups={prodData.lookups}
               people={prodData.people}
               orders={prodData.orders}
+              inventoryItems={inventoryData?.items || []}
               selectedOrderId={selectedOrderId}
               onSelectOrder={setSelectedOrderId}
               onMutated={loadAllData}
@@ -380,7 +433,9 @@ export default function App() {
             ? selectedOrderId
             : null
         }
-        paymentAccounts={munimData?.payment_accounts || []}
+        paymentAccounts={
+          munimData?.payment_accounts || inventoryData?.payment_accounts || []
+        }
         needsInfo={needsInfoList}
         showNeedsInfo={showNeedsInfo}
         onCloseNeedsInfo={() => setShowNeedsInfo(false)}

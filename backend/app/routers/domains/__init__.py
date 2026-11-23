@@ -47,6 +47,17 @@ from .common import (
     _resolve_actor_person,
     _validate_goal_id_or_400,
 )
+from .inventory import (
+    adjust_inventory_count,
+    attribute_stock_to_order,
+    create_inventory_sku,
+    enter_rate_on_pending_movement,
+    get_inventory_overview,
+    load_inventory_batch,
+    patch_inventory_sku,
+    router as inventory_router,
+    undo_inventory_ledger_movement,
+)
 from .munim import (
     add_customer_to_directory,
     add_person_to_roster,
@@ -63,6 +74,7 @@ from .munim import (
 )
 from .production import (
     add_item_raw_material,
+    add_order_wide_raw_material,
     bulk_update_order_materials_status,
     create_order_flat_item,
     create_production_order,
@@ -76,11 +88,14 @@ from .production import (
     router as production_router,
     undo_production_events,
     update_order_flat_item,
+    upload_item_photo,
+    upload_order_attachment,
 )
 
 router = APIRouter(prefix="/api", tags=["domains"])
 router.include_router(production_router)
 router.include_router(munim_router)
+router.include_router(inventory_router)
 router.include_router(agent_router)
 
 __all__ = [
@@ -108,18 +123,24 @@ __all__ = [
     "_validate_goal_id_or_400",
     "add_customer_to_directory",
     "add_item_raw_material",
+    "add_order_wide_raw_material",
     "add_person_to_roster",
     "add_vendor_to_directory",
+    "adjust_inventory_count",
     "agent_core",
+    "attribute_stock_to_order",
     "bulk_update_order_materials_status",
     "choose_agent_goal_option",
     "confirm_agent_goal",
+    "create_inventory_sku",
     "create_order_flat_item",
     "create_production_order",
     "delete_item_raw_material",
     "discard_agent_goal",
     "edit_agent_goal",
+    "enter_rate_on_pending_movement",
     "execute_web_agent_turn",
+    "get_inventory_overview",
     "get_media_signed_url",
     "get_munim_ledger",
     "get_munim_overview",
@@ -127,10 +148,12 @@ __all__ = [
     "get_production_overview",
     "get_supabase_admin",
     "list_needs_info_queue",
+    "load_inventory_batch",
     "move_order_material_stage",
     "move_order_pipeline_stage",
     "park_agent_goal_for_clerk",
     "patch_customer_in_directory",
+    "patch_inventory_sku",
     "patch_item_raw_material",
     "patch_person_in_roster",
     "patch_production_order",
@@ -142,6 +165,7 @@ __all__ = [
     "storage",
     "trigger_zoho_pulse_sync",
     "undo_agent_goal",
+    "undo_inventory_ledger_movement",
     "undo_production_events",
     "update_order_flat_item",
     "zoho",

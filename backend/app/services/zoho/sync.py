@@ -45,24 +45,20 @@ async def sync_project_financial_caches(sb: Any) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=20.0) as client:
             inv_ok, invoices = await pkg._list_all_zoho_docs(client, "/invoices", "invoices")
             bill_ok, bills = await pkg._list_all_zoho_docs(client, "/bills", "bills")
+            exp_ok, expenses = await pkg._list_all_zoho_docs(client, "/expenses", "expenses")
+            jrn_ok, journals = await pkg._list_all_zoho_docs(client, "/journals", "journals")
     except httpx.HTTPError as exc:
         logger.warning("sync_project_financial_caches failed: %s", exc)
         return {"synced": 0, "stubbed": False, "error": str(exc)}
 
-    if not inv_ok and not bill_ok:
-        return {"synced": 0, "stubbed": False, "error": "Failed to fetch Zoho invoices and bills"}
+    if not inv_ok and not bill_ok and not exp_ok and not jrn_ok:
+        return {"synced": 0, "stubbed": False, "error": "Failed to fetch Zoho invoices, bills, expenses, and journals"}
 
     cf_name = settings.zoho_project_custom_field
-    inv_docs = [
-        (doc, *pkg._extract_zoho_doc_project_keys(doc, cf_name))
-        for doc in invoices
-        if doc.get("status") != "void"
-    ]
-    bill_docs = [
-        (doc, *pkg._extract_zoho_doc_project_keys(doc, cf_name))
-        for doc in bills
-        if doc.get("status") != "void"
-    ]
+    inv_docs = [doc for doc in invoices if doc.get("status") != "void"]
+    bill_docs = [doc for doc in bills if doc.get("status") != "void"]
+    exp_docs = [doc for doc in expenses if doc.get("status") != "void"]
+    jrn_docs = [doc for doc in journals if doc.get("status") != "void"]
 
     synced = 0
     for prj in projects:
@@ -84,18 +80,31 @@ async def sync_project_financial_caches(sb: Any) -> dict[str, Any]:
         patch: dict[str, Any] = {"zoho_synced_at": "now()"}
         if inv_ok:
             inv_total = sum(
-                float(doc.get("total") or 0)
-                for doc, t_opts, codes, doc_zp in inv_docs
-                if _matches(t_opts, codes, doc_zp)
+                pkg.extract_project_matched_doc_amount(doc, cf_name, _matches)
+                for doc in inv_docs
             )
             patch["zoho_invoiced_cache"] = round(inv_total, 2)
+        bill_total = 0.0
         if bill_ok:
             bill_total = sum(
-                float(doc.get("total") or 0)
-                for doc, t_opts, codes, doc_zp in bill_docs
-                if _matches(t_opts, codes, doc_zp)
+                pkg.extract_project_matched_doc_amount(doc, cf_name, _matches)
+                for doc in bill_docs
             )
             patch["zoho_bills_cache"] = round(bill_total, 2)
+        exp_total = 0.0
+        if exp_ok:
+            exp_total = sum(
+                pkg.extract_project_matched_doc_amount(doc, cf_name, _matches)
+                for doc in exp_docs
+            )
+        jrn_total = 0.0
+        if jrn_ok:
+            jrn_total = sum(
+                pkg.extract_project_matched_doc_amount(doc, cf_name, _matches, is_journal=True)
+                for doc in jrn_docs
+            )
+        if bill_ok or exp_ok or jrn_ok:
+            patch["cost_cache_inr"] = round(bill_total + exp_total + jrn_total, 2)
 
         sb.table("projects").update(patch).eq("id", prj["id"]).execute()
         synced += 1

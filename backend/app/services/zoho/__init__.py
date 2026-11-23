@@ -32,6 +32,13 @@ from app.services.zoho.contacts import (
     sync_existing_zoho_contact,
     update_zoho_contact_notes,
 )
+from app.services.zoho.inventory_ledger import (
+    _pick_or_create_inventory_asset_account,
+    build_fifo_vendor_bill_allocations,
+    extract_project_matched_doc_amount,
+    push_inventory_journal_to_zoho,
+    push_mixed_inventory_load_to_zoho,
+)
 from app.services.zoho.ledger import (
     _pick_matching_zoho_bank_account,
     _pick_zoho_expense_account,
@@ -39,6 +46,7 @@ from app.services.zoho.ledger import (
     _resolve_zoho_paid_account_id,
     push_management_entry_to_zoho,
 )
+from app.services.zoho.mutations import delete_zoho_financial_entry
 from app.services.zoho.sync import (
     list_recent_ledger_transactions,
     sync_owner_pulse_snapshot,
@@ -56,17 +64,21 @@ __all__ = [
     "_get_chart_of_accounts",
     "_list_all_zoho_docs",
     "_pick_matching_zoho_bank_account",
+    "_pick_or_create_inventory_asset_account",
     "_pick_zoho_expense_account",
     "_post_zoho_with_order_tag_fallback",
     "_resolve_zoho_paid_account_id",
     "_token_cache",
     "_upsert_entity_alias",
     "_zoho_request",
+    "build_fifo_vendor_bill_allocations",
     "check_duplicate_bill",
     "create_draft_bill",
     "create_draft_invoice",
     "create_zoho_contact",
+    "delete_zoho_financial_entry",
     "ensure_project_zoho_bridge",
+    "extract_project_matched_doc_amount",
     "find_matching_active_orders",
     "get_settings",
     "list_recent_ledger_transactions",
@@ -74,7 +86,9 @@ __all__ = [
     "match_existing_order_or_customer",
     "match_existing_payee",
     "merge_notes_text",
+    "push_inventory_journal_to_zoho",
     "push_management_entry_to_zoho",
+    "push_mixed_inventory_load_to_zoho",
     "resolve_or_create_contact",
     "resolve_payee_zoho_vendor",
     "search_zoho_contacts",

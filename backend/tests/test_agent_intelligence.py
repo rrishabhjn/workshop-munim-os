@@ -103,14 +103,52 @@ async def test_feature2_post_write_verification_happy_and_drift_detection():
     assert "packed_ready" in res_drift["prompt"]
     assert sb.store["agent_goals"][1]["status"] == "needs_error_fix"
 
-    # Case C: Non-draft supplier bill caught by Draft-Only invariant check
+    # Case C: Non-draft customer invoice caught by Draft-Only invariant check; open AP supplier bill succeeds
     sb.store["agent_goals"].append(
         {
             "id": "goal-verify-nondraft",
             "owner_person_id": "p-shreyansh",
+            "goal_type": "customer_invoice",
+            "status": "awaiting_confirmation",
+            "summary_title": "Ambure Customer Invoice",
+            "collected_slots": {
+                "operation_kind": "customer_draft_invoice",
+                "party_name": "Ambure Ji",
+                "amount_inr": 25000,
+            },
+            "steps": [
+                {
+                    "step_uuid": "s-3",
+                    "step_index": 0,
+                    "target": "zoho",
+                    "operation": "customer_draft_invoice",
+                    "status": "pending",
+                }
+            ],
+        }
+    )
+
+    with patch(
+        "app.services.zoho.create_draft_invoice",
+        new=AsyncMock(return_value={"stubbed": False, "invoice": {"invoice_id": "zi-1", "status": "sent"}}),
+    ):
+        res_nondraft = await agent_core.confirm_and_execute_goal(
+            sb,
+            goal_id="goal-verify-nondraft",
+            actor_person_id="p-shreyansh",
+            actor_label="Shreyansh",
+        )
+
+    assert res_nondraft["status"] == "needs_error_fix"
+    assert "draft" in res_nondraft["prompt"].lower()
+
+    sb.store["agent_goals"].append(
+        {
+            "id": "goal-verify-open-bill",
+            "owner_person_id": "p-shreyansh",
             "goal_type": "supplier_bill",
             "status": "awaiting_confirmation",
-            "summary_title": "Patel Ply Bill",
+            "summary_title": "Patel Ply Open Bill",
             "collected_slots": {
                 "operation_kind": "supplier_draft_bill",
                 "party_name": "Patel Ply",
@@ -119,7 +157,7 @@ async def test_feature2_post_write_verification_happy_and_drift_detection():
             },
             "steps": [
                 {
-                    "step_uuid": "s-3",
+                    "step_uuid": "s-4",
                     "step_index": 0,
                     "target": "zoho",
                     "operation": "supplier_draft_bill",
@@ -137,18 +175,17 @@ async def test_feature2_post_write_verification_happy_and_drift_detection():
         ),
         patch(
             "app.services.zoho.create_draft_bill",
-            new=AsyncMock(return_value={"stubbed": False, "bill": {"status": "open"}}),
+            new=AsyncMock(return_value={"stubbed": False, "bill": {"bill_id": "zb-open", "status": "open"}}),
         ),
     ):
-        res_nondraft = await agent_core.confirm_and_execute_goal(
+        res_open_bill = await agent_core.confirm_and_execute_goal(
             sb,
-            goal_id="goal-verify-nondraft",
+            goal_id="goal-verify-open-bill",
             actor_person_id="p-shreyansh",
             actor_label="Shreyansh",
         )
 
-    assert res_nondraft["status"] == "needs_error_fix"
-    assert "draft" in res_nondraft["prompt"].lower()
+    assert res_open_bill["status"] == "completed"
 
 
 # ---------------------------------------------------------------------------

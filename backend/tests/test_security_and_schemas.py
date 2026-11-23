@@ -66,7 +66,7 @@ async def test_zoho_create_draft_bill_stubbed_without_creds():
             line_items=[],
         )
     assert res["stubbed"] is True
-    assert res["status"] == "draft"
+    assert res["status"] == "open"
 
 
 @pytest.mark.asyncio
@@ -114,7 +114,7 @@ def test_gemini_response_schemas_accepted_by_google_genai():
 
     dummy_client = Client(api_key="test-key")._api_client
     t.t_schema(dummy_client, SupplierBillExtraction)
-    assert len(INTERACTION_TOOLS_SCHEMA) == 12
+    assert len(INTERACTION_TOOLS_SCHEMA) == 15
     for tool in INTERACTION_TOOLS_SCHEMA:
         t.t_schema(dummy_client, tool["parameters"])
 

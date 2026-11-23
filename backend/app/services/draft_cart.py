@@ -72,7 +72,38 @@ class TurnDraftCart:
         return bool(self.entries)
 
     def items(self) -> list[Any]:
-        return [e["item"] for e in self.entries.values()]
+        raw_items = [e["item"] for e in self.entries.values()]
+        leads = [it for it in raw_items if str(getattr(it, "operation_kind", "")) == "new_lead"]
+        receipts = [it for it in raw_items if str(getattr(it, "operation_kind", "")) == "customer_receipt"]
+        if not (leads and receipts):
+            return raw_items
+
+        merged_receipt_ids: set[int] = set()
+        out: list[Any] = []
+        for it in raw_items:
+            if id(it) in merged_receipt_ids:
+                continue
+            if str(getattr(it, "operation_kind", "")) == "new_lead":
+                lname = re.sub(r"[^a-z0-9]", "", str(getattr(it, "full_name", "") or "").lower())
+                for rc in receipts:
+                    if id(rc) in merged_receipt_ids:
+                        continue
+                    rname = re.sub(r"[^a-z0-9]", "", str(getattr(rc, "party_name", "") or "").lower())
+                    same_cust = bool(lname and rname and (lname in rname or rname in lname)) or len(leads) == 1
+                    if same_cust and not getattr(rc, "project_id", None):
+                        upd: dict[str, Any] = {}
+                        if getattr(rc, "amount_inr", None) and not getattr(it, "advance_amount_inr", None):
+                            upd["advance_amount_inr"] = rc.amount_inr
+                        if getattr(rc, "payment_account_code", None) and not getattr(it, "payment_account_code", None):
+                            upd["payment_account_code"] = rc.payment_account_code
+                        if getattr(rc, "notes", None) and not getattr(it, "advance_notes", None):
+                            upd["advance_notes"] = rc.notes
+                        if upd:
+                            it = it.model_copy(update=upd)
+                            merged_receipt_ids.add(id(rc))
+                            break
+            out.append(it)
+        return [it for it in out if id(it) not in merged_receipt_ids]
 
     def clarified_keys(self) -> set[str]:
         return {goal_item_dedup_key(e["item"]) for e in self.entries.values() if e.get("clarified")}
@@ -218,6 +249,7 @@ async def enrich_candidate_entities(
 ) -> None:
     """Deterministically match payees & customer orders inside action tools (Upgrade B)."""
     from app.services import zoho
+    from app.services.agent_core.financial_amendments import apply_custodian_and_payee_guards
     from app.services.agent_core.schemas import DisambiguationChoice
     from app.services.agent_core.slot_resolvers import _accept_id
 
@@ -242,6 +274,30 @@ async def enrich_candidate_entities(
             cand.clarification_question = m.get("question")
         elif m.get("status") == "new":
             cand.is_new_payee = True
+
+        if not cand.is_ambiguous:
+            cand_dict = cand.model_dump()
+            new_op, g_slots = await apply_custodian_and_payee_guards(
+                sb,
+                op=op,
+                slots=cand_dict,
+                user_text=user_text,
+                heard_transcript=heard_transcript,
+            )
+            cand.operation_kind = new_op  # type: ignore[assignment]
+            for fld in (
+                "to_payment_account_code",
+                "person_id",
+                "vendor_id",
+                "zoho_contact_id",
+                "customer_id",
+                "project_id",
+                "is_new_payee",
+                "force_direct_expense",
+                "auto_create_site_order",
+            ):
+                setattr(cand, fld, g_slots.get(fld))
+            op = new_op
 
     if op in ("customer_receipt", "customer_payment"):
         if cand.skip_order_link:

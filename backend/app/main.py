@@ -44,12 +44,14 @@ app.include_router(telegram.router)
 app.include_router(domains.router)
 app.include_router(cron.router)
 
-# Serve built React PWA / Telegram Mini App (/production and /munim deep links supported)
+# Serve built React PWA / Telegram Mini App (/production, /inventory, and /munim deep links supported)
 FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
 if FRONTEND_DIST.exists():
     @app.get("/")
     @app.get("/production")
     @app.get("/production/{rest_of_path:path}")
+    @app.get("/inventory")
+    @app.get("/inventory/{rest_of_path:path}")
     @app.get("/munim")
     @app.get("/munim/{rest_of_path:path}")
     async def spa_domain_routes(rest_of_path: str = "") -> FileResponse:

@@ -38,6 +38,7 @@ export default function AllOrdersBoard({
   lookups,
   people,
   orders,
+  inventoryItems = [],
   selectedOrderId,
   onSelectOrder,
   onMutated,
@@ -485,6 +486,7 @@ export default function AllOrdersBoard({
           order={selectedOrder}
           lookups={lookups}
           people={people}
+          inventoryItems={inventoryItems}
           onClose={() => onSelectOrder(null)}
           onMutated={onMutated}
           onShowUndoToast={onShowUndoToast}

@@ -53,7 +53,7 @@ def _pick_matching_zoho_bank_account(
         eligible.append(ba)
 
     if code == "cash_galla":
-        for preferred in ("cash galla", "petty cash"):
+        for preferred in ("cash galla", "cash", "petty cash"):
             hit = next(
                 (z for z in eligible if (z.get("account_name") or "").strip().lower() == preferred),
                 None,
@@ -530,6 +530,9 @@ async def push_management_entry_to_zoho(
                         "error_kind": "validation_400",
                         "error": {"message": f"Vendor '{party_name}' could not be resolved in Zoho Books."},
                     }
+                bill_allocs = await pkg.build_fifo_vendor_bill_allocations(
+                    client, str(zoho_contact_id), float(amount_inr)
+                )
                 payload = {
                     "vendor_id": zoho_contact_id,
                     "paid_through_account_id": from_zoho_acc,
@@ -537,11 +540,17 @@ async def push_management_entry_to_zoho(
                     "reference_number": reference_number,
                     "description": vp_desc,
                     **({"date": txn_date} if txn_date else {}),
+                    **({"bills": bill_allocs} if bill_allocs else {}),
                     **order_tags,
                 }
                 resp = await _post_zoho_with_order_tag_fallback(
                     client, "/vendorpayments", payload, has_order_tags=bool(order_tags)
                 )
+                if not resp.is_success and resp.status_code == 400 and bill_allocs and "bill" in resp.text.lower():
+                    no_bills_payload = {k: v for k, v in payload.items() if k != "bills"}
+                    resp = await _post_zoho_with_order_tag_fallback(
+                        client, "/vendorpayments", no_bills_payload, has_order_tags=bool(order_tags)
+                    )
                 if resp.is_success:
                     vpid = (resp.json().get("vendorpayment") or {}).get("payment_id")
                     return {

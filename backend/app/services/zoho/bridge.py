@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import sys
 from typing import Any
 
@@ -44,6 +45,11 @@ def _extract_zoho_doc_project_keys(
         cf_val = cf_hash.get(cf_api_name) or cf_hash.get(f"{cf_api_name}_unformatted") or cf_hash.get("cf_project_code")
         if cf_val:
             codes.add(str(cf_val).strip().lower())
+
+    for text_blob in (doc.get("description"), doc.get("notes"), doc.get("reference_number")):
+        if text_blob:
+            for found_code in re.findall(r"\b(PRJ-\d+)\b", str(text_blob), re.IGNORECASE):
+                codes.add(found_code.lower())
 
     zp_id = str(doc.get("project_id") or "").strip()
     return tag_opt_ids, codes, zp_id

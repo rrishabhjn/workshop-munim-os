@@ -4,9 +4,11 @@ import {
   ExternalLink,
   Inbox,
   Loader2,
+  Mic,
   Paperclip,
   Pencil,
   Send,
+  Square,
   Undo2,
   X,
 } from "lucide-react";
@@ -39,15 +41,41 @@ export default function AgentCommandBar({
   const [replyDrafts, setReplyDrafts] = useState({});
   const [drawerStagedGoals, setDrawerStagedGoals] = useState({});
   const [errorMsg, setErrorMsg] = useState("");
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordingSeconds, setRecordingSeconds] = useState(0);
 
   const WINDOW_MS = 30 * 60 * 1000;
   const fileInputRef = useRef(null);
   const toastTimerRef = useRef(null);
   const sheetScrollRef = useRef(null);
+  const mediaRecorderRef = useRef(null);
+  const mediaStreamRef = useRef(null);
+  const audioChunksRef = useRef([]);
+  const recIntervalRef = useRef(null);
+
+  function stopVoiceResources() {
+    if (recIntervalRef.current) {
+      clearInterval(recIntervalRef.current);
+      recIntervalRef.current = null;
+    }
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach((t) => t.stop());
+      mediaStreamRef.current = null;
+    }
+  }
 
   useEffect(() => {
     return () => {
       if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+        try {
+          mediaRecorderRef.current.onstop = null;
+          mediaRecorderRef.current.stop();
+        } catch {
+          // ignore cleanup stop errors
+        }
+      }
+      stopVoiceResources();
     };
   }, []);
 
@@ -68,6 +96,76 @@ export default function AgentCommandBar({
   function dismissAiToast() {
     if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
     setAiToast(null);
+  }
+
+  async function startVoiceRecording() {
+    if (sending || isRecording) return;
+    if (!navigator?.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+      setErrorMsg("Browser voice mic not supported here — type Hinglish text or attach audio.");
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mimeType = MediaRecorder.isTypeSupported?.("audio/webm;codecs=opus")
+        ? "audio/webm;codecs=opus"
+        : MediaRecorder.isTypeSupported?.("audio/webm")
+        ? "audio/webm"
+        : "";
+      const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+      audioChunksRef.current = [];
+      mediaStreamRef.current = stream;
+      mediaRecorderRef.current = recorder;
+      recorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) audioChunksRef.current.push(e.data);
+      };
+      recorder.start();
+      setErrorMsg("");
+      setRecordingSeconds(0);
+      setIsRecording(true);
+      recIntervalRef.current = setInterval(() => {
+        setRecordingSeconds((s) => s + 1);
+      }, 1000);
+    } catch {
+      stopVoiceResources();
+      setErrorMsg("Microphone permission denied — allow mic access or type below.");
+    }
+  }
+
+  function cancelVoiceRecording() {
+    const rec = mediaRecorderRef.current;
+    if (rec) {
+      rec.onstop = null;
+      if (rec.state !== "inactive") {
+        try {
+          rec.stop();
+        } catch {
+          // ignore
+        }
+      }
+    }
+    audioChunksRef.current = [];
+    stopVoiceResources();
+    setIsRecording(false);
+    setRecordingSeconds(0);
+  }
+
+  function sendVoiceRecording() {
+    const rec = mediaRecorderRef.current;
+    if (!rec || rec.state === "inactive") {
+      cancelVoiceRecording();
+      return;
+    }
+    rec.onstop = () => {
+      const blob = new Blob(audioChunksRef.current, { type: rec.mimeType || "audio/webm" });
+      audioChunksRef.current = [];
+      stopVoiceResources();
+      setIsRecording(false);
+      setRecordingSeconds(0);
+      if (blob.size > 0) {
+        submitTurn({ audioBlob: blob });
+      }
+    };
+    rec.stop();
   }
 
   async function submitTurn({ textOverride, audioBlob }) {
@@ -582,6 +680,38 @@ export default function AgentCommandBar({
             </button>
           )}
 
+          {g.status !== "completed" && choices.length > 0 && (
+            <>
+              {choices.map((ch, i) => {
+                let parsedPatch = {};
+                try {
+                  parsedPatch =
+                    typeof ch.slot_patch_json === "string"
+                      ? JSON.parse(ch.slot_patch_json)
+                      : ch.slot_patch || {};
+                } catch {
+                  parsedPatch = {};
+                }
+                return (
+                  <button
+                    key={ch.choice_id || i}
+                    onClick={() =>
+                      handleGoalAction(
+                        gid,
+                        "choice",
+                        { slot_patch: parsedPatch },
+                        g
+                      )
+                    }
+                    className="min-h-[40px] px-3 rounded-xl bg-amber-900 text-white font-semibold"
+                  >
+                    {ch.label}
+                  </button>
+                );
+              })}
+            </>
+          )}
+
           {g.status === "awaiting_confirmation" && (
             <>
               <button
@@ -611,34 +741,6 @@ export default function AgentCommandBar({
             g.status === "needs_error_fix" ||
             g.status === "parked_for_clerk") && (
             <>
-              {choices.map((ch, i) => {
-                let parsedPatch = {};
-                try {
-                  parsedPatch =
-                    typeof ch.slot_patch_json === "string"
-                      ? JSON.parse(ch.slot_patch_json)
-                      : ch.slot_patch || {};
-                } catch {
-                  parsedPatch = {};
-                }
-                return (
-                  <button
-                    key={ch.choice_id || i}
-                    onClick={() =>
-                      handleGoalAction(
-                        gid,
-                        "choice",
-                        { slot_patch: parsedPatch },
-                        g
-                      )
-                    }
-                    className="min-h-[40px] px-3 rounded-xl bg-amber-900 text-white font-semibold"
-                  >
-                    {ch.label}
-                  </button>
-                );
-              })}
-
               {g.status === "needs_error_fix" && (
                 <button
                   onClick={() => handleGoalAction(gid, "park", null, g)}
@@ -926,57 +1028,97 @@ export default function AgentCommandBar({
           )}
 
           {/* Input Pill */}
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              submitTurn({});
-            }}
-            className="bg-white rounded-2xl border border-stone-300 shadow-lg p-1.5 flex items-center gap-1.5"
-          >
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept="image/*,application/pdf"
-              onChange={(e) => setAttachedFile(e.target.files?.[0] || null)}
-              className="hidden"
-            />
-            <button
-              type="button"
-              onClick={() => fileInputRef.current?.click()}
-              title="Attach bill PDF or photo"
-              className={`min-h-[44px] min-w-[44px] rounded-xl flex items-center justify-center ${
-                attachedFile
-                  ? "bg-amber-100 text-amber-900"
-                  : "text-stone-500 hover:bg-stone-100"
-              }`}
+          {isRecording ? (
+            <div className="bg-rose-50 rounded-2xl border border-rose-300 shadow-lg p-1.5 flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2 px-3 min-h-[44px] text-rose-900 text-sm font-semibold">
+                <span className="w-2.5 h-2.5 rounded-full bg-rose-600 animate-pulse" />
+                <span>
+                  🎙️ Recording {Math.floor(recordingSeconds / 60)}:
+                  {String(recordingSeconds % 60).padStart(2, "0")}
+                </span>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={cancelVoiceRecording}
+                  className="min-h-[44px] px-3 rounded-xl border border-stone-300 bg-white text-stone-700 font-semibold text-xs flex items-center gap-1"
+                >
+                  <X className="w-4 h-4" />
+                  <span>Cancel</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={sendVoiceRecording}
+                  className="min-h-[44px] px-4 rounded-xl bg-rose-700 text-white font-bold text-xs flex items-center gap-1.5"
+                >
+                  <Square className="w-3.5 h-3.5 fill-current" />
+                  <span>Send Voice</span>
+                </button>
+              </div>
+            </div>
+          ) : (
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                submitTurn({});
+              }}
+              className="bg-white rounded-2xl border border-stone-300 shadow-lg p-1.5 flex items-center gap-1.5"
             >
-              <Paperclip className="w-5 h-5" />
-            </button>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/*,application/pdf"
+                onChange={(e) => setAttachedFile(e.target.files?.[0] || null)}
+                className="hidden"
+              />
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                title="Attach bill PDF or photo"
+                className={`min-h-[44px] min-w-[44px] rounded-xl flex items-center justify-center ${
+                  attachedFile
+                    ? "bg-amber-100 text-amber-900"
+                    : "text-stone-500 hover:bg-stone-100"
+                }`}
+              >
+                <Paperclip className="w-5 h-5" />
+              </button>
 
-            <input
-              value={inputText}
-              onChange={(e) => setInputText(e.target.value)}
-              placeholder={
-                domainScope === "munim"
-                  ? "Type money/bill update or question (Hinglish)..."
-                  : viewingProjectId
-                  ? "Update this open order, assign Mistri, or ask AI..."
-                  : "Type lead, stage move, Mistri assign, or question..."
-              }
-              className="flex-1 min-h-[44px] px-2 text-sm outline-none bg-transparent text-stone-900"
-            />
+              <button
+                type="button"
+                onClick={startVoiceRecording}
+                disabled={sending}
+                title="Record voice note (Hinglish)"
+                className="min-h-[44px] min-w-[44px] rounded-xl flex items-center justify-center text-stone-600 hover:bg-amber-50 hover:text-amber-900 disabled:opacity-40"
+              >
+                <Mic className="w-5 h-5" />
+              </button>
 
-            <button
-              type="submit"
-              disabled={sending || (!inputText.trim() && !attachedFile)}
-              className="min-h-[44px] px-4 rounded-xl bg-amber-900 text-white font-bold text-xs flex items-center gap-1.5 disabled:opacity-40"
-            >
-              <Send className="w-4 h-4" />
-              <span className="hidden sm:inline">
-                {sending ? "..." : "Send"}
-              </span>
-            </button>
-          </form>
+              <input
+                value={inputText}
+                onChange={(e) => setInputText(e.target.value)}
+                placeholder={
+                  domainScope === "munim"
+                    ? "Type or record money/bill update (Hinglish)..."
+                    : viewingProjectId
+                    ? "Update this open order, assign Mistri, or ask AI..."
+                    : "Type or record lead, stage move, Mistri assign..."
+                }
+                className="flex-1 min-h-[44px] px-2 text-sm outline-none bg-transparent text-stone-900"
+              />
+
+              <button
+                type="submit"
+                disabled={sending || (!inputText.trim() && !attachedFile)}
+                className="min-h-[44px] px-4 rounded-xl bg-amber-900 text-white font-bold text-xs flex items-center gap-1.5 disabled:opacity-40"
+              >
+                <Send className="w-4 h-4" />
+                <span className="hidden sm:inline">
+                  {sending ? "..." : "Send"}
+                </span>
+              </button>
+            </form>
+          )}
         </div>
       </div>
     </>

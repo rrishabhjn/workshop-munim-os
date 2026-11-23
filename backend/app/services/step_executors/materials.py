@@ -205,8 +205,10 @@ async def add_item_materials_batch(
     actor_person_id: str | None = None,
     source_channel: str = "web",
     heard_transcript: str | None = None,
+    allow_order_wide: bool = False,
+    inventory_item_id: str | None = None,
 ) -> dict[str, Any]:
-    """Add one or more raw material lines under a furniture item and auto-sync order material track."""
+    """Add one or more raw material lines under a furniture item (or order-wide) and auto-sync Material Track."""
     prj_rows = (
         sb.table("projects")
         .select("id,project_code,customer_name")
@@ -264,7 +266,7 @@ async def add_item_materials_batch(
                 .data
                 or []
             )[0]
-    else:
+    elif not allow_order_wide:
         order_items = (
             sb.table("project_items")
             .select("*")
@@ -282,6 +284,9 @@ async def add_item_materials_batch(
                 "error": {"message": "Please specify which furniture item this material belongs to."},
             }
 
+    target_item_id = target_item["id"] if target_item else None
+    target_item_label = target_item["item_name"] if target_item else "Order-Wide"
+
     inserted_rows: list[dict[str, Any]] = []
     for raw_line in materials or []:
         m_name = str(raw_line.get("material_name") or "").strip()
@@ -292,15 +297,17 @@ async def add_item_materials_batch(
         unit_val = raw_unit or parsed_unit or "pcs"
         cat_val = infer_material_category(m_name, raw_line.get("category"))
         st_val = normalize_material_status(raw_line.get("status"))
+        inv_id = raw_line.get("inventory_item_id") or inventory_item_id
         payload: dict[str, Any] = {
             "project_id": project_id,
-            "item_id": target_item["id"],
+            "item_id": target_item_id,
             "category": cat_val,
             "material_name": m_name,
             "quantity": qty_val,
             "unit": unit_val,
             "status": st_val,
             "notes": (str(raw_line.get("notes") or "").strip() or None),
+            **({"inventory_item_id": inv_id} if inv_id else {}),
         }
         ins = sb.table("item_materials").insert(payload).execute().data or []
         if ins:
@@ -319,7 +326,7 @@ async def add_item_materials_batch(
         .insert(
             {
                 "project_id": project_id,
-                "item_id": target_item["id"],
+                "item_id": target_item_id,
                 "track": "item",
                 "from_stage": None,
                 "to_stage": "material_added",
@@ -357,11 +364,11 @@ async def add_item_materials_batch(
     return {
         "ok": True,
         "project_id": project_id,
-        "item_id": target_item["id"],
+        "item_id": target_item_id,
         "material_ids": created_ids,
         "materials": inserted_rows,
         "undo_event_ids": undo_ids,
-        "receipt": f"🪵 Added {desc} → *{target_item['item_name']}* (`{prj['customer_name']}`)",
+        "receipt": f"🪵 Added {desc} → *{target_item_label}* (`{prj['customer_name']}`)",
     }
 
 

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from typing import Any
+import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 
 from app.auth import CurrentUser, get_current_user
+from app.services.goal_primitives import merge_unique_str_list
 from .common import (
     BulkMaterialStatusRequest,
     FlatItemUpsertRequest,
@@ -95,7 +97,8 @@ async def get_production_overview(
     materials_by_item: dict[str, list[dict[str, Any]]] = {}
     materials_by_order: dict[str, list[dict[str, Any]]] = {}
     for m in materials:
-        materials_by_item.setdefault(m["item_id"], []).append(m)
+        if m.get("item_id"):
+            materials_by_item.setdefault(m["item_id"], []).append(m)
         materials_by_order.setdefault(m["project_id"], []).append(m)
 
     items_by_order: dict[str, list[dict[str, Any]]] = {}
@@ -327,6 +330,33 @@ async def add_item_raw_material(
     return res
 
 
+@router.post("/production/orders/{project_id}/materials")
+async def add_order_wide_raw_material(
+    project_id: str,
+    body: ItemMaterialCreateRequest,
+    user: CurrentUser = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Add a shared Order-Wide raw material line (no furniture item required)."""
+    pkg = _pkg()
+    sb = pkg.get_supabase_admin()
+    actor_id, _ = _resolve_actor_person(sb, user)
+    cur = sb.table("projects").select("id").eq("id", project_id).limit(1).execute().data
+    if not cur:
+        raise HTTPException(status_code=404, detail="Order not found")
+    res = await pkg.step_executors.add_item_materials_batch(
+        sb,
+        project_id=project_id,
+        item_id=None,
+        materials=[body.model_dump()],
+        actor_person_id=actor_id,
+        source_channel="web",
+        allow_order_wide=True,
+    )
+    if not res.get("ok"):
+        raise HTTPException(status_code=400, detail=res.get("error", {}).get("message", "Failed adding order material"))
+    return res
+
+
 @router.patch("/production/materials/{material_id}")
 async def patch_item_raw_material(
     material_id: str,
@@ -446,3 +476,77 @@ async def get_order_timeline(
         }
         for e in events
     ]
+
+
+def _detect_upload_kind(raw: bytes, declared_mime: str | None, filename: str | None, *, allow_pdf: bool) -> str:
+    if not raw:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    if len(raw) > 12 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File exceeds 12 MB upload limit.")
+    dm = (declared_mime or "").split(";")[0].strip().lower()
+    fname = (filename or "").strip().lower()
+    if raw[:3] == b"\xff\xd8\xff" or raw[:8] == b"\x89PNG\r\n\x1a\n" or (len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WEBP"):
+        return "image"
+    if allow_pdf and raw[:16].lstrip().startswith(b"%PDF-"):
+        return "pdf"
+    if dm in {"image/jpeg", "image/jpg", "image/png", "image/webp"} or fname.endswith((".jpg", ".jpeg", ".png", ".webp")):
+        return "image"
+    if allow_pdf and (dm == "application/pdf" or fname.endswith(".pdf")):
+        return "pdf"
+    allowed = "JPG, PNG, WEBP, or PDF" if allow_pdf else "JPG, PNG, or WEBP image"
+    raise HTTPException(status_code=400, detail=f"Unsupported file format. Upload {allowed}.")
+
+
+@router.post("/production/orders/{project_id}/attachments")
+async def upload_order_attachment(
+    project_id: str,
+    file: UploadFile = File(...),
+    user: CurrentUser = Depends(get_current_user),
+) -> dict[str, Any]:
+    pkg = _pkg()
+    sb = pkg.get_supabase_admin()
+    _resolve_actor_person(sb, user)
+    p_rows = sb.table("projects").select("id,metadata").eq("id", project_id).limit(1).execute().data or []
+    if not p_rows:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    raw = await file.read()
+    kind = _detect_upload_kind(raw, file.content_type, file.filename, allow_pdf=True)
+    tok = uuid.uuid4().hex[:10]
+    if kind == "pdf":
+        gcs_path = f"orders/{project_id}/spec-{tok}.pdf"
+        pkg.storage.upload_bytes(gcs_path, raw, content_type="application/pdf")
+    else:
+        gcs_path = f"orders/{project_id}/att-{tok}.webp"
+        pkg.storage.upload_image_as_webp(gcs_path, raw)
+
+    meta = dict(p_rows[0].get("metadata") or {})
+    merged_paths = merge_unique_str_list(meta.get("uploaded_gcs_paths"), [gcs_path])
+    meta["uploaded_gcs_paths"] = merged_paths
+    sb.table("projects").update({"metadata": meta}).eq("id", project_id).execute()
+    return {"ok": True, "project_id": project_id, "path": gcs_path, "uploaded_gcs_paths": merged_paths}
+
+
+@router.post("/production/items/{item_id}/photo")
+async def upload_item_photo(
+    item_id: str,
+    file: UploadFile = File(...),
+    user: CurrentUser = Depends(get_current_user),
+) -> dict[str, Any]:
+    pkg = _pkg()
+    sb = pkg.get_supabase_admin()
+    _resolve_actor_person(sb, user)
+    it_rows = sb.table("project_items").select("id,project_id,metadata").eq("id", item_id).limit(1).execute().data or []
+    if not it_rows:
+        raise HTTPException(status_code=404, detail="Furniture item not found")
+
+    raw = await file.read()
+    _detect_upload_kind(raw, file.content_type, file.filename, allow_pdf=False)
+    gcs_path = f"items/{item_id}/photo-{uuid.uuid4().hex[:10]}.webp"
+    pkg.storage.upload_image_as_webp(gcs_path, raw)
+
+    meta = dict(it_rows[0].get("metadata") or {})
+    photo_paths = merge_unique_str_list(meta.get("photo_paths"), [gcs_path])
+    meta["photo_paths"] = photo_paths
+    sb.table("project_items").update({"pre_pack_photo_path": gcs_path, "metadata": meta}).eq("id", item_id).execute()
+    return {"ok": True, "item_id": item_id, "pre_pack_photo_path": gcs_path, "photo_paths": photo_paths}

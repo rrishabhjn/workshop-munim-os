@@ -1,0 +1,28 @@
+{
+  "cutover_date": "2026-11-23",
+  "salary_month": "2026-11",
+  "orders": [
+    {
+      "project_code": "PRJ-OCT-001",
+      "customer_name": "Ambure Ji",
+      "quoted_total": 2300000,
+      "paid_till_date_inr": 1500000
+    }
+  ],
+  "vendor_udhaar": [
+    {
+      "vendor_name": "R P Wood",
+      "amount_inr": 85000,
+      "bill_no": "OPEN-RPWOOD",
+      "notes": "Pre-cutover Udhaar balance"
+    }
+  ],
+  "salaried_staff": [
+    {
+      "full_name": "Arvind Ji",
+      "monthly_salary_inr": 39000,
+      "advance_paid_inr": 10000,
+      "notes": "Nov salary advance paid before cutover"
+    }
+  ]
+}

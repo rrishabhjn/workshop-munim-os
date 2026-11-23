@@ -262,7 +262,7 @@ def _verify_single_step(
         cust_row = _fetch_one(sb, "customers", cust_id)
         if not prj_row or not cust_row:
             return "Lead project or customer row missing after creation."
-        if prj_row.get("zoho_tag_option_id") and prj_row.get("pipeline_stage") in (
+        if prj_row.get("zoho_tag_option_id") and float(prj_row.get("paid_cache_inr") or 0) <= 0 and prj_row.get("pipeline_stage") in (
             None,
             "lead",
             "design",
@@ -361,10 +361,10 @@ def _verify_single_step(
                 return "Customer receipt did not advance Order Payment Track past 'advance_pending'."
         return None
 
-    if op in ("supplier_draft_bill", "customer_draft_invoice"):
+    if op == "customer_draft_invoice":
         draft_status = str(res.get("draft_status") or "draft").strip().lower()
         if draft_status != "draft":
-            return f"Safety invariant violation: supplier bill status must remain 'draft', got '{draft_status}'."
+            return f"Safety invariant violation: customer invoice status must remain 'draft', got '{draft_status}'."
         return None
 
     return None

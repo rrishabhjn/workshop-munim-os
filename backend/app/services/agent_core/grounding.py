@@ -143,12 +143,17 @@ def _build_compact_grounding(
             telegram_chat_id=telegram_chat_id,
         )
 
+    def _q_today_fin() -> list[dict[str, Any]]:
+        from app.services.agent_core.financial_amendments import build_today_completed_financial_tray
+
+        return build_today_completed_financial_tray(sb, max_goals=10)
+
     if hasattr(sb, "store"):
-        accounts, people, rules, raw_open_rows, active_orders_raw, ui_prj, recent_turns = (
-            _q_accounts(), _q_people(), _q_rules(), _q_goals(), _q_orders(), _q_ui_prj(), _q_recent(),
+        accounts, people, rules, raw_open_rows, active_orders_raw, ui_prj, recent_turns, today_fin = (
+            _q_accounts(), _q_people(), _q_rules(), _q_goals(), _q_orders(), _q_ui_prj(), _q_recent(), _q_today_fin(),
         )
     else:
-        with ThreadPoolExecutor(max_workers=7) as pool:
+        with ThreadPoolExecutor(max_workers=8) as pool:
             f_acc = pool.submit(_q_accounts)
             f_ppl = pool.submit(_q_people)
             f_rul = pool.submit(_q_rules)
@@ -156,8 +161,9 @@ def _build_compact_grounding(
             f_ord = pool.submit(_q_orders)
             f_uip = pool.submit(_q_ui_prj)
             f_rec = pool.submit(_q_recent)
-            accounts, people, rules, raw_open_rows, active_orders_raw, ui_prj, recent_turns = (
-                f_acc.result(), f_ppl.result(), f_rul.result(), f_gol.result(), f_ord.result(), f_uip.result(), f_rec.result(),
+            f_tdf = pool.submit(_q_today_fin)
+            accounts, people, rules, raw_open_rows, active_orders_raw, ui_prj, recent_turns, today_fin = (
+                f_acc.result(), f_ppl.result(), f_rul.result(), f_gol.result(), f_ord.result(), f_uip.result(), f_rec.result(), f_tdf.result(),
             )
 
     acc_code_to_id = {a["code"]: a["id"] for a in accounts}
@@ -231,6 +237,7 @@ def _build_compact_grounding(
         "open_goals_tray": build_compact_open_goals_tray(
             open_rows, max_goals=10, reply_to_bot_msg_id=reply_to_bot_msg_id
         ),
+        "recent_completed_financial_today": today_fin,
         "recent_conversation_turns": recent_turns,
         "currently_open_ui_order": ui_prj,
     }
@@ -265,7 +272,12 @@ def _build_system_instruction(grounding_json: str) -> str:
         "AND/OR stage a brand-new update via an action tool. Never drop either half! "
         "If an item in `open_goals_tray` has `replied_directly=true`, or the user gives a short reply or correction "
         "(e.g. 'Jaipur', 'Axis se nahi RGB se', 'amount 5500 hai', an account, or a mistri name), ALWAYS call `resolve_open_goal` with `goal_id` "
-        "and populate the updated/missing slot(s) — NEVER answer an open clarification or card correction with plain text alone!\n"
+        "and populate the updated/missing slot(s) — NEVER answer an open clarification or card correction with plain text alone! "
+        "If the user is correcting or tagging an already-confirmed entry from earlier TODAY (listed in `recent_completed_financial_today`, "
+        "e.g. 'Actually in cash', 'Iliyas wala Rohit wallet se tha', 'add above transport to Rajyawas site'), call `amend_recent_financial_entry` with `prior_goal_id` "
+        "(it voids the prior entry and saves the corrected replacement on Confirm). "
+        "If the user creates a brand-new order AND pays an initial customer advance in the SAME message (e.g. 'New order for X, Deal 1.2L, Advance 40k Axis'), "
+        "pass `advance_amount_inr` and `payment_account_code` directly in ONE `stage_new_order` call!\n"
         "3. NEW CUSTOMER ONBOARDING (X, Y, Z): If a customer is brand-new, require ALL 3 of: "
         "`full_name`, `area_landmark` (locality/city like Civil Lines, Ajmer Road, Jaipur), and `rough_scope` "
         "(items/rooms). A standalone city name (e.g. 'Jaipur', 'Beawar', 'Ajmer', 'Chittorgarh') is 100% sufficient for "
@@ -285,7 +297,8 @@ def _build_system_instruction(grounding_json: str) -> str:
         "   - ALL Money IN (`received`, `mila`, customer advance OR walk-in/counter material sale like '1,05,000 cash sales to Chiranji Lal for door and laminate sales') -> "
         "call `stage_financial_entry` with `entry_kind='customer_receipt'` (books to Zoho Sales Revenue). Attach `project_id` ONLY if an active Production order matches — never force a fake Production project for counter sales!\n"
         "   - Explicit Receivables ('X owes us ₹...', 'baki lena hai') -> `entry_kind='customer_draft_invoice'` (creates Zoho Draft Invoice AR; no account needed).\n"
-        "   - Explicit Payables ('we owe Y ₹...', 'udhaar bill', or an unpaid supplier bill photo/PDF) -> `entry_kind='supplier_draft_bill'` (creates Zoho Draft Bill AP).\n"
+        "   - Explicit Payables ('we owe Y ₹...', 'udhaar bill', or an unpaid supplier bill photo/PDF) -> `entry_kind='supplier_draft_bill'` (posts as Zoho Open AP Bill that auto-clears FIFO on vendor payments).\n"
+        "   - Workshop Inventory (`search_inventory`, `stage_inventory_action`): use `action_kind='load'` for stock Gate-Ins or mixed Stock+Order bills (`settlement_mode`: 'paid_now'|'vendor_udhaar'|'manual'|'rate_pending'; pass `matched_item_material_id` from `search_projects_and_items.open_materials` when fulfilling an open order line), `action_kind='attribute'` to pull stock onto an order, and `action_kind='count_adjust'` for physical count adjustments.\n"
         "   - Use `vendor_payment` / `customer_payment` ONLY if the user explicitly says 'settled bill' / 'udhaar chukaya' / 'against pending invoice'.\n"
         "   - Always populate `amount_inr` (number), `payment_account_code` (for inflows/expenses/transfers), and `party_name`; preserve extra context in `notes`. Never put a Supabase UUID into `zoho_contact_id`.\n"
         "5. PRODUCTION LIFECYCLE STAGES & ITEM RAW MATERIALS:\n"

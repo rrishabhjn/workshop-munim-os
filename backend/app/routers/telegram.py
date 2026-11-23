@@ -35,7 +35,42 @@ from app.services.goal_primitives import (
 router = APIRouter(tags=["telegram"])
 logger = logging.getLogger(__name__)
 _BURST_LOCKS: dict[tuple[int, int], asyncio.Lock] = {}
-_STALE_CLAIM_SECONDS = 120
+_STALE_CLAIM_SECONDS = 60
+
+
+def _detect_supported_media_mime(
+    data: bytes,
+    declared_mime: str | None = None,
+    file_name: str | None = None,
+    file_path: str | None = None,
+) -> str | None:
+    """Sniff supported image/PDF formats from magic bytes, MIME, or extension."""
+    if data:
+        if data[:3] == b"\xff\xd8\xff":
+            return "image/jpeg"
+        if data[:8] == b"\x89PNG\r\n\x1a\n":
+            return "image/png"
+        if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            return "image/webp"
+        if data[:16].lstrip().startswith(b"%PDF-"):
+            return "application/pdf"
+
+    dm = (declared_mime or "").split(";")[0].strip().lower()
+    if dm == "image/jpg":
+        dm = "image/jpeg"
+    if dm in {"image/jpeg", "image/png", "image/webp", "application/pdf"}:
+        return dm
+
+    ref = (file_name or file_path or "").strip().lower()
+    if ref.endswith((".jpg", ".jpeg")):
+        return "image/jpeg"
+    if ref.endswith(".png"):
+        return "image/png"
+    if ref.endswith(".webp"):
+        return "image/webp"
+    if ref.endswith(".pdf"):
+        return "application/pdf"
+    return None
 
 
 def _get_burst_lock(chat_id: int, user_id: int) -> asyncio.Lock:
@@ -154,6 +189,24 @@ def _dispatch_to_cloud_tasks(
 # ---------------------------------------------------------------------------
 # Inline Keyboards for AgentCore Goal States
 # ---------------------------------------------------------------------------
+def _build_choice_rows(gid: str, choices: list[dict[str, Any]]) -> list[list[dict[str, str]]]:
+    rows: list[list[dict[str, str]]] = []
+    btns = [
+        {
+            "text": str(ch.get("label") or f"Option {idx + 1}")[:48],
+            "callback_data": f"ag_choice:{gid}:{idx}",
+        }
+        for idx, ch in enumerate(choices[:4])
+    ]
+    if len(btns) >= 2 and all(len(b["text"]) <= 22 for b in btns):
+        for i in range(0, len(btns), 2):
+            rows.append(btns[i : i + 2])
+    else:
+        for b in btns:
+            rows.append([b])
+    return rows
+
+
 def _build_goal_keyboard(goal_out: dict[str, Any]) -> dict[str, Any] | None:
     gid = str(goal_out.get("goal_id") or "")
     st = goal_out.get("status")
@@ -165,29 +218,16 @@ def _build_goal_keyboard(goal_out: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
     if st in ("awaiting_confirmation", "transient_retry_pending"):
-        return {
-            "inline_keyboard": [[
-                {"text": "✅ Confirm", "callback_data": f"ag_confirm:{gid}"},
-                {"text": "📥 Clerk Later", "callback_data": f"ag_park:{gid}"},
-                {"text": "❌ Discard", "callback_data": f"ag_discard:{gid}"},
-            ]]
-        }
+        rows = _build_choice_rows(gid, choices) if choices else []
+        rows.append([
+            {"text": "✅ Confirm", "callback_data": f"ag_confirm:{gid}"},
+            {"text": "📥 Clerk Later", "callback_data": f"ag_park:{gid}"},
+            {"text": "❌ Discard", "callback_data": f"ag_discard:{gid}"},
+        ])
+        return {"inline_keyboard": rows}
 
     if st in ("gathering_info", "needs_error_fix"):
-        rows: list[list[dict[str, str]]] = []
-        btns = [
-            {
-                "text": str(ch.get("label") or f"Option {idx + 1}")[:48],
-                "callback_data": f"ag_choice:{gid}:{idx}",
-            }
-            for idx, ch in enumerate(choices[:4])
-        ]
-        if len(btns) >= 2 and all(len(b["text"]) <= 22 for b in btns):
-            for i in range(0, len(btns), 2):
-                rows.append(btns[i : i + 2])
-        else:
-            for b in btns:
-                rows.append([b])
+        rows = _build_choice_rows(gid, choices)
         bottom_row = []
         if st == "needs_error_fix":
             bottom_row.append({"text": "📥 Let Clerk Fix Later", "callback_data": f"ag_park:{gid}"})
@@ -245,7 +285,21 @@ async def _handle_agent_callback(
         return {"ok": True}
 
     if cmd == "ag_undo":
-        res = agent_core.undo_completed_goal(sb, goal_id=goal_id, actor_person_id=actor_id)
+        undo_async = getattr(agent_core, "undo_completed_goal_async", None)
+        if undo_async is not None:
+            res = await undo_async(sb, goal_id=goal_id, actor_person_id=actor_id)
+        else:
+            res = agent_core.undo_completed_goal(sb, goal_id=goal_id, actor_person_id=actor_id)
+        if not res.get("ok"):
+            err_msg = str(res.get("error") or "Undo failed.")
+            if not already_answered:
+                await telegram_api.answer_callback_query(cq_id, err_msg[:180])
+            await telegram_api.send_message(
+                chat_id=chat_id,
+                text=f"⚠️ *Undo nahi ho saka:* {err_msg}",
+                reply_to_message_id=message_id,
+            )
+            return {"ok": False, "error": err_msg}
         summary = ", ".join(res.get("reverted") or []) or "Reverted."
         await telegram_api.edit_message_text(
             chat_id=chat_id,
@@ -320,16 +374,15 @@ async def _handle_agent_callback(
 # ---------------------------------------------------------------------------
 # 2.5s Debounced Burst Worker
 # ---------------------------------------------------------------------------
-async def process_debounced_burst(
-    chat_id: int, user_id: int, wait_locally: bool = False
-) -> None:
-    settings = get_settings()
-    debounce_s = max(float(settings.telegram_burst_debounce_seconds or 0.0), 0.0)
-    if wait_locally and debounce_s > 0:
-        await asyncio.sleep(debounce_s)
-
-    sb = get_supabase_admin()
-    claimed_rows: list[dict[str, Any]] = []
+async def _claim_next_telegram_burst(
+    sb: Any,
+    chat_id: int,
+    user_id: int,
+    debounce_s: float,
+    *,
+    apply_debounce: bool,
+) -> list[dict[str, Any]]:
+    """Atomically claim the next ready burst for (chat_id, user_id), enforcing 1 active turn at a time."""
     async with _get_burst_lock(chat_id, user_id):
         for attempt in range(3):
             now_utc = datetime.now(timezone.utc)
@@ -344,7 +397,7 @@ async def process_debounced_burst(
                 or []
             )
             if not active_rows:
-                return
+                return []
 
             stale_cutoff = now_utc - timedelta(seconds=_STALE_CLAIM_SECONDS)
             recovered_ids: set[str] = set()
@@ -357,15 +410,23 @@ async def process_debounced_burst(
                         ).eq("id", r["id"]).eq("status", "claimed").execute()
                         recovered_ids.add(str(r["id"]))
 
+            still_claimed = any(
+                r.get("status") == "claimed" and str(r.get("id")) not in recovered_ids
+                for r in active_rows
+            )
+            if still_claimed:
+                # Active worker owns this (chat_id, user_id); it will drain buffered rows next.
+                return []
+
             buffered_rows = [
                 r
                 for r in active_rows
                 if r.get("status") == "buffered" or str(r.get("id")) in recovered_ids
             ]
             if not buffered_rows:
-                return
+                return []
 
-            if debounce_s > 0 and attempt < 2:
+            if apply_debounce and debounce_s > 0 and attempt < 2:
                 created_times = [
                     ts
                     for ts in (_parse_iso_ts(r.get("created_at")) for r in buffered_rows)
@@ -380,7 +441,7 @@ async def process_debounced_burst(
 
             claim_token = str(uuid.uuid4())
             target_ids = [r["id"] for r in buffered_rows]
-            claimed_rows = (
+            return (
                 sb.table("telegram_inbox_buffer")
                 .update(
                     {
@@ -397,23 +458,30 @@ async def process_debounced_burst(
                 .data
                 or []
             )
-            break
+    return []
 
-    if not claimed_rows:
-        return
 
+async def _process_claimed_telegram_burst(
+    sb: Any,
+    claimed_rows: list[dict[str, Any]],
+    *,
+    chat_id: int,
+    user_id: int,
+    settings: Settings,
+) -> None:
     row_ids = [r["id"] for r in claimed_rows]
     domain_channel = claimed_rows[0].get("domain_channel") or _resolve_domain_channel(chat_id, settings)
 
-    # Hold Attendance Group cleanly for Wave 2 rollout
     if domain_channel == "attendance":
         sb.table("telegram_inbox_buffer").update(
             {"status": "ignored", "processed_at": datetime.now(timezone.utc).isoformat()}
         ).in_("id", row_ids).execute()
         return
 
+    reply_to_on_err: int | None = None
     try:
         merged = merge_buffered_telegram_burst(claimed_rows)
+        reply_to_on_err = merged.get("latest_message_id")
         first_raw = claimed_rows[0].get("raw_payload") or {}
         first_msg = first_raw.get("message") or first_raw.get("edited_message") or {}
         is_group = first_msg.get("chat", {}).get("type", "private") != "private"
@@ -483,12 +551,36 @@ async def process_debounced_burst(
         extra_audio_files = voice_clips[1:] or None
 
         media_files: list[tuple[bytes, str]] = []
+        unsupported_docs: list[str] = []
         for fid in merged["photo_file_ids"]:
-            b_data, _ = await telegram_api.download_file_bytes(fid)
-            media_files.append((b_data, "image/jpeg"))
-        for dfid in merged["document_file_ids"]:
-            b_data, _ = await telegram_api.download_file_bytes(dfid)
-            media_files.append((b_data, "application/pdf"))
+            b_data, dl_path = await telegram_api.download_file_bytes(fid)
+            photo_mime = _detect_supported_media_mime(b_data, "image/jpeg", None, dl_path) or "image/jpeg"
+            media_files.append((b_data, photo_mime))
+        doc_items = merged.get("documents") or [{"file_id": dfid} for dfid in merged["document_file_ids"]]
+        for doc in doc_items:
+            b_data, dl_path = await telegram_api.download_file_bytes(doc["file_id"])
+            doc_mime = _detect_supported_media_mime(
+                b_data, doc.get("mime_type"), doc.get("file_name"), dl_path
+            )
+            if doc_mime:
+                media_files.append((b_data, doc_mime))
+            else:
+                unsupported_docs.append(str(doc.get("file_name") or doc.get("mime_type") or "file"))
+
+        if unsupported_docs and not media_files and not voice_clips and not combined_text:
+            await telegram_api.send_message(
+                chat_id=chat_id,
+                text=(
+                    "⚠️ Ye file format abhi support nahi hai "
+                    f"(`{', '.join(unsupported_docs[:2])}`). Kripya *PDF* ya *Photo (JPG/PNG/WEBP)* bhejein, "
+                    "ya details text/voice me likhein."
+                ),
+                reply_to_message_id=merged["latest_message_id"],
+            )
+            sb.table("telegram_inbox_buffer").update(
+                {"status": "processed", "processed_at": datetime.now(timezone.utc).isoformat()}
+            ).in_("id", row_ids).execute()
+            return
 
         turn_res = await agent_core.run_agent_turn(
             sb,
@@ -506,6 +598,8 @@ async def process_debounced_burst(
         )
 
         heard_hdr = format_voice_receipt_header(turn_res.get("heard_transcript"))
+        if unsupported_docs:
+            heard_hdr = f"{heard_hdr}⚠️ _Unsupported file skipped ({', '.join(unsupported_docs[:2])}); only PDF/JPG/PNG supported._\n"
         reply_to = merged["latest_message_id"]
 
         # Rec #3: Strip inline buttons from superseded / resolved Telegram cards before posting updated cards
@@ -564,6 +658,41 @@ async def process_debounced_burst(
         sb.table("telegram_inbox_buffer").update(
             {"status": "failed", "processed_at": datetime.now(timezone.utc).isoformat()}
         ).in_("id", row_ids).execute()
+        try:
+            await telegram_api.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"⚠️ Maaf kijiye, message process karne me error aa gaya (`{type(exc).__name__}`). "
+                    "Kripya dobara bhejein ya photo/text clear karke try karein."
+                ),
+                reply_to_message_id=reply_to_on_err,
+            )
+        except Exception as send_exc:
+            logger.warning("Could not send Telegram failure notice for chat=%s: %s", chat_id, send_exc)
+
+
+async def process_debounced_burst(
+    chat_id: int, user_id: int, wait_locally: bool = False
+) -> None:
+    settings = get_settings()
+    debounce_s = max(float(settings.telegram_burst_debounce_seconds or 0.0), 0.0)
+    if wait_locally and debounce_s > 0:
+        await asyncio.sleep(debounce_s)
+
+    sb = get_supabase_admin()
+    for _drain_pass in range(5):
+        claimed_rows = await _claim_next_telegram_burst(
+            sb,
+            chat_id,
+            user_id,
+            debounce_s,
+            apply_debounce=(_drain_pass == 0),
+        )
+        if not claimed_rows:
+            return
+        await _process_claimed_telegram_burst(
+            sb, claimed_rows, chat_id=chat_id, user_id=user_id, settings=settings
+        )
 
 
 # ---------------------------------------------------------------------------

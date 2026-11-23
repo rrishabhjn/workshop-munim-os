@@ -36,7 +36,7 @@ Do NOT create a brand-new shared Gmail and immediately log into it from both the
 ## Wave 2 — Wire Zoho, Desktop Auth & Backups
 6. **Zoho Books India (`zoho.in/books` — Standard Plan ~₹749/mo):**
    - Sign up strictly on `zoho.in` (India DC) on the **Standard Plan** (no Professional `Projects` upgrade needed), set state to Rajasthan (`08`), configure as a **GST-off (or tax-exempt default) Internal Management Ledger**, create a Reporting Tag named `Project` (plus custom field `cf_project_code`), and add your Bank/OD accounts, `Cash Galla`, and `Petty Cash` Supervisor Floats.
-   - At `api-console.zoho.in`, create a **Self Client** with scopes `ZohoBooks.bills.ALL,ZohoBooks.expenses.ALL,ZohoBooks.banking.ALL,ZohoBooks.customerpayments.ALL,ZohoBooks.vendorpayments.ALL,ZohoBooks.invoices.ALL,ZohoBooks.contacts.ALL,ZohoBooks.settings.ALL`, and exchange grant code once for `ZOHO_REFRESH_TOKEN`.
+   - At `api-console.zoho.in`, create a **Self Client** with scopes `ZohoBooks.bills.ALL,ZohoBooks.expenses.ALL,ZohoBooks.banking.ALL,ZohoBooks.customerpayments.ALL,ZohoBooks.vendorpayments.ALL,ZohoBooks.invoices.ALL,ZohoBooks.contacts.ALL,ZohoBooks.settings.ALL,ZohoBooks.accountants.ALL`, and exchange grant code once for `ZOHO_REFRESH_TOKEN`.
 7. **Google OAuth Client (Desktop/Shop PC Browser Sign-In):**
    - Create OAuth 2.0 Web Client ID in GCP Console and configure it under Supabase Auth -> Providers -> Google.
 8. **Nightly Read-Only Backup Google Sheet:**
