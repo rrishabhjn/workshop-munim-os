@@ -333,6 +333,9 @@ async def execute_inventory_load(
             if ins:
                 created_movements.append(ins[0])
 
+    if mode == "paid_now" and not zoho_res.get("stubbed"):
+        await zoho.best_effort_sync_after_mutation(sb)
+
     total_val = round(sum(float(ln.get("total_inr") or 0) for ln in prepared), 2)
     summary_val = "Rate Pending" if mode == "rate_pending" else format_inr(total_val)
     return {
@@ -484,6 +487,9 @@ async def complete_rate_pending_movement(
             "metadata": meta_upd,
             **({"notes": notes.strip()} if notes and notes.strip() else {}),
         }).eq("id", r["id"]).execute()
+
+    if mode == "paid_now" and not zoho_res.get("stubbed"):
+        await zoho.best_effort_sync_after_mutation(sb)
 
     total_sum = round(sum(zl["total_inr"] for zl in z_lines), 2)
     return {
@@ -772,5 +778,8 @@ async def undo_inventory_movement(
         sb.table("inventory_movements").update({
             "is_undone": True, "undone_at": now_iso, "undone_by_person_id": actor_person_id
         }).eq("id", r["id"]).execute()
+
+    if z_deleted:
+        await zoho.best_effort_sync_after_mutation(sb)
 
     return {"ok": True, "reverted_count": len(batch_rows), "receipt": f"↩️ Reverted {len(batch_rows)} inventory entry(s)."}

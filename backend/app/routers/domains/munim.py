@@ -29,6 +29,7 @@ async def get_munim_overview(
     pkg = _pkg()
     sb = pkg.get_supabase_admin()
     actor_id, actor_name = _require_munim_access(sb, user)
+    await pkg.zoho.ensure_fresh_owner_pulse(sb)
     accounts = sb.table("payment_accounts").select("*").eq("is_active", True).order("sort_order").execute().data or []
     pnl = sb.table("v_project_pnl").select("*").eq("project_type", "customer").order("promised_delivery_date").limit(80).execute().data or []
     customers = sb.table("customers").select("*").eq("is_active", True).order("full_name").limit(200).execute().data or []

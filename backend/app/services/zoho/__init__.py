@@ -48,6 +48,9 @@ from app.services.zoho.ledger import (
 )
 from app.services.zoho.mutations import delete_zoho_financial_entry
 from app.services.zoho.sync import (
+    best_effort_sync_after_mutation,
+    coalesce_zoho_sync,
+    ensure_fresh_owner_pulse,
     list_recent_ledger_transactions,
     sync_owner_pulse_snapshot,
     sync_project_financial_caches,
@@ -71,12 +74,15 @@ __all__ = [
     "_token_cache",
     "_upsert_entity_alias",
     "_zoho_request",
+    "best_effort_sync_after_mutation",
     "build_fifo_vendor_bill_allocations",
     "check_duplicate_bill",
+    "coalesce_zoho_sync",
     "create_draft_bill",
     "create_draft_invoice",
     "create_zoho_contact",
     "delete_zoho_financial_entry",
+    "ensure_fresh_owner_pulse",
     "ensure_project_zoho_bridge",
     "extract_project_matched_doc_amount",
     "find_matching_active_orders",

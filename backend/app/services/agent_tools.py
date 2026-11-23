@@ -354,6 +354,7 @@ async def _tool_query_workshop_pulse(
         txns = await zoho.list_recent_ledger_transactions(sb, limit=20, party_query=filter_query)
         return {"transactions": txns}
     if topic == "account_balances":
+        await zoho.ensure_fresh_owner_pulse(sb)
         accs = (
             sb.table("payment_accounts")
             .select("code,display_name,account_kind,cached_balance_inr,balance_synced_at")

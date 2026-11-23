@@ -47,6 +47,10 @@ from app.services.goal_primitives import (
 )
 
 logger = logging.getLogger(__name__)
+_GOAL_BALANCE_SYNC_OPS = frozenset({
+    "customer_receipt", "customer_payment", "vendor_payment",
+    "expense", "float_transfer", "void_prior_goal", "inventory_load",
+})
 
 
 def _pkg() -> Any:
@@ -81,138 +85,187 @@ async def confirm_and_execute_goal(
     receipts: list[str] = []
     undo_ids: list[str] = list(claimed.get("undo_event_ids") or [])
 
-    for idx, step in enumerate(steps):
-        if step.get("status") == "succeeded":
-            if step.get("result", {}).get("receipt"):
-                receipts.append(step["result"]["receipt"])
-            continue
+    async with zoho.coalesce_zoho_sync(sb):
+        for idx, step in enumerate(steps):
+            if step.get("status") == "succeeded":
+                if step.get("result", {}).get("receipt"):
+                    receipts.append(step["result"]["receipt"])
+                continue
 
-        op = step.get("operation")
-        is_child_step = idx > 0 or str(op) != str(slots.get("operation_kind") or op)
-        if is_child_step:
-            raw_child = dict(step.get("payload") or {})
-            step_slots = {
-                **slots,
-                **{k: v for k, v in raw_child.items() if v is not None},
-            }
-            if str(op) == "item_upsert_or_move" and "specs_notes" in raw_child and raw_child["specs_notes"] is None:
-                step_slots.pop("specs_notes", None)
-            _sanitize_and_resolve_slot_ids(sb, step_slots)
-        else:
-            step_slots = slots
-
-        digest_blob = " ".join(
-            str(d.get("user") or "")
-            for d in (claimed.get("turn_digest") or [])
-            if isinstance(d, dict)
-        )
-        res = await pkg._run_single_step(
-            sb,
-            goal_id=goal_id,
-            step_index=idx,
-            op=str(op),
-            slots=step_slots,
-            actor_person_id=actor_person_id,
-            actor_label=actor_label,
-            source_channel=source_channel,
-            heard_transcript=heard,
-            goal_domain_scope=claimed.get("domain_scope"),
-            turn_digest_text=" ".join(filter(None, [digest_blob, str(claimed.get("summary_title") or "")])),
-        )
-
-        if res.get("ok"):
-            step["status"] = "succeeded"
-            step["error_kind"] = "none"
-            step["result"] = res
-            receipts.append(res.get("receipt") or "Done")
-            undo_ids.extend(res.get("undo_event_ids") or [])
-            if res.get("project_id"):
-                slots["project_id"] = res["project_id"]
-            if res.get("customer_id"):
-                slots["customer_id"] = res["customer_id"]
-            continue
-
-        # Step failed: distinguish Transient 5xx/429 vs Validation 400!
-        err_kind = res.get("error_kind") or "validation_400"
-        step["retry_count"] = int(step.get("retry_count") or 0) + 1
-        step["error_kind"] = err_kind
-        step["error_detail"] = res.get("error")
-
-        if err_kind == "transient_5xx":
-            attempt = int(step.get("retry_count") or 1)
-            if attempt <= goal_intelligence.MAX_AUTO_ZOHO_RETRIES:
-                step["status"] = "failed_transient"
-                retry_info = goal_intelligence.enqueue_goal_retry_task(
-                    goal_id=goal_id,
-                    actor_person_id=actor_person_id,
-                    actor_label=actor_label,
-                    attempt=attempt,
-                )
-                meta_retry = {
-                    **(claimed.get("metadata") or {}),
-                    "auto_retry_attempt": attempt,
-                    "auto_retry_queued": bool(retry_info.get("queued")),
+            op = step.get("operation")
+            is_child_step = idx > 0 or str(op) != str(slots.get("operation_kind") or op)
+            if is_child_step:
+                raw_child = dict(step.get("payload") or {})
+                step_slots = {
+                    **slots,
+                    **{k: v for k, v in raw_child.items() if v is not None},
                 }
-                pending_msg = (
-                    f"⏳ Zoho/network busy — auto-retry {attempt}/"
-                    f"{goal_intelligence.MAX_AUTO_ZOHO_RETRIES} scheduled (idempotency protected)."
+                if str(op) == "item_upsert_or_move" and "specs_notes" in raw_child and raw_child["specs_notes"] is None:
+                    step_slots.pop("specs_notes", None)
+                _sanitize_and_resolve_slot_ids(sb, step_slots)
+            else:
+                step_slots = slots
+
+            digest_blob = " ".join(
+                str(d.get("user") or "")
+                for d in (claimed.get("turn_digest") or [])
+                if isinstance(d, dict)
+            )
+            res = await pkg._run_single_step(
+                sb,
+                goal_id=goal_id,
+                step_index=idx,
+                op=str(op),
+                slots=step_slots,
+                actor_person_id=actor_person_id,
+                actor_label=actor_label,
+                source_channel=source_channel,
+                heard_transcript=heard,
+                goal_domain_scope=claimed.get("domain_scope"),
+                turn_digest_text=" ".join(filter(None, [digest_blob, str(claimed.get("summary_title") or "")])),
+            )
+
+            if res.get("ok"):
+                step["status"] = "succeeded"
+                step["error_kind"] = "none"
+                step["result"] = res
+                receipts.append(res.get("receipt") or "Done")
+                undo_ids.extend(res.get("undo_event_ids") or [])
+                if res.get("project_id"):
+                    slots["project_id"] = res["project_id"]
+                if res.get("customer_id"):
+                    slots["customer_id"] = res["customer_id"]
+                continue
+
+            # Step failed: distinguish Transient 5xx/429 vs Validation 400!
+            err_kind = res.get("error_kind") or "validation_400"
+            step["retry_count"] = int(step.get("retry_count") or 0) + 1
+            step["error_kind"] = err_kind
+            step["error_detail"] = res.get("error")
+
+            if err_kind == "transient_5xx":
+                attempt = int(step.get("retry_count") or 1)
+                if attempt <= goal_intelligence.MAX_AUTO_ZOHO_RETRIES:
+                    step["status"] = "failed_transient"
+                    retry_info = goal_intelligence.enqueue_goal_retry_task(
+                        goal_id=goal_id,
+                        actor_person_id=actor_person_id,
+                        actor_label=actor_label,
+                        attempt=attempt,
+                    )
+                    meta_retry = {
+                        **(claimed.get("metadata") or {}),
+                        "auto_retry_attempt": attempt,
+                        "auto_retry_queued": bool(retry_info.get("queued")),
+                    }
+                    pending_msg = (
+                        f"⏳ Zoho/network busy — auto-retry {attempt}/"
+                        f"{goal_intelligence.MAX_AUTO_ZOHO_RETRIES} scheduled (idempotency protected)."
+                    )
+                    sb.table("agent_goals").update(
+                        {
+                            "status": "awaiting_confirmation",
+                            "steps": steps,
+                            "metadata": meta_retry,
+                            "pending_prompt": pending_msg,
+                        }
+                    ).eq("id", goal_id).execute()
+                    return {
+                        "goal_id": goal_id,
+                        "status": "transient_retry_pending",
+                        "auto_retry_attempt": attempt,
+                        "auto_retry_queued": bool(retry_info.get("queued")),
+                        "summary_title": claimed.get("summary_title"),
+                        "prompt": (
+                            f"⏳ Zoho momentarily busy — auto-retry {attempt}/"
+                            f"{goal_intelligence.MAX_AUTO_ZOHO_RETRIES} scheduled in background (safe & idempotent)."
+                        ),
+                        "choices": [],
+                    }
+
+                step["status"] = "failed_transient"
+                exhausted_msg = (
+                    "⚠️ Zoho remained unreachable after 3 automatic retries — "
+                    "tap Confirm later or park for Clerk."
                 )
                 sb.table("agent_goals").update(
                     {
-                        "status": "awaiting_confirmation",
+                        "status": "needs_error_fix",
                         "steps": steps,
-                        "metadata": meta_retry,
-                        "pending_prompt": pending_msg,
+                        "pending_prompt": exhausted_msg,
+                        "repair_options": [],
                     }
                 ).eq("id", goal_id).execute()
                 return {
                     "goal_id": goal_id,
-                    "status": "transient_retry_pending",
-                    "auto_retry_attempt": attempt,
-                    "auto_retry_queued": bool(retry_info.get("queued")),
+                    "status": "needs_error_fix",
                     "summary_title": claimed.get("summary_title"),
-                    "prompt": (
-                        f"⏳ Zoho momentarily busy — auto-retry {attempt}/"
-                        f"{goal_intelligence.MAX_AUTO_ZOHO_RETRIES} scheduled in background (safe & idempotent)."
-                    ),
+                    "prompt": exhausted_msg,
                     "choices": [],
+                    "can_park_for_clerk": True,
                 }
 
-            step["status"] = "failed_transient"
-            exhausted_msg = (
-                "⚠️ Zoho remained unreachable after 3 automatic retries — "
-                "tap Confirm later or park for Clerk."
-            )
-            sb.table("agent_goals").update(
-                {
+            err_obj = res.get("error") or {}
+            if err_kind == "auth_401" or (isinstance(err_obj, dict) and err_obj.get("code") == 57):
+                step["status"] = "failed_validation"
+                detail_msg = err_obj.get("message") if isinstance(err_obj, dict) else str(err_obj)
+                auth_msg = (
+                    f"🔒 Zoho Books permission/auth error ({detail_msg or 'Unauthorized'}) — "
+                    "Zoho OAuth token scope check karein ya Clerk queue mein park karein."
+                )
+                sb.table("agent_goals").update(
+                    {
+                        "status": "needs_error_fix",
+                        "steps": steps,
+                        "pending_prompt": auth_msg,
+                        "repair_options": [],
+                    }
+                ).eq("id", goal_id).execute()
+                return {
+                    "goal_id": goal_id,
                     "status": "needs_error_fix",
-                    "steps": steps,
-                    "pending_prompt": exhausted_msg,
-                    "repair_options": [],
+                    "summary_title": claimed.get("summary_title"),
+                    "prompt": auth_msg,
+                    "choices": [],
+                    "can_park_for_clerk": True,
                 }
-            ).eq("id", goal_id).execute()
-            return {
-                "goal_id": goal_id,
-                "status": "needs_error_fix",
-                "summary_title": claimed.get("summary_title"),
-                "prompt": exhausted_msg,
-                "choices": [],
-                "can_park_for_clerk": True,
-            }
 
-        err_obj = res.get("error") or {}
-        if err_kind == "auth_401" or (isinstance(err_obj, dict) and err_obj.get("code") == 57):
+            # Validation 400 -> Invoke Hydrogen ('medium' thinking) Self-Healing!
             step["status"] = "failed_validation"
-            detail_msg = err_obj.get("message") if isinstance(err_obj, dict) else str(err_obj)
-            auth_msg = (
-                f"🔒 Zoho Books permission/auth error ({detail_msg or 'Unauthorized'}) — "
-                "Zoho OAuth token scope check karein ya Clerk queue mein park karein."
+            diagnosis = await _diagnose_validation_error_with_hydrogen(
+                summary_title=claimed.get("summary_title") or op,
+                slots=slots,
+                error_obj=res.get("error") or {},
             )
+            repairs = [c.model_dump() for c in diagnosis.repair_options]
             sb.table("agent_goals").update(
                 {
                     "status": "needs_error_fix",
                     "steps": steps,
-                    "pending_prompt": auth_msg,
+                    "pending_prompt": diagnosis.explanation_hinglish,
+                    "repair_options": repairs,
+                }
+            ).eq("id", goal_id).execute()
+            return {
+                "goal_id": goal_id,
+                "status": "needs_error_fix",
+                "summary_title": claimed.get("summary_title"),
+                "prompt": diagnosis.explanation_hinglish,
+                "choices": repairs,
+                "can_park_for_clerk": True,
+            }
+
+        verification = goal_intelligence.verify_committed_goal_steps(
+            sb, steps=steps, slots=slots
+        )
+        if not verification.get("verified"):
+            msg = f"⚠️ Post-save verification caught a mismatch: {verification.get('mismatch')}"
+            sb.table("agent_goals").update(
+                {
+                    "status": "needs_error_fix",
+                    "steps": steps,
+                    "collected_slots": slots,
+                    "pending_prompt": msg,
                     "repair_options": [],
                 }
             ).eq("id", goal_id).execute()
@@ -220,76 +273,31 @@ async def confirm_and_execute_goal(
                 "goal_id": goal_id,
                 "status": "needs_error_fix",
                 "summary_title": claimed.get("summary_title"),
-                "prompt": auth_msg,
+                "prompt": msg,
                 "choices": [],
                 "can_park_for_clerk": True,
+                "verification": verification,
             }
 
-        # Validation 400 -> Invoke Hydrogen ('medium' thinking) Self-Healing!
-        step["status"] = "failed_validation"
-        diagnosis = await _diagnose_validation_error_with_hydrogen(
-            summary_title=claimed.get("summary_title") or op,
-            slots=slots,
-            error_obj=res.get("error") or {},
-        )
-        repairs = [c.model_dump() for c in diagnosis.repair_options]
-        sb.table("agent_goals").update(
-            {
-                "status": "needs_error_fix",
-                "steps": steps,
-                "pending_prompt": diagnosis.explanation_hinglish,
-                "repair_options": repairs,
-            }
-        ).eq("id", goal_id).execute()
-        return {
-            "goal_id": goal_id,
-            "status": "needs_error_fix",
-            "summary_title": claimed.get("summary_title"),
-            "prompt": diagnosis.explanation_hinglish,
-            "choices": repairs,
-            "can_park_for_clerk": True,
+        meta_done = {
+            **(claimed.get("metadata") or {}),
+            "verified_checks": verification.get("checks_run", 0),
         }
-
-    verification = goal_intelligence.verify_committed_goal_steps(
-        sb, steps=steps, slots=slots
-    )
-    if not verification.get("verified"):
-        msg = f"⚠️ Post-save verification caught a mismatch: {verification.get('mismatch')}"
         sb.table("agent_goals").update(
             {
-                "status": "needs_error_fix",
+                "status": "completed",
                 "steps": steps,
                 "collected_slots": slots,
-                "pending_prompt": msg,
-                "repair_options": [],
+                "undo_event_ids": undo_ids,
+                "project_id": goal_intelligence._safe_uuid_for_db(sb, slots.get("project_id"), project_lookup=True),
+                "customer_id": goal_intelligence._safe_uuid_for_db(sb, slots.get("customer_id")),
+                "metadata": meta_done,
+                "resolved_at": datetime.now(timezone.utc).isoformat(),
             }
         ).eq("id", goal_id).execute()
-        return {
-            "goal_id": goal_id,
-            "status": "needs_error_fix",
-            "summary_title": claimed.get("summary_title"),
-            "prompt": msg,
-            "choices": [],
-            "can_park_for_clerk": True,
-            "verification": verification,
-        }
 
-    meta_done = {
-        **(claimed.get("metadata") or {}),
-        "verified_checks": verification.get("checks_run", 0),
-    }
-    sb.table("agent_goals").update(
-        {
-            "status": "completed",
-            "steps": steps,
-            "collected_slots": slots,
-            "undo_event_ids": undo_ids,
-            "project_id": goal_intelligence._safe_uuid_for_db(sb, slots.get("project_id"), project_lookup=True),
-            "customer_id": goal_intelligence._safe_uuid_for_db(sb, slots.get("customer_id")),
-            "metadata": meta_done,
-            "resolved_at": datetime.now(timezone.utc).isoformat(),
-        }
-    ).eq("id", goal_id).execute()
+        if any(s.get("status") == "succeeded" and s.get("operation") in _GOAL_BALANCE_SYNC_OPS for s in steps):
+            await zoho.best_effort_sync_after_mutation(sb)
 
     has_entity_undo = any(bool((s.get("result") or {}).get("entity_undo")) for s in steps)
     fin_undoable = is_goal_undoable_today_ist(

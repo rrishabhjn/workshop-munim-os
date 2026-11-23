@@ -400,6 +400,7 @@ async def run_async_financial_or_stage_undo(
             sb, list(g.get("undo_event_ids") or []), actor_person_id=actor_person_id
         )
         sb.table("agent_goals").update({"status": "undone"}).eq("id", goal_id).execute()
+        await zoho.best_effort_sync_after_mutation(sb)
         return {"ok": True, "reverted": fin_reverted + stage_reverted}
     if any(s.get("operation") in inventory_ai.INVENTORY_OPS for s in (g.get("steps") or [])):
         if not is_goal_undoable_today_ist(g):
@@ -408,6 +409,7 @@ async def run_async_financial_or_stage_undo(
         if errors:
             return {"ok": False, "error": "; ".join(errors)}
         sb.table("agent_goals").update({"status": "undone"}).eq("id", goal_id).execute()
+        await zoho.best_effort_sync_after_mutation(sb)
         return {"ok": True, "reverted": inv_reverted}
     return sync_undo_fn(sb, goal_id=goal_id, actor_person_id=actor_person_id)
 

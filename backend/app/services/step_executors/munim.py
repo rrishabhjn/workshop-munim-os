@@ -153,6 +153,30 @@ async def execute_munim_financial_step(
     }
 
 
+def _bump_project_doc_caches(
+    sb: Any, project_id: str | None, *, amount_inr: float, cols: tuple[str, ...]
+) -> dict[str, Any] | None:
+    """Increment one or more project financial cache columns and return an undo snapshot."""
+    if not project_id or amount_inr <= 0:
+        return None
+    pid = str(project_id)
+    p_rows = (
+        sb.table("projects")
+        .select(",".join(("id", *cols)))
+        .eq("id", pid)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    if not p_rows:
+        return None
+    before = {col: float(p_rows[0].get(col) or 0) for col in cols}
+    patch = {col: round(before[col] + float(amount_inr), 2) for col in cols}
+    sb.table("projects").update(patch).eq("id", pid).execute()
+    return {"project_id": pid, "before": before}
+
+
 async def execute_munim_draft_doc_step(
     sb: Any,
     *,
@@ -200,12 +224,16 @@ async def execute_munim_draft_doc_step(
             }
         draft_status = str(draft_res.get("status") or (draft_res.get("invoice") or {}).get("status") or "draft")
         inv_id = str((draft_res.get("invoice") or {}).get("invoice_id") or "")
+        inv_undo_snap = _bump_project_doc_caches(
+            sb, slots.get("project_id"), amount_inr=amt, cols=("zoho_invoiced_cache",)
+        )
         return {
             "ok": True,
             "draft_status": draft_status,
             "zoho_id": inv_id or None,
             "zoho_type": "invoice",
             "reference_number": ref_no,
+            **({"project_undo_snapshot": inv_undo_snap} if inv_undo_snap else {}),
             "receipt": f"📄 Zoho *Draft Invoice (AR)* saved: *{party_name}* · *{format_inr(amt)}*",
         }
 
@@ -253,28 +281,9 @@ async def execute_munim_draft_doc_step(
     bill_obj = draft_res.get("bill") or {}
     bill_status = str(draft_res.get("status") or bill_obj.get("status") or "open")
     bill_id = str(bill_obj.get("bill_id") or "")
-    bill_undo_snap: dict[str, Any] | None = None
-    if slots.get("project_id") and amt > 0:
-        pid = str(slots["project_id"])
-        p_rows = (
-            sb.table("projects")
-            .select("id,cost_cache_inr,zoho_bills_cache")
-            .eq("id", pid)
-            .limit(1)
-            .execute()
-            .data
-            or []
-        )
-        if p_rows:
-            old_cost = float(p_rows[0].get("cost_cache_inr") or 0)
-            old_bills = float(p_rows[0].get("zoho_bills_cache") or 0)
-            bill_undo_snap = {
-                "project_id": pid,
-                "before": {"cost_cache_inr": old_cost, "zoho_bills_cache": old_bills},
-            }
-            sb.table("projects").update(
-                {"cost_cache_inr": round(old_cost + amt, 2), "zoho_bills_cache": round(old_bills + amt, 2)}
-            ).eq("id", pid).execute()
+    bill_undo_snap = _bump_project_doc_caches(
+        sb, slots.get("project_id"), amount_inr=amt, cols=("cost_cache_inr", "zoho_bills_cache")
+    )
     acc_note = f" · _{draft_res['expense_account_name']}_" if draft_res.get("expense_account_name") else ""
     return {
         "ok": True,

@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
+from datetime import datetime, timezone
 import logging
 import re
 import sys
+import time
 from typing import Any
 
 import httpx
@@ -13,6 +17,8 @@ import httpx
 from app.services.zoho.contacts import NON_PAYEE_WORDS
 
 logger = logging.getLogger(__name__)
+_LAST_PULSE_SYNC_MONO: dict[tuple[str, int], float] = {}
+_SYNC_BATCH_CTX: ContextVar[dict[str, bool] | None] = ContextVar("_SYNC_BATCH_CTX", default=None)
 
 
 def _pkg() -> Any:
@@ -147,19 +153,98 @@ async def sync_owner_pulse_snapshot(sb: Any) -> dict[str, Any]:
                 if match:
                     zid = str(match["account_id"])
                     claimed_zoho_ids.add(zid)
-                    sb.table("payment_accounts").update(
-                        {
-                            "zoho_account_id": zid,
-                            "cached_balance_inr": round(float(match.get("balance") or 0), 2),
-                            "balance_synced_at": "now()",
-                        }
-                    ).eq("id", la["id"]).execute()
+                    new_bal = round(float(match.get("balance") or 0), 2)
+                    old_bal = round(float(la.get("cached_balance_inr") or 0), 2)
+                    needs_write = (
+                        zid != str(la.get("zoho_account_id") or "")
+                        or abs(new_bal - old_bal) >= 0.005
+                        or not la.get("balance_synced_at")
+                    )
+                    if needs_write:
+                        sb.table("payment_accounts").update(
+                            {
+                                "zoho_account_id": zid,
+                                "cached_balance_inr": new_bal,
+                                "balance_synced_at": "now()",
+                            }
+                        ).eq("id", la["id"]).execute()
                     synced += 1
     except httpx.HTTPError as exc:
         logger.warning("sync_owner_pulse_snapshot failed: %s", exc)
         return {"ok": False, "error": str(exc)}
 
+    _LAST_PULSE_SYNC_MONO[(str(getattr(settings, "zoho_org_id", "") or ""), id(sb))] = time.monotonic()
     return {"ok": True, "stubbed": False, "accounts_synced": synced}
+
+
+def _parse_iso_utc(raw: Any) -> datetime | None:
+    if not raw or not isinstance(raw, str) or raw == "now()":
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+@asynccontextmanager
+async def coalesce_zoho_sync(sb: Any):
+    """Coalesce multiple Zoho writes in one turn into a single Owner Pulse balance sync."""
+    state = {"dirty": False}
+    token = _SYNC_BATCH_CTX.set(state)
+    try:
+        yield
+    finally:
+        _SYNC_BATCH_CTX.reset(token)
+        if state["dirty"]:
+            await best_effort_sync_after_mutation(sb)
+
+
+async def best_effort_sync_after_mutation(sb: Any) -> None:
+    """Refresh Owner Pulse balances after a Zoho write without ever failing the committed write."""
+    pkg = _pkg()
+    if sb is None or not pkg.get_settings().zoho_enabled:
+        return
+    ctx = _SYNC_BATCH_CTX.get()
+    if ctx is not None:
+        ctx["dirty"] = True
+        return
+    try:
+        await pkg.sync_owner_pulse_snapshot(sb)
+    except Exception as exc:
+        logger.warning("Post-mutation Zoho balance sync skipped: %s", exc)
+
+
+async def ensure_fresh_owner_pulse(sb: Any, max_age_seconds: float = 300.0) -> None:
+    """Silently refresh Owner Pulse if the last Zoho balance sync is older than max_age_seconds."""
+    pkg = _pkg()
+    settings = pkg.get_settings()
+    if sb is None or not settings.zoho_enabled:
+        return
+    cache_key = (str(getattr(settings, "zoho_org_id", "") or ""), id(sb))
+    last_mono = _LAST_PULSE_SYNC_MONO.get(cache_key)
+    if last_mono is not None and (time.monotonic() - last_mono) < max_age_seconds:
+        return
+
+    rows = (
+        sb.table("payment_accounts")
+        .select("balance_synced_at")
+        .eq("is_active", True)
+        .execute()
+        .data
+        or []
+    )
+    newest_dt = max(
+        (dt for r in rows if (dt := _parse_iso_utc(r.get("balance_synced_at"))) is not None),
+        default=None,
+    )
+    if newest_dt is not None:
+        age_secs = (datetime.now(timezone.utc) - newest_dt).total_seconds()
+        if 0.0 <= age_secs < max_age_seconds:
+            _LAST_PULSE_SYNC_MONO[cache_key] = time.monotonic() - age_secs
+            return
+
+    await best_effort_sync_after_mutation(sb)
 
 
 def _extract_party_from_desc(desc: str) -> str:
