@@ -32,6 +32,7 @@ async def execute_munim_financial_step(
     notes: str = "",
     actor_label: str = "Munim",
     expense_category: str | None = None,
+    account_name: str | None = None,
     is_explicit_advance: bool = False,
 ) -> dict[str, Any]:
     """Idempotent Munim -> Zoho Books Standard push + Smart Auto-Bridge Payment Track sync."""
@@ -53,6 +54,7 @@ async def execute_munim_financial_step(
         notes=notes,
         actor_label=actor_label,
         expense_category=expense_category,
+        account_name=account_name,
     )
     if not z_res.get("ok"):
         return z_res
@@ -106,7 +108,7 @@ async def execute_munim_financial_step(
                     "before": {k: p.get(k) for k in prj_patch},
                 }
                 sb.table("projects").update(prj_patch).eq("id", project_id).execute()
-    elif entry_kind in ("expense", "vendor_payment") and project_id and float(amount_inr or 0) > 0:
+    elif entry_kind in ("expense", "vendor_payment") and project_id and float(amount_inr or 0) > 0 and expense_category != "loan_principal":
         p_rows = (
             sb.table("projects")
             .select("id,cost_cache_inr")

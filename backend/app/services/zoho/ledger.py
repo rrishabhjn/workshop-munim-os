@@ -143,17 +143,32 @@ async def _resolve_zoho_paid_account_id(
 
 
 def _pick_zoho_expense_account(
-    accounts: list[dict[str, Any]], expense_category: str | None
+    accounts: list[dict[str, Any]],
+    expense_category: str | None,
+    *,
+    account_name: str | None = None,
 ) -> dict[str, Any] | None:
     """Select best matching Zoho Books Expense / COGS account for an expense_category."""
     active_exp = [
         a
         for a in accounts
-        if a.get("account_type") in ("expense", "cost_of_goods_sold")
+        if a.get("account_type") in ("expense", "cost_of_goods_sold", "other_expense")
         and a.get("is_active", True)
     ]
     if not active_exp:
         return None
+
+    if account_name and account_name.strip():
+        override_low = account_name.strip().lower()
+        hit = next(
+            (a for a in active_exp if (a.get("account_name") or "").strip().lower() == override_low),
+            None,
+        ) or next(
+            (a for a in active_exp if override_low in (a.get("account_name") or "").strip().lower()),
+            None,
+        )
+        if hit:
+            return hit
 
     cat_code = normalize_or_infer_expense_category(expense_category)
     target_names = [
@@ -198,6 +213,135 @@ def _pick_zoho_expense_account(
     return active_exp[0]
 
 
+_SYSTEM_OR_TEMPLATE_LIABILITY_NAMES: frozenset[str] = frozenset(
+    {
+        "mortgages", "construction loans", "tds payable", "unearned revenue",
+        "opening balance adjustments", "employee reimbursements", "gst payable",
+        "output igst", "output cgst", "output sgst", "tax payable",
+        "dimension adjustments", "pre-cutover offset", "pre-cutover clearing",
+    }
+)
+
+
+def pick_zoho_loan_liability_account(
+    accounts: list[dict[str, Any]],
+    *,
+    account_name: str | None = None,
+    hint_text: str = "",
+    bank_hint: str = "",
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """Select custom Zoho Loan Liability CoA account, or return ambiguous loan candidates."""
+    all_liab = [
+        a for a in (accounts or [])
+        if a.get("account_type") in ("long_term_liability", "other_current_liability", "other_liability")
+        and a.get("is_active", True) and not a.get("is_system_account")
+    ]
+    if not all_liab:
+        return None, []
+    if account_name and account_name.strip():
+        ov = account_name.strip().lower()
+        exact = next((a for a in all_liab if (a.get("account_name") or "").strip().lower() == ov), None)
+        if exact:
+            return exact, []
+        subs = [a for a in all_liab if ov in (a.get("account_name") or "").strip().lower()]
+        if subs:
+            return (subs[0], []) if len(subs) == 1 else (None, subs)
+    custom_loans = [a for a in all_liab if (a.get("account_name") or "").strip().lower() not in _SYSTEM_OR_TEMPLATE_LIABILITY_NAMES]
+    if len(custom_loans) <= 1:
+        return (custom_loans[0], []) if custom_loans else (None, [])
+    stop = {"loan", "term", "emi", "principal", "paid", "repayment", "bank", "account", "muldhan", "mooldhan", "kisht"}
+    for raw_h in (hint_text, bank_hint):
+        toks = {t for t in re.findall(r"[a-z0-9]+", (raw_h or "").lower()) if len(t) >= 2} - stop
+        if toks:
+            hits = [a for a in custom_loans if toks & set(re.findall(r"[a-z0-9]+", (a.get("account_name") or "").lower()))]
+            if len(hits) == 1:
+                return hits[0], []
+    return None, custom_loans
+
+
+async def _push_loan_principal_to_zoho(
+    client: httpx.AsyncClient,
+    *,
+    from_acc: dict[str, Any],
+    from_zoho_acc: str,
+    amount_inr: float,
+    party_name: str,
+    notes: str,
+    desc: str,
+    reference_number: str,
+    txn_date: str | None,
+    account_name: str | None,
+) -> dict[str, Any]:
+    """Post a Loan Principal repayment against a custom Zoho Liability account with safe fallbacks."""
+    pkg = _pkg()
+    for pth, lst_k, id_k, z_tp in (
+        ("/expenses", "expenses", "expense_id", "expense"),
+        ("/banktransactions", "banktransactions", "transaction_id", "banktransaction"),
+        ("/journals", "journals", "journal_id", "journal"),
+    ):
+        ex_id = await pkg._find_existing_by_reference(client, pth, lst_k, id_k, reference_number)
+        if ex_id:
+            return {"ok": True, "status_code": 200, "error_kind": "none", "zoho_type": z_tp, "zoho_id": ex_id, "deduped": True, "expense_category": "loan_principal"}
+
+    accounts = await pkg._get_chart_of_accounts(client)
+    loan_coa, amb_loans = pick_zoho_loan_liability_account(
+        accounts, account_name=account_name, hint_text=f"{party_name} {notes}", bank_hint=str(from_acc.get("display_name") or "")
+    )
+    if amb_loans:
+        names_list = ", ".join(str(a.get("account_name") or "") for a in amb_loans)
+        return {"ok": False, "status_code": 400, "error_kind": "validation_400", "error": {"message": f"Multiple Loan Liability accounts in Zoho ({names_list}) — specify account_name."}}
+    if not loan_coa:
+        return {"ok": False, "status_code": 400, "error_kind": "validation_400", "error": {"message": "No active Loan Liability account (e.g. RGB Term Loan) found in Zoho Chart of Accounts."}}
+
+    def _ok_loan(resp_obj: httpx.Response, z_tp: str, obj_key: str, id_key: str) -> dict[str, Any]:
+        return {
+            "ok": True, "status_code": resp_obj.status_code, "error_kind": "none",
+            "zoho_type": z_tp, "zoho_id": (resp_obj.json().get(obj_key) or {}).get(id_key),
+            "expense_category": "loan_principal", "expense_account_name": loan_coa.get("account_name"),
+        }
+
+    amt_rounded = round(float(amount_inr), 2)
+    iso_date = txn_date or datetime.now(IST).date().isoformat()
+    loan_payload = {
+        "account_id": loan_coa["account_id"], "paid_through_account_id": from_zoho_acc,
+        "amount": amt_rounded, "reference_number": reference_number, "description": desc,
+        "is_inclusive_tax": False, **({"date": txn_date} if txn_date else {}),
+    }
+    resp = await pkg._zoho_request(client, "POST", "/expenses", json_body=loan_payload)
+    if resp.is_success:
+        return _ok_loan(resp, "expense", "expense", "expense_id")
+    if resp.status_code == 400:
+        for bt_type in ("expense", "other_withdrawal", "transfer_fund"):
+            bt_resp = await pkg._zoho_request(
+                client, "POST", "/banktransactions",
+                json_body={"transaction_type": bt_type, "from_account_id": from_zoho_acc, "to_account_id": loan_coa["account_id"], "amount": amt_rounded, "date": iso_date, "reference_number": reference_number, "description": desc},
+            )
+            if bt_resp.is_success:
+                return _ok_loan(bt_resp, "banktransaction", "banktransaction", "transaction_id")
+            if bt_resp.status_code != 400:
+                resp = bt_resp
+                break
+        else:
+            j_note = re.sub(r"[<>]+", " ", desc.replace("->", " to "))[:95].strip() or "Loan Principal"
+            j_resp = await pkg._zoho_request(
+                client, "POST", "/journals",
+                json_body={
+                    "journal_date": iso_date, "reference_number": reference_number, "notes": j_note,
+                    "line_items": [
+                        {"account_id": loan_coa["account_id"], "debit_or_credit": "debit", "amount": amt_rounded, "description": j_note},
+                        {"account_id": from_zoho_acc, "debit_or_credit": "credit", "amount": amt_rounded, "description": j_note},
+                    ],
+                },
+            )
+            if j_resp.is_success:
+                return _ok_loan(j_resp, "journal", "journal", "journal_id")
+            resp = j_resp
+    return {
+        "ok": False, "status_code": resp.status_code, "error_kind": classify_external_error(resp.status_code),
+        "error": resp.json() if "json" in resp.headers.get("content-type", "") else {"message": resp.text[:240]},
+    }
+
+
 def _pick_zoho_income_account(accounts: list[dict[str, Any]]) -> dict[str, Any] | None:
     """Select active Zoho Books Income account ('Sales' first, then 'General Income')."""
     active_inc = [
@@ -232,6 +376,7 @@ async def push_management_entry_to_zoho(
     notes: str = "",
     actor_label: str = "Munim",
     expense_category: str | None = None,
+    account_name: str | None = None,
 ) -> dict[str, Any]:
     """Push a confirmed management ledger transaction to Zoho Books India (GST-off Standard Plan)
     with reference_number idempotency and 1:1 Project Reporting Tag linking.
@@ -276,9 +421,13 @@ async def push_management_entry_to_zoho(
         if entry_kind == "customer_receipt":
             stub_out["income_account_name"] = "Sales"
         if entry_kind == "expense":
-            inferred_cat = normalize_or_infer_expense_category(expense_category, party_name, notes)
+            inferred_cat = normalize_or_infer_expense_category(expense_category, notes, party_name)
             stub_out["expense_category"] = inferred_cat
-            stub_out["expense_account_name"] = get_expense_category_label(inferred_cat)
+            stub_out["expense_account_name"] = (
+                (account_name or "RGB Term Loan")
+                if inferred_cat == "loan_principal"
+                else (account_name or get_expense_category_label(inferred_cat))
+            )
         return stub_out
 
     order_tags = build_zoho_standard_order_tags(
@@ -567,7 +716,22 @@ async def push_management_entry_to_zoho(
                     "error": resp.json() if "json" in resp.headers.get("content-type", "") else {"message": resp.text[:240]},
                 }
 
-            # Default: non-GST Management Expense
+            # Default: non-GST Management Expense (plus Loan Principal / Loan Interest)
+            cat_code = normalize_or_infer_expense_category(expense_category, notes, party_name)
+            if cat_code == "loan_principal":
+                return await _push_loan_principal_to_zoho(
+                    client,
+                    from_acc=from_acc,
+                    from_zoho_acc=from_zoho_acc,
+                    amount_inr=amount_inr,
+                    party_name=party_name,
+                    notes=notes,
+                    desc=desc,
+                    reference_number=reference_number,
+                    txn_date=txn_date,
+                    account_name=account_name,
+                )
+
             existing_id = await pkg._find_existing_by_reference(
                 client, "/expenses", "expenses", "expense_id", reference_number
             )
@@ -581,8 +745,7 @@ async def push_management_entry_to_zoho(
                     "deduped": True,
                 }
             accounts = await pkg._get_chart_of_accounts(client)
-            cat_code = normalize_or_infer_expense_category(expense_category, party_name, notes)
-            matched_coa = _pick_zoho_expense_account(accounts, cat_code)
+            matched_coa = _pick_zoho_expense_account(accounts, cat_code, account_name=account_name)
             if not matched_coa:
                 return {
                     "ok": False,
@@ -590,8 +753,12 @@ async def push_management_entry_to_zoho(
                     "error_kind": "validation_400",
                     "error": {"message": "No active Expense account found in Zoho Chart of Accounts."},
                 }
-            payee = await pkg.resolve_payee_zoho_vendor(
-                sb, party_name, zoho_contact_id=zoho_contact_id, allow_adhoc_create=True
+            payee = (
+                {}
+                if cat_code == "loan_interest"
+                else await pkg.resolve_payee_zoho_vendor(
+                    sb, party_name, zoho_contact_id=zoho_contact_id, allow_adhoc_create=True
+                )
             )
             exp_desc = desc
             if payee.get("canonical_name") and payee.get("via_alias"):
@@ -600,7 +767,7 @@ async def push_management_entry_to_zoho(
                     f"(via {payee['via_alias']}) {notes}"
                 ).strip()[:250]
             vendor_zoho_id = payee.get("contact_id")
-            customer_zoho_id = bridge.get("zoho_contact_id") if project_id else None
+            customer_zoho_id = None if cat_code == "loan_interest" else (bridge.get("zoho_contact_id") if project_id else None)
             exp_payload = {
                 "account_id": matched_coa["account_id"],
                 "paid_through_account_id": from_zoho_acc,
@@ -611,10 +778,10 @@ async def push_management_entry_to_zoho(
                 **({"vendor_id": vendor_zoho_id} if vendor_zoho_id else {}),
                 **({"customer_id": customer_zoho_id} if customer_zoho_id else {}),
                 **({"date": txn_date} if txn_date else {}),
-                **order_tags,
+                **({} if cat_code == "loan_interest" else order_tags),
             }
             resp = await _post_zoho_with_order_tag_fallback(
-                client, "/expenses", exp_payload, has_order_tags=bool(order_tags)
+                client, "/expenses", exp_payload, has_order_tags=(bool(order_tags) and cat_code != "loan_interest")
             )
             if resp.is_success:
                 eid = (resp.json().get("expense") or {}).get("expense_id")

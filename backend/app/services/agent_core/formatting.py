@@ -135,14 +135,15 @@ def _format_confirmation_summary(
         amt = format_inr(float(slots.get("amount_inr") or 0))
         acc = (slots.get("payment_account_code") or "").upper()
         is_inflow = op in ("customer_receipt", "customer_payment")
-        badge = "🟢 PAISA AAYA (IN)" if is_inflow else ("🔄 TRANSFER" if op == "float_transfer" else "🔴 PAISA GAYA (OUT)")
+        is_loan_prin = op == "expense" and slots.get("expense_category") == "loan_principal"
+        badge = "🟢 PAISA AAYA (IN)" if is_inflow else ("🔄 TRANSFER" if op == "float_transfer" else ("🏦 PAISA GAYA — LOAN PRINCIPAL (OUT)" if is_loan_prin else "🔴 PAISA GAYA (OUT)"))
         party = slots.get("party_name") or slots.get("to_payment_account_code") or op
         if op == "float_transfer" and slots.get("to_payment_account_code"):
             party = f"{party} ({str(slots['to_payment_account_code']).upper()})"
         match_tag = ""
         if op != "float_transfer" and slots.get("party_name"):
-            if slots.get("is_generic_expense_label"):
-                match_tag = " _(🧾 Direct Expense)_"
+            if slots.get("is_generic_expense_label") or slots.get("expense_category") in ("loan_principal", "loan_interest"):
+                match_tag = " _(🏦 Loan Ledger)_" if is_loan_prin else " _(🧾 Direct Expense)_"
             elif slots.get("matched_customer_as_site"):
                 match_tag = " _(🏠 Customer Site)_"
             elif slots.get("is_new_payee") is True:
@@ -151,7 +152,9 @@ def _format_confirmation_summary(
                 match_tag = " _(✅ Matched)_"
         cat_line = ""
         if op == "expense":
-            cat_line = f"\n• Category: *{get_expense_category_label(slots.get('expense_category'))}*"
+            cat_lbl = "Loan Principal (Reduces Zoho Loan Liability)" if is_loan_prin else get_expense_category_label(slots.get("expense_category"))
+            acct_ovr = f"\n• Loan Account: *{slots['account_name']}*" if slots.get("account_name") else ""
+            cat_line = f"\n• Category: *{cat_lbl}*{acct_ovr}"
         elif op == "float_transfer":
             cat_line = "\n• Type: *Wallet / Float Transfer (Custodian)*"
         elif op == "customer_receipt":

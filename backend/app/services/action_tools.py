@@ -170,7 +170,7 @@ ACTION_TOOLS_SCHEMA: list[dict[str, Any]] = [
                 "project_id": {"type": "string", "description": "Linked customer order UUID if matched (omit for walk-in counter sales or workshop overheads)"},
                 "expense_category": {
                     "type": "string",
-                    "description": "'salary_wages'|'contractor_labor'|'raw_materials'|'transport_freight'|'food_tea_mess'|'rent'|'utilities_office'|'repairs_maintenance'|'other_expense'",
+                    "description": "'loan_principal'|'loan_interest'|'salary_wages'|'contractor_labor'|'raw_materials'|'transport_freight'|'food_tea_mess'|'rent'|'utilities_office'|'repairs_maintenance'|'other_expense'",
                 },
                 "account_name": {"type": "string", "description": "Optional Zoho Chart of Accounts name override"},
                 "force_direct_expense": {"type": "boolean", "description": "Force direct expense instead of wallet float transfer for a custodian"},

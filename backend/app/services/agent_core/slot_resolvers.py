@@ -314,13 +314,10 @@ def _backfill_financial_slots_from_text(
 
     if op == "expense":
         cat = normalize_or_infer_expense_category(
-            slots.get("expense_category"),
-            user_text,
-            heard_transcript,
-            slots.get("notes"),
-            slots.get("summary_title"),
-            slots.get("party_name"),
+            slots.get("expense_category"), slots.get("notes"), slots.get("summary_title"), slots.get("party_name")
         )
+        if cat == "other_expense":
+            cat = normalize_or_infer_expense_category(None, user_text, heard_transcript)
         if cat == "other_expense":
             if matched_person_kind == "salaried_karigar":
                 cat = "salary_wages"

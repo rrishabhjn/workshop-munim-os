@@ -563,6 +563,7 @@ async def _run_single_step(
             notes=str(slots.get("notes") or ""),
             actor_label=actor_label,
             expense_category=slots.get("expense_category"),
+            account_name=slots.get("account_name"),
             is_explicit_advance=is_explicit_advance,
         )
     if op == "void_prior_goal":

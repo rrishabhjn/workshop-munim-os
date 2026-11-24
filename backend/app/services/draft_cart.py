@@ -6,6 +6,8 @@ import json
 import re
 from typing import Any
 
+from app.services.goal_primitives import is_ambiguous_emi_text, normalize_or_infer_expense_category
+
 _FIN_FAMILY = frozenset(
     {
         "customer_receipt",
@@ -42,7 +44,8 @@ def goal_item_dedup_key(it: Any, slots: dict[str, Any] | None = None) -> str:
         who = str(_v("party_name") or "").strip().lower()
         amt = _v("amount_inr")
         amt_s = f"{float(amt):g}" if amt not in (None, "") else ""
-        return f"{op}:{who}:{amt_s}:{_v('invoice_no') or ''}"
+        cat_tag = f":{_v('expense_category')}" if op == "expense" and _v("expense_category") in ("loan_principal", "loan_interest") else ""
+        return f"{op}{cat_tag}:{who}:{amt_s}:{_v('invoice_no') or ''}"
     return f"{op}:{str(getattr(it, 'summary_title', '') or '').strip().lower()}"
 
 
@@ -184,7 +187,9 @@ class TurnDraftCart:
                 if same_amt and same_or_blank_acc:
                     p_old = str(e_it.party_name or "").strip().lower()
                     toks_old = _core_name_tokens(p_old)
-                    distinct_payees = bool(
+                    c_old, c_new = str(e_it.expense_category or ""), str(resolved_slots.get("expense_category") or cand.expense_category or "")
+                    distinct_loan_split = bool({"loan_principal", "loan_interest"} & {c_old, c_new} and c_old != c_new)
+                    distinct_payees = distinct_loan_split or bool(
                         p_old
                         and p_new
                         and (toks_old != toks_new if (toks_old and toks_new) else p_old != p_new)
@@ -254,6 +259,37 @@ async def enrich_candidate_entities(
     from app.services.agent_core.slot_resolvers import _accept_id
 
     op = str(cand.operation_kind or "")
+    if op == "expense":
+        item_cat = normalize_or_infer_expense_category(cand.expense_category, cand.notes, cand.summary_title, cand.party_name)
+        if item_cat == "other_expense":
+            item_cat = normalize_or_infer_expense_category(None, user_text, heard_transcript)
+        ambig_emi = not cand.target_open_goal_id and (
+            (item_cat not in ("loan_principal", "loan_interest") and is_ambiguous_emi_text(cand.notes, cand.party_name, cand.summary_title, user_text, heard_transcript))
+            or (bool((user_text or "").strip() or (heard_transcript or "").strip()) and is_ambiguous_emi_text(user_text, heard_transcript))
+        )
+        if ambig_emi:
+            cand.is_ambiguous = True
+            cand.is_new_payee = False
+            cand.vendor_id = None
+            cand.zoho_contact_id = None
+            cand.project_id = None
+            cand.party_name = cand.party_name or "Loan EMI"
+            cand.choices = [
+                DisambiguationChoice(choice_id="emi_principal", label="🏦 Loan Principal (Liability)", slot_patch_json='{"expense_category":"loan_principal","is_ambiguous":false}'),
+                DisambiguationChoice(choice_id="emi_interest", label="📉 Loan Interest (Expense)", slot_patch_json='{"expense_category":"loan_interest","is_ambiguous":false}'),
+            ]
+            cand.clarification_question = "🏦 Yeh *EMI* entry *Loan Principal* (Liability kam karega) hai ya *Loan Interest* (Expense)? Button chunein ya dono alag-alag amount reply karein."
+            return
+        if item_cat in ("loan_principal", "loan_interest"):
+            cand.expense_category = item_cat
+            cand.is_new_payee = False
+            cand.vendor_id = None
+            cand.zoho_contact_id = None
+            cand.project_id = None
+            if not cand.party_name:
+                cand.party_name = "Loan Principal" if item_cat == "loan_principal" else "Loan Interest"
+            return
+
     if op in ("expense", "vendor_payment", "supplier_draft_bill") and cand.party_name:
         m = await zoho.match_existing_payee(sb, cand.party_name)
         if m.get("status") == "matched":

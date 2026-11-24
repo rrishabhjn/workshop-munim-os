@@ -275,7 +275,7 @@ class GoalIntentItem(BaseModel):
     to_payment_account_code: str | None = None
     expense_category: str | None = Field(
         default=None,
-        description="For expense (including salaries/karigar payouts): 'salary_wages' | 'contractor_labor' | 'raw_materials' | 'transport_freight' | 'food_tea_mess' | 'rent' | 'utilities_office' | 'repairs_maintenance' | 'other_expense'.",
+        description="For expense (including salaries/karigar/loan repayments): 'loan_principal' | 'loan_interest' | 'salary_wages' | 'contractor_labor' | 'raw_materials' | 'transport_freight' | 'food_tea_mess' | 'rent' | 'utilities_office' | 'repairs_maintenance' | 'other_expense'.",
     )
     party_name: str | None = Field(
         default=None,

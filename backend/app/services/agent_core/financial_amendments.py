@@ -35,6 +35,8 @@ GENERIC_EXPENSE_WORDS: frozenset[str] = frozenset(
         "bill", "rent", "kiraya", "stationery", "tools", "consumables",
         "petty cash", "cash", "galla", "general", "other", "expense", "kharcha",
         "salary", "wages", "labour", "labor",
+        "loan", "emi", "kisht", "interest", "byaaj", "byaj", "principal",
+        "muldhan", "mooldhan", "loan interest", "loan principal", "rgb loan", "rgb term loan",
     }
 )
 
@@ -176,7 +178,11 @@ def detect_implicit_same_day_amendment(
 
         party_low = str(slots.get("party_name") or "").strip().lower()
         amt_val = slots.get("amount_inr")
+        cat_new = str(slots.get("expense_category") or "")
         for cand in today_tray:
+            cat_old = str(cand.get("expense_category") or "")
+            if {"loan_principal", "loan_interest"} & {cat_new, cat_old} and cat_new != cat_old and not _ABOVE_REF_RE.search(blob):
+                continue
             c_party = str(cand.get("party_name") or "").strip().lower()
             c_amt = cand.get("amount_inr")
             same_party = bool(party_low and c_party and (party_low in c_party or c_party in party_low))
@@ -508,6 +514,12 @@ async def apply_custodian_and_payee_guards(
     """Enforce CUJ #3A (wallet custodian float default) and CUJ #3B (payee & site hygiene)."""
     out_op = op
     out = dict(slots)
+    if out_op == "expense" and out.get("expense_category") in ("loan_principal", "loan_interest"):
+        out["vendor_id"] = None
+        out["zoho_contact_id"] = None
+        out["project_id"] = None
+        out["is_new_payee"] = False
+        return out_op, out
     party = str(out.get("party_name") or out.get("full_name") or "").strip()
     party_low = party.lower()
     notes_blob = f"{out.get('notes') or ''} {user_text or ''} {heard_transcript or ''}".strip()

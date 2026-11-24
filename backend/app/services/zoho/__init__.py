@@ -44,6 +44,7 @@ from app.services.zoho.ledger import (
     _pick_zoho_expense_account,
     _post_zoho_with_order_tag_fallback,
     _resolve_zoho_paid_account_id,
+    pick_zoho_loan_liability_account,
     push_management_entry_to_zoho,
 )
 from app.services.zoho.mutations import delete_zoho_financial_entry
@@ -92,6 +93,7 @@ __all__ = [
     "match_existing_order_or_customer",
     "match_existing_payee",
     "merge_notes_text",
+    "pick_zoho_loan_liability_account",
     "push_inventory_journal_to_zoho",
     "push_management_entry_to_zoho",
     "push_mixed_inventory_load_to_zoho",

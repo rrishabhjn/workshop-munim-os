@@ -801,6 +801,16 @@ EXPENSE_CATEGORIES: dict[str, dict[str, Any]] = {
         "zoho_names": ["repairs and maintenance", "janitorial expense"],
         "pattern": r"\b(repair|repairs|maintenance|blade|dhaar|sharpening|cutter|compressor|machine|tool\s+repair|welding|cleaning|safai|plumber|electrician)\b",
     },
+    "loan_principal": {
+        "label": "Loan Principal (Liability)",
+        "zoho_names": ["rgb term loan", "term loan", "bank loan", "loan"],
+        "pattern": r"\b(?:(?:loan|emi|rgb|axis|bank)\s+principal|principal\s+(?:repayment|paid|due|amount|emi|loan|installment)|muldhan|mooldhan|principal(?!\s+(?:sir|mam|madam|room|office|school|college)))\b",
+    },
+    "loan_interest": {
+        "label": "Loan Interest",
+        "zoho_names": ["interest expense", "loan interest", "bank fees and charges"],
+        "pattern": r"\b(?:loan\s+interest|emi\s+interest|cc\s+interest|od\s+interest|bank\s+interest|interest\s+expense|interest\s+paid|interest|byaaj|byaj)\b",
+    },
     "other_expense": {
         "label": "Other Workshop Expense",
         "zoho_names": ["other expenses", "uncategorized"],
@@ -809,6 +819,20 @@ EXPENSE_CATEGORIES: dict[str, dict[str, Any]] = {
 }
 
 _EXPENSE_CATEGORY_ALIASES: dict[str, str] = {
+    "principal": "loan_principal",
+    "loan_principal": "loan_principal",
+    "emi_principal": "loan_principal",
+    "principal_repayment": "loan_principal",
+    "muldhan": "loan_principal",
+    "mooldhan": "loan_principal",
+    "interest": "loan_interest",
+    "interest_expense": "loan_interest",
+    "loan_interest": "loan_interest",
+    "bank_interest": "loan_interest",
+    "od_interest": "loan_interest",
+    "cc_interest": "loan_interest",
+    "byaaj": "loan_interest",
+    "byaj": "loan_interest",
     "salary": "salary_wages",
     "salaries": "salary_wages",
     "salaries_and_wages": "salary_wages",
@@ -858,6 +882,8 @@ _EXPENSE_CATEGORY_ALIASES: dict[str, str] = {
 }
 
 _INFER_SCAN_ORDER: tuple[str, ...] = (
+    "loan_principal",
+    "loan_interest",
     "salary_wages",
     "rent",
     "transport_freight",
@@ -867,6 +893,17 @@ _INFER_SCAN_ORDER: tuple[str, ...] = (
     "contractor_labor",
     "raw_materials",
 )
+
+
+def is_ambiguous_emi_text(*texts: str | None) -> bool:
+    """Return True when EMI/loan installment text omits Principal vs Interest."""
+    combined = " ".join((t or "").strip().lower() for t in texts if t and str(t).strip())
+    if not combined or not re.search(r"\b(?:emi|kisht|loan(?:\s+installment)?)\b", combined):
+        return False
+    return not (
+        re.search(EXPENSE_CATEGORIES["loan_principal"]["pattern"], combined)
+        or re.search(EXPENSE_CATEGORIES["loan_interest"]["pattern"], combined)
+    )
 
 
 def normalize_or_infer_expense_category(

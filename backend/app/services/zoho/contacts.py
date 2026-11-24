@@ -81,6 +81,22 @@ NON_PAYEE_WORDS: frozenset[str] = frozenset(
         "the furniture company",
         "the work app",
         "shreyansh jain",
+        "loan",
+        "emi",
+        "kisht",
+        "interest",
+        "byaaj",
+        "byaj",
+        "loan interest",
+        "loan principal",
+        "principal",
+        "muldhan",
+        "mooldhan",
+        "rgb loan",
+        "rgb term loan",
+        "bank interest",
+        "od interest",
+        "cc interest",
     }
 )
 
