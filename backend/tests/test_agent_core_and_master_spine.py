@@ -532,3 +532,27 @@ async def test_munim_master_directory_patch_endpoints():
                 assert sb.store["people"][2]["payout_aliases"] == ["Ruksar Bano"]
     finally:
         app.dependency_overrides.clear()
+
+
+def test_vendor_kind_alias_and_meter_unit_normalization():
+    """Verify 'vendor' maps to supplier in vendors table and 'mt'/'m' normalize to 'mtr'."""
+    from app.services.agent_core.financial_amendments import dedup_or_insert_vendor_or_person
+    from app.services.step_executors.inventory_matching import normalize_inventory_unit
+
+    sb = _seed_fake_sb()
+    people_before = len(sb.store["people"])
+    res = dedup_or_insert_vendor_or_person(
+        sb,
+        {
+            "full_name": "Navkar Traders",
+            "person_or_vendor_kind": "vendor",
+            "gstin": "08JCLPK6516H1Z6",
+            "phone": "9414009486",
+        },
+    )
+    assert res["ok"] is True and res.get("vendor_id")
+    assert len(sb.store["people"]) == people_before
+    assert sb.store["vendors"][-1]["vendor_kind"] == "supplier"
+    assert normalize_inventory_unit("mt") == "mtr"
+    assert normalize_inventory_unit("m") == "mtr"
+

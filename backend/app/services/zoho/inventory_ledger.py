@@ -252,6 +252,8 @@ async def push_mixed_inventory_load_to_zoho(
     payment_account_id: str | None = None,
     vendor_name: str = "",
     vendor_zoho_id: str | None = None,
+    vendor_phone: str | None = None,
+    vendor_gstin: str | None = None,
     invoice_no: str | None = None,
     txn_date: str | None = None,
     notes: str = "",
@@ -348,9 +350,13 @@ async def push_mixed_inventory_load_to_zoho(
                         **(_line_tags(pid) if is_cust else {}),
                     })
                 vendor_id = vendor_zoho_id
+                resolved_vendor_id: str | None = None
                 if not vendor_id and vendor_name:
-                    payee = await pkg.resolve_payee_zoho_vendor(sb, vendor_name, allow_adhoc_create=True)
+                    payee = await pkg.resolve_payee_zoho_vendor(
+                        sb, vendor_name, allow_adhoc_create=True, phone=vendor_phone, gstin=vendor_gstin
+                    )
                     vendor_id = payee.get("contact_id")
+                    resolved_vendor_id = payee.get("vendor_id")
                 exp_payload: dict[str, Any] = {
                     **({"account_id": exp_lines[0]["account_id"]} if len(exp_lines) == 1 else {}),
                     "paid_through_account_id": from_zoho_acc,
@@ -365,16 +371,27 @@ async def push_mixed_inventory_load_to_zoho(
                 resp = await pkg._post_zoho_with_order_tag_fallback(client, "/expenses", exp_payload, has_order_tags=has_any_tags)
                 if resp.is_success:
                     eid = (resp.json().get("expense") or {}).get("expense_id")
-                    return {"ok": True, "status_code": resp.status_code, "error_kind": "none", "zoho_type": "expense", "zoho_id": eid}
+                    return {"ok": True, "status_code": resp.status_code, "error_kind": "none", "zoho_type": "expense", "zoho_id": eid, **({"vendor_id": resolved_vendor_id} if resolved_vendor_id else {})}
                 return {"ok": False, "status_code": resp.status_code, "error_kind": classify_external_error(resp.status_code), "error": _extract_zoho_error(resp, "Zoho Expense error")}
 
             if settlement_mode == "vendor_udhaar":
                 vid = vendor_zoho_id
+                vendor_err: str | None = None
+                resolved_vendor_id = None
                 if not vid and vendor_name:
-                    payee = await pkg.resolve_payee_zoho_vendor(sb, vendor_name, allow_adhoc_create=True)
+                    payee = await pkg.resolve_payee_zoho_vendor(
+                        sb, vendor_name, allow_adhoc_create=True, phone=vendor_phone, gstin=vendor_gstin
+                    )
                     vid = payee.get("contact_id")
+                    vendor_err = payee.get("error")
+                    resolved_vendor_id = payee.get("vendor_id")
                 if not vid:
-                    return {"ok": False, "status_code": 400, "error_kind": "validation_400", "error": {"message": f"Vendor '{vendor_name}' could not be resolved in Zoho Books."}}
+                    return {
+                        "ok": False,
+                        "status_code": 400,
+                        "error_kind": "validation_400",
+                        "error": {"message": vendor_err or f"Vendor '{vendor_name}' could not be resolved in Zoho Books."},
+                    }
 
                 bill_lines = []
                 for ln in lines:
@@ -405,7 +422,7 @@ async def push_mixed_inventory_load_to_zoho(
                 bid = str(bill_obj.get("bill_id") or "")
                 if bid and str(bill_obj.get("status") or "").lower() == "draft":
                     await pkg._zoho_request(client, "POST", f"/bills/{bid}/status/open", json_body={})
-                return {"ok": True, "status_code": b_resp.status_code, "error_kind": "none", "zoho_type": "bill_open", "zoho_id": bid}
+                return {"ok": True, "status_code": b_resp.status_code, "error_kind": "none", "zoho_type": "bill_open", "zoho_id": bid, **({"vendor_id": resolved_vendor_id} if resolved_vendor_id else {})}
 
             # manual / opening load -> balanced Journal
             j_lines = []

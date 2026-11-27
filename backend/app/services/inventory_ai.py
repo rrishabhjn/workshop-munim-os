@@ -33,9 +33,9 @@ INVENTORY_ACTION_TOOLS_SCHEMA: list[dict[str, Any]] = [
         "type": "function",
         "name": "stage_inventory_action",
         "description": (
-            "Stage a Workshop Inventory operation: "
-            "1) 'load' (CUJ 2 Gate-In / stock load or mixed receipt with Stock + Direct Customer lines; "
-            "settlement_mode: 'paid_now', 'vendor_udhaar', 'manual', or 'rate_pending' for unpriced challans); "
+            "Default tool for ALL itemized material/product supplier bills (photos/PDFs/text) and Workshop Inventory operations: "
+            "1) 'load' (loads Workshop Stock or direct Customer Order lines AND registers the Zoho Open AP Bill ['vendor_udhaar'] "
+            "or Zoho Expense ['paid_now'] in one step; also supports 'manual' and 'rate_pending' for unpriced challans); "
             "2) 'attribute' (CUJ 1 pull workshop stock onto a Customer Order, furniture item optional); "
             "3) 'count_adjust' (set actual physical count on hand and write off shrinkage/variance)."
         ),
@@ -46,6 +46,8 @@ INVENTORY_ACTION_TOOLS_SCHEMA: list[dict[str, Any]] = [
                 "settlement_mode": {"type": "string", "enum": ["paid_now", "vendor_udhaar", "manual", "rate_pending"]},
                 "payment_account_code": {"type": "string", "description": "Account code for paid_now loads (e.g. 'axis', 'cash_galla', 'float_ansh')"},
                 "party_name": {"type": "string", "description": "Supplier/vendor name for loads"},
+                "phone": {"type": "string", "description": "Supplier phone from bill header if present"},
+                "gstin": {"type": "string", "description": "Supplier GSTIN from bill header if present"},
                 "invoice_no": {"type": "string"},
                 "txn_date": {"type": "string", "description": "YYYY-MM-DD"},
                 "inventory_item_id": {"type": "string", "description": "SKU UUID or name for attribute/count_adjust"},
@@ -145,6 +147,8 @@ def build_inventory_candidates_from_tool(args: dict[str, Any]) -> list[dict[str,
         "settlement_mode": args.get("settlement_mode") or "manual",
         "payment_account_code": args.get("payment_account_code"),
         "party_name": args.get("party_name"),
+        "phone": args.get("phone"),
+        "gstin": args.get("gstin"),
         "invoice_no": args.get("invoice_no"),
         "txn_date": args.get("txn_date"),
         "inventory_item_id": args.get("inventory_item_id"),
@@ -175,7 +179,7 @@ def resolve_inventory_slots(sb: Any, slots: dict[str, Any], resolve_project_fn: 
         else:
             slots.pop("inventory_item_id", None)
 
-    if op == "inventory_attribution" and slots.get("project_id"):
+    if op in ("inventory_attribution", "inventory_load") and slots.get("project_id"):
         raw_pid = str(slots["project_id"])
         resolved_pid = resolve_project_fn(sb, raw_pid)
         if resolved_pid:
@@ -205,8 +209,14 @@ def resolve_inventory_slots(sb: Any, slots: dict[str, Any], resolve_project_fn: 
         except (TypeError, ValueError):
             raw_lines = []
         if isinstance(raw_lines, list):
+            top_pid = slots.get("project_id") if op == "inventory_load" else None
             for ln in raw_lines:
-                if isinstance(ln, dict) and ln.get("destination") == "order" and ln.get("project_id"):
+                if not isinstance(ln, dict):
+                    continue
+                if top_pid and not ln.get("project_id"):
+                    ln["destination"] = "order"
+                    ln["project_id"] = top_pid
+                if ln.get("destination") == "order" and ln.get("project_id"):
                     resolved_pid = resolve_project_fn(sb, str(ln["project_id"]))
                     if resolved_pid:
                         ln["project_id"] = resolved_pid
@@ -260,12 +270,18 @@ def format_inventory_confirmation_summary(sb: Any, op: str, slots: dict[str, Any
             dest_lbl = "Workshop Stock" if ln.get("destination", "stock") == "stock" else "Customer Order"
             rate_str = f" @ {format_inr(float(ln['unit_rate_inr']))}" if ln.get("unit_rate_inr") is not None else ""
             bullet_lines.append(f"• *{ln.get('material_name')}* — {ln.get('quantity')} {ln.get('unit') or 'pcs'}{rate_str} → _{dest_lbl}_")
-        extra = f"\n• Vendor: *{slots['party_name']}*" if slots.get("party_name") else ""
+        v_badge = (
+            " _(🆕 New Vendor)_"
+            if slots.get("is_new_payee") is True
+            else (" _(✅ Matched)_" if (slots.get("is_new_payee") is False or slots.get("vendor_id") or slots.get("zoho_contact_id")) else "")
+        )
+        extra = f"\n• Vendor: *{slots['party_name']}*{v_badge}" if slots.get("party_name") else ""
+        inv = f"\n• Invoice: `{slots['invoice_no']}`" if slots.get("invoice_no") else ""
         acc = f"\n• Account: `{str(slots['payment_account_code']).upper()}`" if slots.get("payment_account_code") else ""
         return (
             f"📦 *Confirm Inventory Load ({mode})*\n"
             + "\n".join(bullet_lines)
-            + f"{extra}{acc}\n• Total: *{format_inr(tot)}*"
+            + f"{extra}{inv}{acc}\n• Total: *{format_inr(tot)}*"
         )
     if op == "inventory_attribution":
         sku = step_executors.match_inventory_sku(sb, str(slots.get("inventory_item_id") or ""))
@@ -313,6 +329,8 @@ async def run_inventory_goal_step(
             payment_account_id=slots.get("payment_account_id"),
             vendor_id=slots.get("vendor_id"),
             vendor_name=slots.get("party_name"),
+            vendor_phone=slots.get("phone"),
+            vendor_gstin=slots.get("gstin"),
             invoice_no=slots.get("invoice_no"),
             txn_date=slots.get("txn_date"),
             notes=slots.get("notes"),

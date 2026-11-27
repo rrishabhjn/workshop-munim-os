@@ -21,6 +21,8 @@ _UNIT_CANON: dict[str, str] = {
     "pieces": "pcs",
     "no": "pcs",
     "nos": "pcs",
+    "m": "mtr",
+    "mt": "mtr",
     "mtr": "mtr",
     "mtrs": "mtr",
     "meter": "mtr",

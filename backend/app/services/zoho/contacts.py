@@ -219,17 +219,17 @@ async def create_zoho_contact(
     if not settings.zoho_enabled:
         return {"ok": False, "stubbed": True, "error": "Zoho not configured"}
 
+    merged_notes = notes or ""
+    if phone and phone.strip():
+        merged_notes = merge_notes_text(merged_notes, f"Phone: {phone.strip()}")
+    if gstin and gstin.strip():
+        merged_notes = merge_notes_text(merged_notes, f"GSTIN: {gstin.strip().upper()}")
     payload: dict[str, Any] = {
         "contact_name": name.strip(),
         "contact_type": contact_type,
     }
-    if phone:
-        payload["phone"] = phone
-    if gstin:
-        payload["gst_no"] = gstin.strip().upper()
-        payload["gst_treatment"] = "business_gst"
-    if notes and notes.strip():
-        payload["notes"] = notes.strip()[:500]
+    if merged_notes.strip():
+        payload["notes"] = merged_notes.strip()[:500]
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -287,24 +287,25 @@ async def sync_existing_zoho_contact(
             payload: dict[str, Any] = {}
             if name and name.strip():
                 payload["contact_name"] = name.strip()
-            if phone is not None:
-                payload["phone"] = phone.strip()
-            if gstin is not None:
-                clean_gst = gstin.strip().upper()
-                payload["gst_no"] = clean_gst
-                if clean_gst:
-                    payload["gst_treatment"] = "business_gst"
+            extra_notes = ""
+            if phone and phone.strip():
+                extra_notes = merge_notes_text(extra_notes, f"Phone: {phone.strip()}")
+            if gstin and gstin.strip():
+                extra_notes = merge_notes_text(extra_notes, f"GSTIN: {gstin.strip().upper()}")
 
             if replace_notes is not None:
-                payload["notes"] = replace_notes.strip()[:500]
-            elif notes_to_merge and notes_to_merge.strip():
-                get_resp = await pkg._zoho_request(client, "GET", f"/contacts/{contact_id}")
-                existing_notes = ""
-                if get_resp.is_success:
-                    existing_notes = (get_resp.json().get("contact") or {}).get("notes") or ""
-                merged = merge_notes_text(existing_notes, notes_to_merge)
-                if merged and merged != existing_notes.strip():
-                    payload["notes"] = merged[:500]
+                merged_rep = merge_notes_text(replace_notes, extra_notes) if extra_notes else replace_notes.strip()
+                payload["notes"] = merged_rep[:500]
+            else:
+                notes_add = merge_notes_text(notes_to_merge, extra_notes)
+                if notes_add:
+                    get_resp = await pkg._zoho_request(client, "GET", f"/contacts/{contact_id}")
+                    existing_notes = ""
+                    if get_resp.is_success:
+                        existing_notes = (get_resp.json().get("contact") or {}).get("notes") or ""
+                    merged = merge_notes_text(existing_notes, notes_add)
+                    if merged and merged != existing_notes.strip():
+                        payload["notes"] = merged[:500]
 
             if not payload:
                 return True
@@ -378,6 +379,8 @@ async def resolve_payee_zoho_vendor(
     *,
     zoho_contact_id: str | None = None,
     allow_adhoc_create: bool = True,
+    phone: str | None = None,
+    gstin: str | None = None,
 ) -> dict[str, Any]:
     """Resolve a payee (Vendor, Person/Karigar, or Payout Proxy Alias) to a Zoho Vendor Contact."""
     raw = (party_name or "").strip()
@@ -389,8 +392,7 @@ async def resolve_payee_zoho_vendor(
     matched_person: dict[str, Any] | None = None
     source = "adhoc" if raw else "none"
     canonical_name = raw
-    phone: str | None = None
-    gstin: str | None = None
+    resolved_vendor_id: str | None = None
     cached_id: str | None = None
 
     if sb is not None and raw_low:
@@ -406,10 +408,11 @@ async def resolve_payee_zoho_vendor(
             names = [str(v.get("canonical_name") or ""), *(v.get("aliases") or [])]
             if any(str(n).strip().lower() == raw_low for n in names if str(n).strip()):
                 matched_vendor = v
+                resolved_vendor_id = v.get("id")
                 source = "vendor"
                 canonical_name = str(v.get("canonical_name") or raw).strip()
-                phone = v.get("phone")
-                gstin = v.get("gstin")
+                phone = v.get("phone") or phone
+                gstin = v.get("gstin") or gstin
                 cached_id = v.get("zoho_contact_id")
                 break
 
@@ -432,7 +435,7 @@ async def resolve_payee_zoho_vendor(
                     matched_person = p
                     source = "person"
                     canonical_name = str(p.get("full_name") or raw).strip()
-                    phone = p.get("phone")
+                    phone = p.get("phone") or phone
                     cached_id = (p.get("metadata") or {}).get("zoho_contact_id")
                     break
 
@@ -462,9 +465,20 @@ async def resolve_payee_zoho_vendor(
             if meta.get("zoho_contact_id") != cid:
                 meta["zoho_contact_id"] = cid
                 sb.table("people").update({"metadata": meta}).eq("id", matched_person["id"]).execute()
+        elif not matched_vendor and not matched_person and source == "adhoc" and allow_adhoc_create:
+            ex_v = sb.table("vendors").select("id").eq("zoho_contact_id", cid).eq("is_active", True).limit(1).execute().data or []
+            if ex_v:
+                resolved_vendor_id = ex_v[0]["id"]
+            else:
+                v_ins = sb.table("vendors").insert({
+                    "canonical_name": canonical_name, "vendor_kind": "supplier", "zoho_contact_id": cid,
+                    "phone": phone, "gstin": gstin.strip().upper() if gstin else None, "is_active": True,
+                }).execute().data or []
+                resolved_vendor_id = v_ins[0]["id"] if v_ins else None
 
     out: dict[str, Any] = {
         "contact_id": cid,
+        "vendor_id": resolved_vendor_id,
         "canonical_name": canonical_name,
         "via_alias": via_alias,
         "source": source,

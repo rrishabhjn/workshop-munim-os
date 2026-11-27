@@ -48,6 +48,8 @@ def infer_material_category(material_name: str, explicit_category: str | None = 
             "edgeband",
             "edge band",
             "pvc",
+            "plastic strip",
+            "strip",
             "highlighter",
         )
     ):
@@ -101,6 +103,8 @@ def infer_material_category(material_name: str, explicit_category: str | None = 
             "upholstery",
             "mattress",
             "gadda",
+            "fibre",
+            "fiber",
         )
     ):
         return "foam_fabric"

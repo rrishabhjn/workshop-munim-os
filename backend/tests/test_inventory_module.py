@@ -633,3 +633,118 @@ async def test_zoho_notes_sanitization_retry_idempotency_and_hardening():
     )
     assert zero_rate["ok"] is False
 
+
+@pytest.mark.asyncio
+async def test_zoho_contact_creation_omits_gst_fields_and_surfaces_vendor_error():
+    """GST-off Zoho org rejects gst_no/gst_treatment/phone; fold into notes and surface real errors."""
+    sb = _seed_inv_sb()
+    fake_settings = Settings(
+        zoho_client_id="c", zoho_client_secret="s", zoho_refresh_token="r", zoho_org_id="o"
+    )
+    posted_contacts: list[dict[str, object]] = []
+
+    async def fake_zoho_req(client, method, path, params=None, json_body=None):
+        if method == "POST" and path == "/contacts":
+            posted_contacts.append(dict(json_body or {}))
+            return httpx.Response(201, json={"contact": {"contact_id": "zv-nav", "contact_name": "Navkar Traders"}})
+        raise AssertionError(f"Unexpected Zoho request: {method} {path}")
+
+    with (
+        patch("app.services.zoho.get_settings", return_value=fake_settings),
+        patch("app.services.zoho._zoho_request", side_effect=fake_zoho_req),
+    ):
+        res = await zoho.create_zoho_contact(
+            "Navkar Traders", "vendor", phone="9414009486", gstin="08JCLPK6516H1Z6"
+        )
+    assert res["ok"] is True
+    assert set(posted_contacts[0].keys()) == {"contact_name", "contact_type", "notes"}
+    assert "Phone: 9414009486" in str(posted_contacts[0]["notes"])
+    assert "GSTIN: 08JCLPK6516H1Z6" in str(posted_contacts[0]["notes"])
+
+    with (
+        patch("app.services.zoho.get_settings", return_value=fake_settings),
+        patch("app.services.zoho._find_existing_by_reference", AsyncMock(return_value=None)),
+        patch("app.services.zoho._get_chart_of_accounts", AsyncMock(return_value=[{"account_id": "a1", "account_name": "Inventory Asset", "account_type": "stock", "is_active": True}, {"account_id": "a2", "account_name": "Cost of Goods Sold", "account_type": "cost_of_goods_sold", "is_active": True}])),
+        patch("app.services.zoho.resolve_payee_zoho_vendor", AsyncMock(return_value={"contact_id": None, "error": "Zoho Contact error 400: Invalid GST"})),
+    ):
+        fail_res = await zoho.push_mixed_inventory_load_to_zoho(
+            sb,
+            settlement_mode="vendor_udhaar",
+            lines=[{"destination": "stock", "material_label": "Fibre", "quantity": 10, "unit": "mtr", "unit_rate_inr": 110, "total_inr": 1100}],
+            reference_number="MUNIM-TEST-ERR",
+            vendor_name="Navkar Traders",
+        )
+    assert fail_res["ok"] is False and "Zoho Contact error 400: Invalid GST" in fail_res["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_inventory_load_vendor_matching_followup_routing_and_auto_vendor_upsert():
+    """Inventory load enriches vendor badges, routes 'for <Customer>', and auto-upserts new vendors."""
+    sb = _seed_inv_sb()
+    sb.store["vendors"] = [
+        {"id": "v-nav", "canonical_name": "Navkar Traders", "vendor_kind": "supplier", "zoho_contact_id": "zv-nav", "aliases": [], "is_active": True}
+    ]
+    from app.services.inventory_ai import format_inventory_confirmation_summary, resolve_inventory_slots
+
+    cand_matched = agent_core.GoalIntentItem(
+        operation_kind="inventory_load", summary_title="Load Fibre", party_name="Navkar Traders",
+        settlement_mode="vendor_udhaar", invoice_no="408",
+        inventory_lines_json='[{"destination":"stock","material_name":"Fibre","quantity":10,"unit":"mtr","unit_rate_inr":110}]',
+    )
+    await draft_cart.enrich_candidate_entities(sb, cand_matched)
+    assert cand_matched.is_new_payee is False and cand_matched.vendor_id == "v-nav"
+    card_m = format_inventory_confirmation_summary(sb, "inventory_load", cand_matched.model_dump())
+    assert "✅ Matched" in card_m and "Invoice: `408`" in card_m
+
+    cand_new = agent_core.GoalIntentItem(
+        operation_kind="inventory_load", summary_title="Load Mattress", party_name="Ganesh Steel",
+        settlement_mode="vendor_udhaar", invoice_no="656",
+        inventory_lines_json='[{"destination":"stock","material_name":"Mattress","quantity":1,"unit":"pcs","unit_rate_inr":8500}]',
+    )
+    with patch("app.services.zoho.search_zoho_contacts", AsyncMock(return_value=[])):
+        await draft_cart.enrich_candidate_entities(sb, cand_new)
+    assert cand_new.is_new_payee is True and cand_new.vendor_id is None
+    card_n = format_inventory_confirmation_summary(sb, "inventory_load", cand_new.model_dump())
+    assert "🆕 New Vendor" in card_n and "Invoice: `656`" in card_n
+
+    # Follow-up "for Kaushab" converts stock lines on inventory_load to direct order lines
+    slots = {"operation_kind": "inventory_load", "project_id": "Kaushab", "inventory_lines_json": cand_new.inventory_lines_json}
+    resolve_inventory_slots(sb, slots, lambda _sb, h: "prj-k" if "kaushab" in h.lower() else None)
+    assert slots["project_id"] == "prj-k" and json.loads(slots["inventory_lines_json"])[0]["destination"] == "order"
+
+    # Confirming an inventory_load for a new vendor auto-upserts Supabase vendors & links vendor_id
+    fake_settings = Settings(zoho_client_id="c", zoho_client_secret="s", zoho_refresh_token="r", zoho_org_id="o")
+    async def fake_req(client, method, path, params=None, json_body=None):
+        if method == "GET" and path == "/bills":
+            return httpx.Response(200, json={"bills": []})
+        if method == "GET" and path == "/chartofaccounts":
+            return httpx.Response(200, json={"chartofaccounts": [
+                {"account_id": "a-inv", "account_name": "Workshop Inventory", "account_type": "other_current_asset", "is_active": True},
+                {"account_id": "a-cogs", "account_name": "Materials", "account_type": "expense", "is_active": True},
+            ]})
+        if method == "GET" and path == "/contacts":
+            return httpx.Response(200, json={"contacts": []})
+        if method == "POST" and path == "/contacts":
+            return httpx.Response(201, json={"contact": {"contact_id": "zv-ganesh", "contact_name": "Ganesh Steel Industries"}})
+        if method == "POST" and path == "/bills":
+            return httpx.Response(201, json={"bill": {"bill_id": "zb-656", "status": "open"}})
+        raise AssertionError(f"Unexpected Zoho call: {method} {path}")
+
+    with (
+        patch("app.services.zoho.get_settings", return_value=fake_settings),
+        patch("app.services.zoho._zoho_request", side_effect=fake_req),
+        patch("app.services.zoho.check_duplicate_bill", AsyncMock(return_value=None)),
+    ):
+        load_res = await step_executors.execute_inventory_load(
+            sb, settlement_mode="vendor_udhaar", vendor_name="Ganesh Steel Industries",
+            vendor_phone="9414010651", vendor_gstin="08AADPI5716Q1ZA", invoice_no="656",
+            lines=[{"destination": "stock", "material_name": "Mattress - D.ortho plus 78x48", "quantity": 1, "unit": "pcs", "unit_rate_inr": 8500}],
+        )
+    assert load_res["ok"] is True
+    assert any(v["canonical_name"] == "Ganesh Steel Industries" and v["zoho_contact_id"] == "zv-ganesh" and v["gstin"] == "08AADPI5716Q1ZA" for v in sb.store["vendors"])
+    assert load_res["movements"][0]["vendor_id"] is not None
+    assert step_executors.infer_material_category("Plastic Strip 25mm*0.80mm solid hg [1013]") == "laminate"
+    assert step_executors.infer_material_category("Fibre") == "foam_fabric"
+
+
+

@@ -144,7 +144,7 @@ ACTION_TOOLS_SCHEMA: list[dict[str, Any]] = [
             "'expense' (ALL money OUT right away: materials, transport, contractor/mistri payouts, AND salary/salary-advance); "
             "'customer_receipt' (ALL money IN right away: project advances AND walk-in counter/material sales -> Zoho Sales); "
             "'customer_draft_invoice' (ONLY when explicitly told a customer/party OWES us AR -> Zoho Draft Invoice); "
-            "'supplier_draft_bill' (ONLY when explicitly told we OWE a vendor/credit OR an unpaid bill photo/PDF -> Zoho Draft Bill); "
+            "'supplier_draft_bill' (ONLY for unpaid NON-INVENTORY / service / lump-sum vendor payables without physical materials; for itemized material/product supplier bills ALWAYS use stage_inventory_action(action_kind='load')); "
             "'vendor_payment'/'customer_payment' (ONLY when explicitly settling an earlier pending bill/invoice); "
             "'float_transfer' (moving cash between firm bank/Cash Galla/supervisor wallet). Always shows ₹ Confirm card."
         ),
@@ -213,6 +213,7 @@ ACTION_TOOLS_SCHEMA: list[dict[str, Any]] = [
             "properties": {
                 "goal_id": {"type": "string", "description": "Exact goal_id UUID from open_goals_tray"},
                 "entry_kind": {"type": "string", "description": "Override entry_kind if user changed it (expense/customer_receipt/supplier_draft_bill/customer_draft_invoice/float_transfer)"},
+                "settlement_mode": {"type": "string", "enum": ["paid_now", "vendor_udhaar", "manual", "rate_pending"]},
                 "expense_category": {"type": "string"},
                 "area_landmark": {"type": "string"},
                 "item_name": {"type": "string"},
@@ -293,7 +294,11 @@ ACTION_TOOLS_SCHEMA: list[dict[str, Any]] = [
                 "person_id": {"type": "string"},
                 "full_name": {"type": "string"},
                 "new_name": {"type": "string"},
-                "person_or_vendor_kind": {"type": "string"},
+                "person_or_vendor_kind": {
+                    "type": "string",
+                    "enum": ["supplier", "contractor", "salaried_karigar", "contractor_mistri"],
+                    "description": "'supplier' for material vendors, 'contractor' for service contractors, 'salaried_karigar' or 'contractor_mistri' for people/mistris",
+                },
                 "area_landmark": {"type": "string"},
                 "rough_scope": {"type": "string"},
                 "phone": {"type": "string"},

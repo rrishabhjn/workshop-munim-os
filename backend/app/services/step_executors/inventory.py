@@ -104,6 +104,8 @@ async def execute_inventory_load(
     payment_account_id: str | None = None,
     vendor_id: str | None = None,
     vendor_name: str | None = None,
+    vendor_phone: str | None = None,
+    vendor_gstin: str | None = None,
     invoice_no: str | None = None,
     txn_date: str | None = None,
     notes: str | None = None,
@@ -220,12 +222,15 @@ async def execute_inventory_load(
             payment_account_id=payment_account_id,
             vendor_name=resolved_vendor_name,
             vendor_zoho_id=vendor_zoho_id,
+            vendor_phone=vendor_phone,
+            vendor_gstin=vendor_gstin,
             invoice_no=invoice_no,
             txn_date=sanitize_iso_date(txn_date),
             notes=(notes or "").strip(),
         )
         if not zoho_res.get("ok"):
             return zoho_res
+        vendor_id = vendor_id or _clean_opt_id(zoho_res.get("vendor_id"))
 
     z_status = "rate_pending" if mode == "rate_pending" else ("stubbed" if zoho_res.get("stubbed") else "synced")
     created_movements: list[dict[str, Any]] = []
@@ -361,6 +366,8 @@ async def complete_rate_pending_movement(
     payment_account_id: str | None = None,
     vendor_id: str | None = None,
     vendor_name: str | None = None,
+    vendor_phone: str | None = None,
+    vendor_gstin: str | None = None,
     invoice_no: str | None = None,
     notes: str | None = None,
 ) -> dict[str, Any]:

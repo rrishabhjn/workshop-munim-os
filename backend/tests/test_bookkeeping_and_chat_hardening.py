@@ -867,4 +867,26 @@ async def test_surgical_fixes_1_to_4():
     assert fake_nr.interactions.create.call_count == 2 and all(c.kwargs["generation_config"]["thinking_level"] == "low" for c in fake_nr.interactions.create.call_args_list) and nr_out["goals"][0]["status"] == "gathering_info"
 
 
+@pytest.mark.asyncio
+async def test_nightly_sync_endpoint_cleans_up_old_telegram_rows():
+    """Verify /cron/nightly-sync imports date cleanly and deletes 30+ day old Telegram rows."""
+    from app.config import get_settings
+    from app.main import app
+
+    fake_sb = MagicMock()
+    app.dependency_overrides[get_settings] = lambda: Settings(cron_auth_secret="cron-s")
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            with (
+                patch("app.routers.cron.get_supabase_admin", return_value=fake_sb),
+                patch("app.routers.cron.zoho.sync_owner_pulse_snapshot", AsyncMock(return_value={"ok": True})),
+                patch("app.routers.cron.zoho.sync_project_financial_caches", AsyncMock(return_value={"ok": True})),
+                patch("app.routers.cron.sheets_backup.export_readonly_sheet_snapshot", MagicMock(return_value={"ok": True})),
+            ):
+                resp = await client.post("/cron/nightly-sync", headers={"X-Cron-Secret": "cron-s"})
+        assert resp.status_code == 200 and resp.json() == {"ok": True, "zoho_pulse": {"ok": True}, "project_caches": {"ok": True}, "sheets": {"ok": True}}
+        tables = [c.args[0] for c in fake_sb.table.call_args_list]
+        assert "telegram_webhook_dedup" in tables and "telegram_inbox_buffer" in tables
+    finally:
+        app.dependency_overrides.clear()
 

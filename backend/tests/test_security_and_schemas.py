@@ -265,3 +265,26 @@ def test_frontend_jsx_components_never_call_hooks_after_early_return():
                 i += 1
 
     assert violations == [], "React Rules of Hooks violation(s):\n" + "\n".join(violations)
+
+
+def test_supabase_admin_uses_http1_pooled_postgrest_session():
+    """Verify get_supabase_admin eagerly initializes PostgREST with HTTP/1.1 connection pooling."""
+    from app.config import Settings
+    from app.db import get_supabase_admin
+
+    dummy_jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoic2VydmljZV9yb2xlIn0.sig"
+    fake_settings = Settings(supabase_url="https://example.supabase.co", supabase_secret_key=dummy_jwt)
+    client = None
+    get_supabase_admin.cache_clear()
+    try:
+        with patch("app.db.get_settings", return_value=fake_settings):
+            client = get_supabase_admin()
+        assert client._postgrest is not None
+        sess = client.postgrest.session
+        assert sess._transport._pool._http2 is False
+        assert "rest/v1" in str(sess.base_url)
+        assert "apikey" in sess.headers
+    finally:
+        if client is not None and client._postgrest is not None:
+            client.postgrest.session.close()
+        get_supabase_admin.cache_clear()

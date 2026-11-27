@@ -290,7 +290,7 @@ async def enrich_candidate_entities(
                 cand.party_name = "Loan Principal" if item_cat == "loan_principal" else "Loan Interest"
             return
 
-    if op in ("expense", "vendor_payment", "supplier_draft_bill") and cand.party_name:
+    if op in ("expense", "vendor_payment", "supplier_draft_bill", "inventory_load") and cand.party_name:
         m = await zoho.match_existing_payee(sb, cand.party_name)
         if m.get("status") == "matched":
             cand.party_name = m["canonical_name"]
@@ -311,7 +311,7 @@ async def enrich_candidate_entities(
         elif m.get("status") == "new":
             cand.is_new_payee = True
 
-        if not cand.is_ambiguous:
+        if op != "inventory_load" and not cand.is_ambiguous:
             cand_dict = cand.model_dump()
             new_op, g_slots = await apply_custodian_and_payee_guards(
                 sb,

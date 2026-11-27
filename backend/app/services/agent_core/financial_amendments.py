@@ -317,7 +317,8 @@ async def execute_auto_create_site_order_step(
 
 def dedup_or_insert_vendor_or_person(sb: Any, slots: dict[str, Any]) -> dict[str, Any]:
     """Insert or deduplicate vendor (by GSTIN, canonical_name, aliases) or add person to roster."""
-    kind = str(slots.get("person_or_vendor_kind") or "salaried_karigar")
+    raw_kind = str(slots.get("person_or_vendor_kind") or "salaried_karigar").strip().lower()
+    kind = "supplier" if raw_kind in ("vendor", "suppliers", "material_vendor", "material_supplier") else raw_kind
     name = str(slots.get("full_name") or slots.get("party_name") or "").strip()
     if not name:
         return {"ok": False, "error_kind": "validation_400", "error": {"message": "Name is required."}}
